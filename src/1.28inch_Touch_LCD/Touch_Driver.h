@@ -17,7 +17,7 @@
 #include <stdlib.h>		//itoa()
 #include <stdio.h>
 
-#define address   0x15  //slave address
+#define touchAddress   0x15  //slave address
 
 #define GESTUREID 0x01 //gesture code
 #define None 0x00 		//no gesture

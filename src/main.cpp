@@ -1,9 +1,20 @@
 #include <Arduino.h>
+
 #include "Adafruit_MPR121.h"
+
 #include "1.28inch_Touch_LCD/LCD_Driver.h"
 #include "1.28inch_Touch_LCD/Touch_Driver.h"
 #include "1.28inch_Touch_LCD/GUI_Paint.h"
 
+#include <Wire.h>
+#include <Audio.h>
+
+// GUItool: begin automatically generated code
+AudioSynthWaveformSine   sine1;          //xy=720.2000427246094,508.20001220703125
+AudioOutputI2S           i2s;           //xy=880.2000732421875,499.20001220703125
+AudioConnection          patchCord1(sine1, 0, i2s, 0);
+AudioConnection          patchCord2(sine1, 0, i2s, 1);
+// GUItool: end automatically generated code
 
 
 Adafruit_MPR121 cap = Adafruit_MPR121();
@@ -50,7 +61,9 @@ void setup() {
   Paint_DrawString_EN(35, 90, "OMNIPHONE!", &Font20, BLACK, WHITE);
 
 
-
+  AudioMemory(15);
+  sine1.frequency(111);
+  sine1.amplitude(0.5);
 }
 
 void loop() {
