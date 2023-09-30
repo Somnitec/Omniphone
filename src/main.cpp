@@ -1,18 +1,37 @@
 #include <Arduino.h>
+#include <Wire.h>
+#include "Adafruit_MPR121.h"
 
-// put function declarations here:
-int myFunction(int, int);
+Adafruit_MPR121 cap = Adafruit_MPR121();
+
+uint16_t lasttouched = 0;
+uint16_t currtouched = 0;
 
 void setup() {
-  // put your setup code here, to run once:
-  int result = myFunction(2, 3);
+  Serial.begin(9600);
+
+  if (!cap.begin(0x5B)) {
+    Serial.println("MPR121@0x5B not found, check wiring?");
+    while (1);
+  }
+  Serial.println("MPR121@0x5B found!");
 }
 
 void loop() {
-  // put your main code here, to run repeatedly:
-}
+// Get the currently touched pads
+  currtouched = cap.touched();
+  
+  for (uint8_t i=0; i<12; i++) {
+    // it if *is* touched and *wasnt* touched before, alert!
+    if ((currtouched & _BV(i)) && !(lasttouched & _BV(i)) ) {
+      Serial.print(i); Serial.println(" touched");
+    }
+    // if it *was* touched and now *isnt*, alert!
+    if (!(currtouched & _BV(i)) && (lasttouched & _BV(i)) ) {
+      Serial.print(i); Serial.println(" released");
+    }
+  }
+  lasttouched = currtouched;
 
-// put function definitions here:
-int myFunction(int x, int y) {
-  return x + y;
+  delay(100);           
 }
