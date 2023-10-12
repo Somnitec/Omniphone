@@ -17,10 +17,13 @@ AudioConnection          patchCord2(sine1, 0, i2s, 1);
 // GUItool: end automatically generated code
 
 
-Adafruit_MPR121 cap = Adafruit_MPR121();
+Adafruit_MPR121 cap5B = Adafruit_MPR121();
+Adafruit_MPR121 cap5D = Adafruit_MPR121();
 
-uint16_t lasttouched = 0;
-uint16_t currtouched = 0;
+uint16_t lasttouched5B = 0;
+uint16_t currtouched5B = 0;
+uint16_t lasttouched5D = 0;
+uint16_t currtouched5D = 0;
 UWORD x, y = 0;
 
 void Touch_INT_callback() {
@@ -38,11 +41,16 @@ void Touch_INT_callback() {
 void setup() {
   Serial.begin(9600);
 
-  if (!cap.begin(0x5B)) {
+  if (!cap5B.begin(0x5B)) {
     Serial.println("MPR121@0x5B not found, check wiring?");
     while (1);
   }
   Serial.println("MPR121@0x5B found!");
+    if (!cap5D.begin(0x5D)) {
+    Serial.println("MPR121@0x5D not found, check wiring?");
+    while (1);
+  }
+  Serial.println("MPR121@0x5D found!");
 
   Touch_1IN28_XY XY;
   XY.mode = 1;
@@ -68,19 +76,29 @@ void setup() {
 
 void loop() {
 // Get the currently touched pads
-  currtouched = cap.touched();
+  currtouched5D = cap5D.touched();
+  currtouched5B = cap5B.touched();
   
   for (uint8_t i=0; i<12; i++) {
     // it if *is* touched and *wasnt* touched before, alert!
-    if ((currtouched & _BV(i)) && !(lasttouched & _BV(i)) ) {
-      Serial.print(i); Serial.println(" touched");
+    if ((currtouched5B & _BV(i)) && !(lasttouched5B & _BV(i)) ) {
+      Serial.print(i); Serial.println(" 5B touched");
     }
     // if it *was* touched and now *isnt*, alert!
-    if (!(currtouched & _BV(i)) && (lasttouched & _BV(i)) ) {
-      Serial.print(i); Serial.println(" released");
+    if (!(currtouched5B & _BV(i)) && (lasttouched5B & _BV(i)) ) {
+      Serial.print(i); Serial.println(" 5B released");
+    }
+
+        if ((currtouched5D & _BV(i)) && !(lasttouched5D & _BV(i)) ) {
+      Serial.print(i); Serial.println(" 5D touched");
+    }
+    // if it *was* touched and now *isnt*, alert!
+    if (!(currtouched5D & _BV(i)) && (lasttouched5D & _BV(i)) ) {
+      Serial.print(i); Serial.println(" 5D released");
     }
   }
-  lasttouched = currtouched;
+  lasttouched5B = currtouched5B;
+  lasttouched5D = currtouched5D;
 
     
 
