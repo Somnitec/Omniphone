@@ -17,14 +17,20 @@ AudioConnection          patchCord2(sine1, 0, i2s, 1);
 // GUItool: end automatically generated code
 
 
-Adafruit_MPR121 cap5B = Adafruit_MPR121();
-Adafruit_MPR121 cap5D = Adafruit_MPR121();
+Adafruit_MPR121 cap5A = Adafruit_MPR121();
+Adafruit_MPR121 cap5C = Adafruit_MPR121();
 
-uint16_t lasttouched5B = 0;
-uint16_t currtouched5B = 0;
-uint16_t lasttouched5D = 0;
-uint16_t currtouched5D = 0;
+const uint8_t LED_GPIO_BIT = 0b11111100;
+
+uint16_t lasttouched5A = 0;
+uint16_t currtouched5A = 0;
+uint16_t lasttouched5C = 0;
+uint16_t currtouched5C = 0;
 UWORD x, y = 0;
+// MPR121 GPIO: pin 6 as LED output, pin 0 as touch input
+const uint8_t MPR121_LED_PIN = 6;  // MPR121 GPIO pin 6 for LED
+unsigned long lastSampleTime = 0;
+const unsigned long SAMPLE_INTERVAL_MS = 500;
 
 void Touch_INT_callback() {
   XY = Touch_1IN28_Get_Point();
@@ -41,16 +47,40 @@ void Touch_INT_callback() {
 void setup() {
   Serial.begin(9600);
 
-  if (!cap5B.begin(0x5B)) {
-    Serial.println("MPR121@0x5B not found, check wiring?");
+  if (!cap5A.begin(0x5A)) {
+    Serial.println("MPR121@0x5A not found, check wiring?");
     while (1);
   }
-  Serial.println("MPR121@0x5B found!");
-    if (!cap5D.begin(0x5D)) {
-    Serial.println("MPR121@0x5D not found, check wiring?");
+  Serial.println("MPR121@0x5A found!");
+    if (!cap5C.begin(0x5C,&Wire,12,6,6)) {
+    Serial.println("MPR121@0x5C not found, check wiring?");
+      // enable only the GPIO line we want
+
     while (1);
   }
-  Serial.println("MPR121@0x5D found!");
+  Serial.println("MPR121@0x5C found!");
+  // Electrode Configuration Register, see datasheet page 15
+  cap5C.writeRegister(MPR121_ECR, 0b00000000); //reset ECR
+  //delay(100);
+
+  cap5C.writeRegister(MPR121_ECR, 0b00000110);
+  //first two bits set calibration mode
+  //second two bytes set proximity detection
+  //last four bits
+
+    cap5C.writeRegister(MPR121_GPIOEN,   LED_GPIO_BIT);
+
+  cap5C.writeRegister(MPR121_GPIODIR,  LED_GPIO_BIT);
+
+  cap5C.writeRegister(MPR121_GPIOCTL0,  LED_GPIO_BIT);
+  cap5C.writeRegister(MPR121_GPIOCTL1,  LED_GPIO_BIT);
+
+
+  cap5C.writeRegister(MPR121_GPIOCLR,  LED_GPIO_BIT);
+  Serial.println("MPR121@0x5C set!");
+cap5C.writeRegister(MPR121_GPIOTOGGLE,  LED_GPIO_BIT);
+delay(500);
+cap5C.writeRegister(MPR121_GPIOTOGGLE,  LED_GPIO_BIT);
 
   Touch_1IN28_XY XY;
   XY.mode = 1;
@@ -64,7 +94,7 @@ void setup() {
   LCD_SetBacklight(255);//0-255
   Paint_NewImage(LCD_WIDTH, LCD_HEIGHT, 0, BLACK);
   Paint_Clear(WHITE);
-  attachInterrupt(digitalPinToInterrupt(TP_INT_PIN), Touch_INT_callback, LOW);
+  //attachInterrupt(digitalPinToInterrupt(TP_INT_PIN), Touch_INT_callback, LOW);
   pinMode(TP_INT_PIN, INPUT_PULLUP);
   Paint_DrawString_EN(35, 90, "OMNIPHONE!", &Font20, BLACK, WHITE);
 
@@ -75,33 +105,26 @@ void setup() {
 }
 
 void loop() {
-// Get the currently touched pads
-  currtouched5D = cap5D.touched();
-  currtouched5B = cap5B.touched();
-  
-  for (uint8_t i=0; i<12; i++) {
-    // it if *is* touched and *wasnt* touched before, alert!
-    if ((currtouched5B & _BV(i)) && !(lasttouched5B & _BV(i)) ) {
-      Serial.print(i); Serial.println(" 5B touched");
-    }
-    // if it *was* touched and now *isnt*, alert!
-    if (!(currtouched5B & _BV(i)) && (lasttouched5B & _BV(i)) ) {
-      Serial.print(i); Serial.println(" 5B released");
-    }
+  // Sample MPR121 electrode 0 and control LED on GPIO pin 6 every 100ms
+  if (millis() - lastSampleTime >= SAMPLE_INTERVAL_MS) {
+    lastSampleTime = millis();
 
-        if ((currtouched5D & _BV(i)) && !(lasttouched5D & _BV(i)) ) {
-      Serial.print(i); Serial.println(" 5D touched");
-    }
-    // if it *was* touched and now *isnt*, alert!
-    if (!(currtouched5D & _BV(i)) && (lasttouched5D & _BV(i)) ) {
-      Serial.print(i); Serial.println(" 5D released");
-    }
-  }
-  lasttouched5B = currtouched5B;
-  lasttouched5D = currtouched5D;
-
+    cap5C.writeRegister(MPR121_GPIOTOGGLE,  LED_GPIO_BIT);
+    Serial.print(lastSampleTime);
+    for (int i = 0; i < 6; i++) {
+      Serial.print(" ");
+      Serial.print(cap5C.filteredData(i));
     
+    }
+    Serial.println("");
 
-  delay(100);           
+    // Get the currently touched pads
+    currtouched5C = cap5C.touched();
+    currtouched5A = cap5A.touched();
+
+
+    lasttouched5A = currtouched5A;
+    lasttouched5C = currtouched5C;
+  }
 }
 
