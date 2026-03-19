@@ -2,9 +2,9 @@
 
 #include "Adafruit_MPR121.h"
 
-#include "1.28inch_Touch_LCD/LCD_Driver.h"
-#include "1.28inch_Touch_LCD/Touch_Driver.h"
-#include "1.28inch_Touch_LCD/GUI_Paint.h"
+#include "LCD_Driver.h"
+#include "Touch_Driver.h"
+#include "GUI_Paint.h"
 
 #include <Wire.h>
 #include <Audio.h>
@@ -108,6 +108,8 @@ void loop() {
   // Sample MPR121 electrode 0 and control LED on GPIO pin 6 every 100ms
   if (millis() - lastSampleTime >= SAMPLE_INTERVAL_MS) {
     lastSampleTime = millis();
+
+    cap5C.writeRegister(MPR121_ECR, 0b00000110);
 
     cap5C.writeRegister(MPR121_GPIOTOGGLE,  LED_GPIO_BIT);
     Serial.print(lastSampleTime);
