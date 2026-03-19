@@ -32,6 +32,9 @@ const uint8_t MPR121_LED_PIN = 6;  // MPR121 GPIO pin 6 for LED
 unsigned long lastSampleTime = 0;
 const unsigned long SAMPLE_INTERVAL_MS = 10;
 
+unsigned long lastBlinkTime = 0;
+const unsigned long BLINK_INTERVAL_MS = 500;
+
 void Touch_INT_callback() {
   XY = Touch_1IN28_Get_Point();
 
@@ -43,16 +46,21 @@ void Touch_INT_callback() {
         Serial.print(y);
         Serial.println();
 }
-
+void writeAllCapsense(uint8_t reg, uint8_t value){
+  cap5A.writeRegister(reg, value);
+  //cap5B.writeRegister(reg, value);
+  cap5C.writeRegister(reg, value);
+  //cap5D.writeRegister(reg, value);
+}
 void setup() {
   Serial.begin(9600);
 
-  if (!cap5A.begin(0x5A)) {
+  if (!cap5A.begin(0x5B,&Wire,12,6,true, 6)) {
     Serial.println("MPR121@0x5A not found, check wiring?");
     while (1);
   }
   Serial.println("MPR121@0x5A found!");
-    if (!cap5C.begin(0x5C,&Wire,12,6,6)) {
+    if (!cap5C.begin(0x5D,&Wire,12,6,true,6)) {
     Serial.println("MPR121@0x5C not found, check wiring?");
       // enable only the GPIO line we want
 
@@ -60,30 +68,30 @@ void setup() {
   }
   Serial.println("MPR121@0x5C found!");
   // Electrode Configuration Register, see datasheet page 15
-  cap5C.writeRegister(MPR121_ECR, 0b00000000); //reset ECR
+  writeAllCapsense(MPR121_ECR, 0b00000000); //reset ECR
 
-cap5C.writeRegister(MPR121_CONFIG1, 0b00000001);
+  writeAllCapsense(MPR121_CONFIG1, 0b00000001);
 //High Sensitivity: (FFI = 6 samples, lowest; CDC=16μA—adjust this if you get 0 or 1023 in filtered data)
-  cap5C.writeRegister(MPR121_CONFIG2, 0b00100000);
+  writeAllCapsense(MPR121_CONFIG2, 0b00100000);
   //Fastest Sampling: (CDT= 0.5us, SFI=4, ESI=1ms)
 
 
 
-  cap5C.writeRegister(MPR121_GPIOEN,   LED_GPIO_BIT);
-  cap5C.writeRegister(MPR121_GPIODIR,  LED_GPIO_BIT);
-  cap5C.writeRegister(MPR121_GPIOCTL0,  0);
-  cap5C.writeRegister(MPR121_GPIOCTL1,  LED_GPIO_BIT);
+  writeAllCapsense(MPR121_GPIOEN,   LED_GPIO_BIT);
+  writeAllCapsense(MPR121_GPIODIR,  LED_GPIO_BIT);
+  writeAllCapsense(MPR121_GPIOCTL0,  0);
+  writeAllCapsense(MPR121_GPIOCTL1,  LED_GPIO_BIT);
 
 
 
-  cap5C.writeRegister(MPR121_ECR, 0b11000110);
+  writeAllCapsense(MPR121_ECR, 0b11000110);
   //first two bits set calibration mode = 11 (On start, it copies the exact current reading to the baseline.	Best for Instruments. Gives you a clean, precise "zero" the moment you power on.)(Baseline tracking and initialize enable. At the first {ESI x SFI}, MPR121 copy the 2nd filter output to 10bit baseline value. Subsequent update is per nominal baseline filter operation)
   //second two bytes set proximity detection = 00 (disable proximity, we just want touch)
   //last four bits = 0110 to enable electrodes 0,1,2,3,4,5 (the ones we have wired up)
 
-  cap5C.writeRegister(MPR121_GPIOCLR,  LED_GPIO_BIT);
+  writeAllCapsense(MPR121_GPIOCLR,  LED_GPIO_BIT);
 
-  Serial.println("MPR121@0x5C set!");
+  Serial.println("capsense set!");
 
 
 
@@ -105,34 +113,36 @@ cap5C.writeRegister(MPR121_CONFIG1, 0b00000001);
 
 
   AudioMemory(15);
-  sine1.frequency(111);
+  sine1.frequency(200);
   sine1.amplitude(0.5);
 }
 
 void loop() {
-  // Sample MPR121 electrode 0 and control LED on GPIO pin 6 every 100ms
+   if (millis() - lastBlinkTime >= BLINK_INTERVAL_MS) {
+    lastBlinkTime = millis();
+    //writeAllCapsense(MPR121_GPIOTOGGLE,  LED_GPIO_BIT);
+    uint8_t pwm0 = 4; // 0..15
+uint8_t pwm1 = 10;
+cap5C.writeRegister(MPR121_PWM0, (pwm1 << 4) | pwm0);  // 0x81: PWM1/PWM0
+uint8_t pwm2 = 7;
+uint8_t pwm3 = 7;
+cap5C.writeRegister(MPR121_PWM1, (pwm3 << 4) | pwm2);  // 0x82: PWM3/PWM2
+  }
+// Sample MPR121 electrode 0 and control LED on GPIO pin 6 every 100ms
+ 
   if (millis() - lastSampleTime >= SAMPLE_INTERVAL_MS) {
     lastSampleTime = millis();
 
-    
-//cap5C.writeRegister(MPR121_ECR, 0);
-    cap5C.writeRegister(MPR121_GPIOTOGGLE,  LED_GPIO_BIT);
-
-    /*
-  //byte PWM_SETTING =7; // 0-15, higher is brighter
-  byte PWM_SETTING =0; // 0-15, higher is brighter
-  uint8_t pwmReg = (PWM_SETTING << 4) | PWM_SETTING; 
-  cap5C.writeRegister(MPR121_PWM0, pwmReg);
-  cap5C.writeRegister(MPR121_PWM1, pwmReg);
-  cap5C.writeRegister(MPR121_PWM2, pwmReg);
-  cap5C.writeRegister(MPR121_PWM3, pwmReg);
-  //cap5C.writeRegister(MPR121_ECR, 0b000100110);
-  */
 
     //Serial.print(lastSampleTime);
     for (int i = 0; i < 6; i++) {
       Serial.print(" ");
       Serial.print(cap5C.filteredData(i));
+    
+    }
+    for (int i = 0; i < 6; i++) {
+      Serial.print(" ");
+      Serial.print(cap5A.filteredData(i));
     
     }
     Serial.println("");
