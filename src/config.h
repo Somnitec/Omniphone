@@ -40,8 +40,8 @@ namespace Note {
 }
 
 // ── Board setup ───────────────────────────────────────────────────────────────
-static constexpr uint8_t NUM_BOARDS        = 1;
-static constexpr uint8_t BOARD_ADDRESSES[] = { 0x5C, 0x5D, 0x00, 0x00 };
+static constexpr uint8_t NUM_BOARDS        = 2;
+static constexpr uint8_t BOARD_ADDRESSES[] = { 0x5B, 0x5D, 0x00, 0x00 };
 
 // ── Sensor descriptor ─────────────────────────────────────────────────────────
 struct SensorConfig {
@@ -54,21 +54,21 @@ struct SensorConfig {
 // Two boards × 6 electrodes = 12 sensors mapped to two octaves of C pentatonic.
 // Change noteFreq values here to retune individual pads.
 static constexpr SensorConfig SENSORS[] = {
-    // Board 0 (0x5C), ELE0–ELE5 → low octave
+    // Board 0 , ELE0–ELE5 → low octave
     { 0, 0, Note::C3 },
     { 0, 1, Note::D3 },
     { 0, 2, Note::E3 },
     { 0, 3, Note::G3 },
     { 0, 4, Note::A3 },
     { 0, 5, Note::C4 },
-    /*
-    // Board 1 (0x5D), ELE0–ELE5 → high octave
+    
+    // Board 1 , ELE0–ELE5 → high octave
     { 1, 0, Note::D4 },
     { 1, 1, Note::E4 },
     { 1, 2, Note::G4 },
     { 1, 3, Note::A4 },
     { 1, 4, Note::C5 },
-    { 1, 5, Note::D5 },*/
+    { 1, 5, Note::D5 },
 };
 
 static constexpr uint8_t NUM_SENSORS =

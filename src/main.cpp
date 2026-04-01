@@ -335,11 +335,11 @@ void loop() {
             float intensity = norm < 0.0f ? 0.0f : (norm > 1.0f ? 1.0f : norm);
 
             Serial.print(i);
+            Serial.print(F(":"));
+            Serial.print(sensorState[i].fast, 3);
             Serial.print(F(" "));
-            Serial.print(intensity, 3);
-            Serial.print(F(" "));
-            Serial.print(SENSORS[i].noteFreq, 1);
-            Serial.print(F("  "));
+            //Serial.print(SENSORS[i].noteFreq, 1);
+            //Serial.print(F("  "));
         }
         Serial.println();
     }
