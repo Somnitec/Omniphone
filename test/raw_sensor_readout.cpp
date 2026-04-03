@@ -21,7 +21,7 @@ static MPR121 boards[2] = {
 static SensorState sensorState[NUM_SENSORS];
 static ProximityConfig proxCfg; // uses struct default values from proximity_engine.h
 
-static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz sensor update rate
+//already defined in config.h static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz sensor update rate
 static uint32_t lastUpdateMs = 0;
 
 
