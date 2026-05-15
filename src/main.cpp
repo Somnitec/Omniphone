@@ -144,29 +144,36 @@ static void onTouch(uint8_t sensorIndex, float velocity)
 
 static void playStartupAnimation()
 {
-    uint8_t bri[6];
+    uint8_t bri[8];
     for (uint8_t v = 0; v <= 15; v++)
     {
         memset(bri, v, sizeof(bri));
         for (uint8_t b = 0; b < NUM_BOARDS; b++)
-            boards[b].setAllLEDs(bri);
+            boards[b].setLEDs8(bri);
         delay(10);
     }
     for (uint8_t v = 15; v > 0; v--)
     {
         memset(bri, v, sizeof(bri));
         for (uint8_t b = 0; b < NUM_BOARDS; b++)
-            boards[b].setAllLEDs(bri);
+            boards[b].setLEDs8(bri);
         delay(10);
     }
     memset(bri, 0, sizeof(bri));
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
-        boards[b].setAllLEDs(bri);
+        boards[b].setLEDs8(bri);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // setup()
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Force USB Full-Speed (12 Mbps) instead of High-Speed (480 Mbps).
+// Runs immediately after usb_init() via weak-symbol override, before the host
+// has time to enumerate — so the HS handshake never happens.
+extern "C" void startup_late_hook(void) {
+    USB1_PORTSC1 |= USB_PORTSC1_PFSC;
+}
 
 void setup()
 {
@@ -180,7 +187,7 @@ void setup()
     // ── MPR121 boards ────────────────────────────────────────────────────────
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
     {
-        if (!boards[b].begin())
+        if (!boards[b].begin(SENSE_ELECTRODES[b]))
         {
             Serial.print(F("ERROR: MPR121 board "));
             Serial.print(b);
@@ -201,6 +208,7 @@ void setup()
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
     {
         const SensorConfig &sc = SENSORS[i];
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
         uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
         uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
         int16_t raw = (int16_t)base - (int16_t)filt;
@@ -291,7 +299,8 @@ void loop()
     }
 
     // ── Per-sensor update ────────────────────────────────────────────────────
-    static uint8_t ledBri[NUM_BOARDS][6];
+    // ledBri is indexed by GPIO bit (g → ELE g+4); g=1..7 = ELE5..ELE11.
+    static uint8_t ledBri[NUM_BOARDS][8];
     memset(ledBri, 0, sizeof(ledBri));
 
     const SoundSet &ss = SOUND_SETS[activeSet];
@@ -299,7 +308,11 @@ void loop()
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
     {
         const SensorConfig &sc = SENSORS[i];
-        const BoardData    &b  = bd[sc.boardIndex];
+
+        // Disabled pad (e.g. dropped idx5): keep its voice silent, no LED.
+        if (sc.electrode == NO_PIN) { onProximity(i, 0.0f); continue; }
+
+        const BoardData &b = bd[sc.boardIndex];
         uint8_t e = sc.electrode;
 
         // Reconstruct 10-bit values from burst buffers
@@ -325,13 +338,23 @@ void loop()
         setVoiceFrequency(voices[i], freq);
 
         // ── LED brightness ───────────────────────────────────────────────────
-        ledBri[sc.boardIndex][e] = (intensity < 0.001f) ? 0
-            : static_cast<uint8_t>(1.0f + intensity * 14.0f + 0.5f);
+        // Explicit LED board + pin; GPIO bit = ledEle - 4 (ELE5→1 … ELE11→7).
+        // ledBoard may differ from the sense board (idx1: sense C, LED A).
+        if (sc.ledEle != NO_PIN)
+        {
+            ledBri[sc.ledBoard][sc.ledEle - 4] = (intensity < 0.001f) ? 0
+                : static_cast<uint8_t>(1.0f + intensity * 14.0f + 0.5f);
+        }
     }
 
     // ── Batch LED update ─────────────────────────────────────────────────────
+    // ELE9 (GPIO bit 5) has nothing wired to it, but the chip only lights the
+    // ELE10 LED (bit 6) when ELE9 is driven the same — mirror it per board.
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
-        boards[b].setAllLEDs(ledBri[b]);
+    {
+        ledBri[b][5] = ledBri[b][6]; // ELE9 ← ELE10
+        boards[b].setLEDs8(ledBri[b]);
+    }
 
     // ── Diagnostic output (10 Hz) ────────────────────────────────────────────
     static uint32_t lastDiagMs = 0;

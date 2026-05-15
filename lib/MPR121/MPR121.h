@@ -57,6 +57,7 @@ namespace MPR121Reg {
     static constexpr uint8_t GPIOCLR   = 0x79; // Write 1 to turn pin off
 
     // PWM brightness: each nibble is one GPIO pin, 0 = off, 15 = full
+    static constexpr uint8_t PWM0      = 0x81; // GPIO0 [3:0], GPIO1 [7:4]  ← ELE4, ELE5
     static constexpr uint8_t PWM1      = 0x82; // GPIO2 [3:0], GPIO3 [7:4]  ← LED 0, 1
     static constexpr uint8_t PWM2      = 0x83; // GPIO4 [3:0], GPIO5 [7:4]  ← LED 2, 3
     static constexpr uint8_t PWM3      = 0x84; // GPIO6 [3:0], GPIO7 [7:4]  ← LED 4, 5
@@ -98,7 +99,13 @@ public:
     void setLED(uint8_t ledIndex, uint8_t bri);
 
     // Write all 6 LED brightnesses in a minimal burst of I²C writes.
+    // (Legacy ELE6–ELE11 map; used by the test sketches.)
     void setAllLEDs(const uint8_t bri[6]);
+
+    // Generalised path: brightness indexed by GPIO bit, where index g drives
+    // ELE(g+4). g=0 (ELE4) is ignored (it's a touch electrode); g=1..7 cover
+    // ELE5–ELE11. 0 = off, 1–15 = dim–full. Used by the main firmware.
+    void setLEDs8(const uint8_t bri[8]);
 
     // ── Raw register access ──────────────────────────────────────────────────
     void    write(uint8_t reg, uint8_t val);

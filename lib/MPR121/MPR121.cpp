@@ -114,13 +114,15 @@ uint16_t MPR121::touchStatus() {
 // ── LED helpers ───────────────────────────────────────────────────────────────
 
 void MPR121::beginLEDs() {
-    // Configure ELE6–ELE11 as high-side open-drain outputs.
-    // CTL0=CTL1=1 sets the push-pull drive needed for the PWM dimming feature.
-    write(GPIOEN,   LED_MASK);
-    write(GPIODIR,  LED_MASK);
-    write(GPIOCTL0, LED_MASK);
-    write(GPIOCTL1, LED_MASK);
-    write(GPIOCLR,  LED_MASK); // All LEDs off on startup
+    // Configure ELE5–ELE11 (GPIO bits 1–7) as high-side open-drain outputs.
+    // CTL0=CTL1=1 is the open-drain LED-driver mode the hardware PWM needs.
+    // (ELE4/bit0 stays a touch electrode, so it's left out of the mask.)
+    constexpr uint8_t mask = 0xFE; // bits 1..7 = ELE5..ELE11
+    write(GPIOEN,   mask);
+    write(GPIODIR,  mask);
+    write(GPIOCTL0, mask);
+    write(GPIOCTL1, mask);
+    write(GPIOCLR,  mask); // All LEDs off on startup
 }
 
 void MPR121::setLED(uint8_t ledIndex, uint8_t bri) {
@@ -167,4 +169,28 @@ void MPR121::setAllLEDs(const uint8_t bri[6]) {
     write(PWM1, pwm[0]);
     write(PWM2, pwm[1]);
     write(PWM3, pwm[2]);
+}
+
+void MPR121::setLEDs8(const uint8_t bri[8]) {
+    uint8_t setMask = 0, clrMask = 0;
+    uint8_t pwm[4] = {0, 0, 0, 0}; // PWM0..PWM3 = 0x81..0x84
+
+    // g = GPIO bit; ELE(g+4). g=0 (ELE4) skipped — it's a touch electrode.
+    for (uint8_t g = 1; g < 8; g++) {
+        if (bri[g] == 0) {
+            clrMask |= (uint8_t)(1u << g);
+        } else {
+            setMask |= (uint8_t)(1u << g);
+            uint8_t reg = g / 2;                 // 0,1,1,2,2,3,3
+            if (g & 1) pwm[reg] |= (uint8_t)((bri[g] & 0x0F) << 4);
+            else       pwm[reg] |= (uint8_t)(bri[g] & 0x0F);
+        }
+    }
+
+    if (setMask) write(GPIOSET, setMask);
+    if (clrMask) write(GPIOCLR, clrMask);
+    write(PWM0, pwm[0]);
+    write(PWM1, pwm[1]);
+    write(PWM2, pwm[2]);
+    write(PWM3, pwm[3]);
 }
