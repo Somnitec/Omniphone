@@ -15,6 +15,10 @@
 static constexpr uint8_t NUM_BOARDS        = 2;
 static constexpr uint8_t BOARD_ADDRESSES[] = { 0x5A, 0x5C, 0x00, 0x00 };
 
+// Set to 1 only if a round LCD/touch screen is attached. 0 skips all LCD and
+// touchscreen init (and the GUI draws) — noticeably faster startup.
+#define ENABLE_SCREEN 0
+
 // ── Sensor descriptor ────────────────────────────────────────────────────────
 static constexpr uint8_t NO_PIN = 0xFF; // disabled pad / no LED
 
@@ -30,6 +34,16 @@ struct SensorConfig {
 //   A (0x5A): ELE0–ELE4 (5)  — ELE5 freed as a GPIO LED pin (idx1's lamp)
 //   C (0x5C): ELE0–ELE5 (6)  — idx5 senses on ELE5, LEDs limited to ELE6–ELE11
 static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 5, 6 };
+
+// MPR121 charge current / time (sensor gain). Controlled measurement
+// (test/proximity_tuning) shows the electrode does NOT couple beyond ~1 cm at
+// ANY CDC — this is a near-field/touch instrument, not a distance theremin
+// (electrode geometry limit, not firmware). Within the usable zone
+// (~1 cm → plastic → metal) CDC=16 gave the strongest, cleanest spread with
+// idle noise still ~1 (1 cm/plastic ≈ 5/22 vs 3/14 at CDC=10). CDC=48 was
+// over-saturated and felt dead — 16 is the measured sweet spot, not extreme.
+static constexpr uint8_t SENSOR_CDC = 16; // 0–63 (try 10 to A/B; both 1 line)
+static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-free LEDs)
 
 // ── Physical sensor layout (post ELE9/ELE10 rework) ──────────────────────────
 // 11 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C").
@@ -159,7 +173,7 @@ namespace JI {
 }
 
 // ── Sound sets ───────────────────────────────────────────────────────────────
-static constexpr uint8_t NUM_SOUND_SETS = 5;
+static constexpr uint8_t NUM_SOUND_SETS = 6;
 
 static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
     // ── 0: Hangdrum / D Kurd ─────────────────────────────────────────────────
@@ -232,11 +246,32 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         8000.0f,        // opens wide
         1.0f,           // clean, minimal resonance
     },
+
+    // ── 5: Bright Pentatonic (default) ───────────────────────────────────────
+    // Based on set 4 (sine, C major pentatonic) but voiced an octave up and
+    // re-mapped per pad so every touch-combination is consonant. Indices are
+    // serial-monitor pad numbers; the chord groups requested all resolve
+    // because a major pentatonic has no clashing intervals. {8,4,3} lands on
+    // A-minor (A C E) for a melancholic contrast among the bright voicings.
+    {
+        "Bright Pentatonic",
+        //  0=top   1     2     3     4     5         (upper ring / root)
+        { Note::C3, Note::E4, Note::G4, Note::A4, Note::C4, Note::D4,
+        //  6     7     8     9     10                (lower ring)
+          Note::C5, Note::D5, Note::E5, Note::G5, Note::A5 },
+        WAVEFORM_SINE,
+        0.20f,          // light sub — keep it clear, not boomy
+        400.0f,         // bright base
+        8500.0f,        // opens wide and shimmery
+        0.9f,           // clean, minimal resonance (no clip colouring)
+    },
 };
 
 // ── Synth parameters ─────────────────────────────────────────────────────────
 // Voice architecture
-static constexpr float MAIN_OSC_AMPLITUDE = 1.0f;  // main osc always full (DC controls level)
+// 0.6 (not 1.0): leaves headroom so main+sub and the resonant filter boost
+// don't clip before the dcAmp stage — clipping is what made sines sound buzzy.
+static constexpr float MAIN_OSC_AMPLITUDE = 0.6f;  // DC stage still sets final level
 static constexpr float SUB_OSC_AMPLITUDE  = 1.0f;  // sub osc always full (voiceMix controls blend)
 static constexpr float VOICE_MAX_AMP      = 0.45f; // max DC level per voice (prevents clipping)
 
@@ -251,6 +286,65 @@ static constexpr float AMP_RAMP_MS = 8.0f;  // matches update interval — smoot
 static constexpr float LFO_RATE_HZ   = 1.25f;  // slow drift cycle
 static constexpr float LFO_AMOUNT    = 0.003f;  // +/-0.3% pitch deviation (~5 cents at A4)
 static constexpr float LFO_RATE_SPREAD = 0.15f; // each voice's LFO rate offset to prevent phase-locking
+
+// Bell — short metallic transient fired on a metal-contact (touch) event,
+// i.e. when the delta spikes after the proximity volume is already maxed.
+static constexpr float BELL_MIX        = 0.20f;  // bell level in the master mixer (ch 3)
+static constexpr float BELL_AMP        = 0.55f;  // bell oscillator peak amplitude
+static constexpr float BELL_PARTIAL    = 2.76f;  // inharmonic 2nd partial → bell timbre
+static constexpr float BELL_OCTAVES    = 2.0f;   // bell pitch = note × this (sparkle above)
+static constexpr float BELL_FLOOR      = 0.01f;  // min bell level (softest tap)
+// ADSR: attack → decay to the sustain level (held while the pad is touched) →
+// release when the finger lifts. BELL_SUSTAIN = 0 makes it a pure pluck again.
+// NOTE: attack is intentionally ~the strike window so the velocity-derived
+// level locks in smoothly while the envelope is still ramping up (no click).
+static constexpr float BELL_ATTACK_MS   = 20.0f;
+static constexpr float BELL_DECAY_MS    = 280.0f;
+static constexpr float BELL_SUSTAIN     = 0.35f;  // ring level while held (0–1 of peak)
+static constexpr float BELL_RELEASE_MS  = 400.0f; // tail after the finger lifts
+static constexpr float BELL_HOLD_RELEASE = 0.15f; // proximity below this = "lifted" → note-off
+
+// Bell dynamics — driven by CONTACT VELOCITY (how fast the hand was moving
+// when it hit the metal). A capacitive pad can't sense press force; approach
+// speed is the only real expressive axis (gentle vs committed strike).
+//
+//   strike = clamp01( (peakVel − VEL_MIN) / (VEL_MAX − VEL_MIN) )
+//   level  = BELL_AMP × (BELL_FLOOR + (1−BELL_FLOOR) × (strike×GAIN)^CURVE)
+//
+// Starting point from captured taps (pad0, CDC10/CDT3): soft peakVel ≈ 63–80,
+// firm ≈ 86–99. Re-run test/strike_tuning per pad if pads differ a lot.
+//   VEL_MIN  velocity mapped to silence-floor (just below softest tap)
+//   VEL_MAX  velocity mapped to full volume   (≈ a firm strike)
+//   CURVE>1 expander (only committed hits get loud) · <1 more uniform
+//   GAIN scales strike before the curve (result clamped to 1)
+static constexpr float BELL_VEL_MIN     = 60.0f;  // CDC=10 capture: soft ≈ 63–81,
+static constexpr float BELL_VEL_MAX     = 100.0f; //   firm ≈ 86–99 (weak split — expected)
+static constexpr float BELL_CURVE       = 2.0f;
+static constexpr float BELL_STRIKE_GAIN = 1.0f;
+static constexpr uint32_t BELL_STRIKE_WIN_MS = 25; // peak-velocity capture window
+
+// ── Touch (metal-contact) trigger — algorithm lives in proximity_engine.h ─────
+// Tune here if triggering is inconsistent or repeated taps get missed:
+//   JUMP_THRESHOLD  contact spike needed to fire. LOWER = more sensitive and
+//                   more consistent, but too low = false fires on a fast
+//                   no-contact approach.
+//   RELEASE_RATIO   re-arms once the spike falls below ratio×threshold. HIGHER
+//                   (→1) re-arms sooner → fast repeated taps register better;
+//                   too high can double-fire one strike.
+//   COOLDOWN_MS     minimum ms between events per pad (edge debounce).
+static constexpr float    TOUCH_JUMP_THRESHOLD = 250.0f; // metal contact jumps ≫ this
+                                                          // (700+ at CDC=16); near-field
+                                                          // ≪ this → bell only on real touch
+static constexpr float    TOUCH_RELEASE_RATIO  = 0.5f;
+static constexpr uint32_t TOUCH_COOLDOWN_MS    = 10;
+
+// ── Proximity → volume mapping (intensity = (fast−deadband)/(proxMax−deadband))
+// From the CDC=16 capture: idle noise ≈ 1, ~1 cm ≈ 5, on plastic ≈ 22. So the
+// playable swell lives between a light near-touch and resting on the shell;
+// deadband sits just above idle noise, proxMax ≈ firm-plastic so the sound is
+// full by the time you rest on it (metal contact then adds the bell).
+static constexpr float PROX_DEADBAND = 2.0f;
+static constexpr float PROX_MAX      = 18.0f;
 
 // Update timing
 static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz sensor update rate

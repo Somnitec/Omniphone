@@ -26,6 +26,7 @@ void test_seed_initialises_emas() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, 15.0f, s.prevFast);
     TEST_ASSERT_FLOAT_WITHIN(0.001f,  0.0f, s.velocity);
     TEST_ASSERT_EQUAL_UINT32(0, s.lastTouchMs);
+    TEST_ASSERT_FALSE(s.inContact);
 }
 
 // Zero delta → zero intensity, no touch.
@@ -89,37 +90,43 @@ void test_fast_ema_decays_with_fall_alpha() {
     TEST_ASSERT_FLOAT_WITHIN(0.001f, expected, s.fast);
 }
 
-// A touch event fires once, then the cooldown prevents re-firing.
-// After the cooldown expires a second event can fire again.
-void test_touch_fires_once_then_cooldown() {
-    cfg.jumpThreshold = 5.0f;
-    cfg.cooldownMs    = 400;
+// Touch is edge-triggered: fires once on the rising edge, does NOT re-fire
+// while the pad is held (even long after the debounce window), and re-arms
+// only after the jump collapses (hand lifted) — then a new strike fires again.
+void test_touch_edge_triggered_with_hysteresis() {
+    cfg.jumpThreshold = 10.0f;
+    cfg.releaseRatio  = 0.5f;   // re-arm once jump < 5.0
+    cfg.cooldownMs    = 30;
 
     SensorState s;
-    // Pre-set state so fast >> slow, guaranteeing jump > threshold immediately.
-    s.fast        = 20.0f;
-    s.slow        = 0.0f;
-    s.prevFast    = 20.0f;
-    s.velocity    = 0.0f;
-    s.lastTouchMs = 0;
+    seedSensorState(s, 0.0f);
+    s.fast = 20.0f; s.slow = 0.0f; s.prevFast = 20.0f; // jump ≈ 20 > 10
 
     float intensity; bool touch;
 
-    // Frame 1 at t=1000 ms: cooldown not active, jump = ~19.8 > 5 → fires.
+    // Rising edge → fires once, latches.
     updateProximity(20.0f, 1000, cfg, s, intensity, touch);
     TEST_ASSERT_TRUE(touch);
-    TEST_ASSERT_EQUAL_UINT32(1000, s.lastTouchMs);
+    TEST_ASSERT_TRUE(s.inContact);
 
-    // Frame 2 at t=1200 ms: within cooldown window → must not fire.
-    updateProximity(20.0f, 1200, cfg, s, intensity, touch);
+    // Held high → must NOT re-fire, even far past the debounce window.
+    s.slow = 0.0f; // keep jump large (simulates a sustained hold)
+    updateProximity(20.0f, 2000, cfg, s, intensity, touch);
+    TEST_ASSERT_FALSE(touch);
+    s.slow = 0.0f;
+    updateProximity(20.0f, 5000, cfg, s, intensity, touch);
     TEST_ASSERT_FALSE(touch);
 
-    // Frame 3 at t=1500 ms: cooldown has expired (500 > 400 ms).
-    // Reset slow to 0 so the jump stays large enough to trigger again.
-    s.slow = 0.0f;
-    updateProximity(20.0f, 1500, cfg, s, intensity, touch);
+    // Hand lifts: jump collapses below releaseRatio×threshold → re-arm.
+    s.fast = 0.0f; s.slow = 0.0f;
+    updateProximity(0.0f, 6000, cfg, s, intensity, touch);
+    TEST_ASSERT_FALSE(touch);
+    TEST_ASSERT_FALSE(s.inContact);
+
+    // Next strike fires again.
+    s.fast = 20.0f; s.slow = 0.0f;
+    updateProximity(20.0f, 7000, cfg, s, intensity, touch);
     TEST_ASSERT_TRUE(touch);
-    TEST_ASSERT_EQUAL_UINT32(1500, s.lastTouchMs);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -133,6 +140,6 @@ int main() {
     RUN_TEST(test_intensity_above_proxmax_clamped_to_one);
     RUN_TEST(test_fast_ema_rises_faster_than_slow);
     RUN_TEST(test_fast_ema_decays_with_fall_alpha);
-    RUN_TEST(test_touch_fires_once_then_cooldown);
+    RUN_TEST(test_touch_edge_triggered_with_hysteresis);
     return UNITY_END();
 }

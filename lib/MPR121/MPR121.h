@@ -75,8 +75,11 @@ public:
     //   numElectrodes : how many of ELE0–ELE5 to use as touch inputs (1–6)
     //   touchTh       : raw hardware touch threshold (lower = more sensitive)
     //   releaseTh     : raw hardware release threshold (must be < touchTh)
+    //   cdc           : charge current 0–63 (sensor gain; see config.h notes)
+    //   cdt           : charge time 0–7 (ESI kept at 2 ms for flicker-free LEDs)
     bool begin(uint8_t numElectrodes = 6,
-               uint8_t touchTh = 40, uint8_t releaseTh = 20);
+               uint8_t touchTh = 40, uint8_t releaseTh = 20,
+               uint8_t cdc = 10, uint8_t cdt = 3);
 
     // ── Sensor reads ─────────────────────────────────────────────────────────
 

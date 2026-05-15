@@ -27,8 +27,43 @@ static Voice voices[NUM_SENSORS];
 
 // ── Mixer tree ───────────────────────────────────────────────────────────────
 AudioMixer4    stageMix[3];  // stage 1: up to 4 voices each
-AudioMixer4    masterMix;    // stage 2: combines 3 stage mixers
+AudioMixer4    masterMix;    // stage 2: combines 3 stage mixers + bell on ch 3
 AudioOutputI2S i2sOut;
+
+// ── Bell — one touch-transient voice per pad ─────────────────────────────────
+// One voice per pad (indexed by sensor) so several players striking different
+// pads at once never steal each other. Each voice: two sine partials
+// (fundamental + inharmonic) → fast envelope → 3-mixer tree → master ch 3.
+static constexpr uint8_t NUM_BELLS = NUM_SENSORS;
+static_assert(NUM_BELLS == 11, "BELL_WIRING below is hand-wired for 11 voices");
+
+AudioSynthWaveformSine bellOscA[NUM_BELLS];
+AudioSynthWaveformSine bellOscB[NUM_BELLS];
+AudioMixer4            bellVoiceMix[NUM_BELLS];
+AudioEffectEnvelope    bellEnv[NUM_BELLS];
+AudioMixer4            bellGroup[3]; // 4+4+3 voices
+AudioMixer4            bellSum;      // groups → master ch 3
+
+#define BELL_WIRING(K, G, CH)                                                \
+    AudioConnection bw##K##a(bellOscA[K],     0, bellVoiceMix[K], 0);        \
+    AudioConnection bw##K##b(bellOscB[K],     0, bellVoiceMix[K], 1);        \
+    AudioConnection bw##K##m(bellVoiceMix[K], 0, bellEnv[K],      0);        \
+    AudioConnection bw##K##e(bellEnv[K],      0, bellGroup[G],    CH);
+BELL_WIRING( 0, 0, 0)
+BELL_WIRING( 1, 0, 1)
+BELL_WIRING( 2, 0, 2)
+BELL_WIRING( 3, 0, 3)
+BELL_WIRING( 4, 1, 0)
+BELL_WIRING( 5, 1, 1)
+BELL_WIRING( 6, 1, 2)
+BELL_WIRING( 7, 1, 3)
+BELL_WIRING( 8, 2, 0)
+BELL_WIRING( 9, 2, 1)
+BELL_WIRING(10, 2, 2)
+AudioConnection bgs0(bellGroup[0], 0, bellSum, 0);
+AudioConnection bgs1(bellGroup[1], 0, bellSum, 1);
+AudioConnection bgs2(bellGroup[2], 0, bellSum, 2);
+AudioConnection bellOut(bellSum, 0, masterMix, 3);
 
 // ── Per-voice wiring (macro expands to 6 internal + 1 output connection) ─────
 //                      voice index, stage mixer,  channel
@@ -105,9 +140,11 @@ static void loadSoundSet(uint8_t index)
         initVoice(voices[i], ss, ss.freqs[i]);
     }
 
+#if ENABLE_SCREEN
     Paint_Clear(BLACK);
     Paint_DrawString_EN(35, 90, "OMNIPHONE", &Font20, BLACK, WHITE);
     Paint_DrawString_EN(30, 115, ss.name, &Font16, BLACK, WHITE);
+#endif
 
     Serial.print(F("# Sound set: "));
     Serial.println(ss.name);
@@ -131,11 +168,47 @@ static void onProximity(uint8_t sensorIndex, float intensity)
     setVoiceFilter(voices[sensorIndex], intensity, ss.filterBaseHz, ss.filterMaxHz);
 }
 
-// Called once on the frame a contact event is detected.
-static void onTouch(uint8_t sensorIndex, float velocity)
+// Per-pad bell state.
+static bool     bellHeld[NUM_BELLS]   = { false }; // sounding, awaiting lift → release
+static uint32_t bellArmMs[NUM_BELLS]  = { 0 };     // peak-velocity window deadline
+static float    bellPeakV[NUM_BELLS]  = { 0.0f };  // peak contact velocity so far
+
+// Contact velocity → bell oscillator amplitude (the dynamics curve).
+static float bellAmpFromVel(float vel)
 {
-    (void)sensorIndex;
-    (void)velocity;
+    float n = (vel - BELL_VEL_MIN) / (BELL_VEL_MAX - BELL_VEL_MIN);
+    n *= BELL_STRIKE_GAIN;
+    n = n < 0.0f ? 0.0f : (n > 1.0f ? 1.0f : n);
+    return BELL_AMP * (BELL_FLOOR + (1.0f - BELL_FLOOR) * powf(n, BELL_CURVE));
+}
+
+static void bellSetAmp(uint8_t k, float vel)
+{
+    float amp = bellAmpFromVel(vel);
+    bellOscA[k].amplitude(amp);
+    bellOscB[k].amplitude(amp * 0.5f);
+}
+
+// Called once on the frame a contact event is detected (rising edge). Triggers
+// the bell immediately at the provisional velocity, then opens a short window
+// during which loop() tracks the PEAK velocity and re-levels — the long-ish
+// attack means that final level lands smoothly with no click or latency.
+// One dedicated bell voice per pad (k = sensorIndex).
+static void onTouch(uint8_t sensorIndex, float velocity, uint32_t nowMs)
+{
+    const SoundSet &ss = SOUND_SETS[activeSet];
+    float fund = ss.freqs[sensorIndex] * BELL_OCTAVES;
+
+    uint8_t k = sensorIndex; // one bell per pad
+
+    bellOscA[k].frequency(fund);
+    bellOscB[k].frequency(fund * BELL_PARTIAL);
+    bellSetAmp(k, velocity);
+    bellEnv[k].noteOn();
+
+    bellHeld[k]  = true;                          // sustain until the finger lifts
+    bellArmMs[k] = nowMs + BELL_STRIKE_WIN_MS;    // refine level for this long
+    bellPeakV[k] = velocity;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -187,7 +260,7 @@ void setup()
     // ── MPR121 boards ────────────────────────────────────────────────────────
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
     {
-        if (!boards[b].begin(SENSE_ELECTRODES[b]))
+        if (!boards[b].begin(SENSE_ELECTRODES[b], 40, 20, SENSOR_CDC, SENSOR_CDT))
         {
             Serial.print(F("ERROR: MPR121 board "));
             Serial.print(b);
@@ -223,7 +296,7 @@ void setup()
     }
 
     // ── Teensy Audio ─────────────────────────────────────────────────────────
-    AudioMemory(150);
+    AudioMemory(220); // headroom for 11 voices + 11 bell voices
 
     // Stage mixer gains
     for (int ch = 0; ch < 4; ch++)
@@ -235,9 +308,38 @@ void setup()
     // Master mixer
     for (int ch = 0; ch < 3; ch++)
         masterMix.gain(ch, MASTER_GAIN);
-    masterMix.gain(3, 0.0f);
+    masterMix.gain(3, BELL_MIX); // ch 3 = summed bell voices
+
+    // Bell voices
+    for (uint8_t k = 0; k < NUM_BELLS; k++)
+    {
+        bellVoiceMix[k].gain(0, 0.65f); // fundamental partial
+        bellVoiceMix[k].gain(1, 0.35f); // inharmonic partial
+        bellVoiceMix[k].gain(2, 0.0f);
+        bellVoiceMix[k].gain(3, 0.0f);
+        bellEnv[k].attack(BELL_ATTACK_MS);
+        bellEnv[k].hold(0.0f);
+        bellEnv[k].decay(BELL_DECAY_MS);
+        bellEnv[k].sustain(BELL_SUSTAIN); // rings while the pad is held
+        bellEnv[k].release(BELL_RELEASE_MS);
+    }
+    for (uint8_t g = 0; g < 3; g++)
+        for (uint8_t ch = 0; ch < 4; ch++)
+            bellGroup[g].gain(ch, 0.6f); // headroom for many simultaneous bells
+    bellSum.gain(0, 1.0f);
+    bellSum.gain(1, 1.0f);
+    bellSum.gain(2, 1.0f);
+    bellSum.gain(3, 0.0f);
+
+    // Touch trigger tuning (see config.h)
+    proxCfg.jumpThreshold = TOUCH_JUMP_THRESHOLD;
+    proxCfg.releaseRatio  = TOUCH_RELEASE_RATIO;
+    proxCfg.cooldownMs    = TOUCH_COOLDOWN_MS;
+    proxCfg.proxDeadband  = PROX_DEADBAND;
+    proxCfg.proxMax       = PROX_MAX;
 
     // ── LCD / touch screen ───────────────────────────────────────────────────
+#if ENABLE_SCREEN
     Touch_1IN28_XY XY;
     XY.mode = 1;
 
@@ -249,17 +351,20 @@ void setup()
         Serial.println(F("Touchscreen OK"));
     else
         Serial.println(F("Touchscreen not found"));
+#endif
 
     // ── Startup animation ────────────────────────────────────────────────────
     playStartupAnimation();
 
     // ── Load default sound set ───────────────────────────────────────────────
+#if ENABLE_SCREEN
     Paint_NewImage(LCD_WIDTH, LCD_HEIGHT, 0, BLACK);
-    loadSoundSet(0);
+#endif
+    loadSoundSet(5); // start on the new Bright Pentatonic set
 
     Serial.println(F("# Omniphone started"));
-    Serial.println(F("# Send 0-4 to switch sound sets:"));
-    Serial.println(F("#   0=D Kurd  1=Just Intonation  2=Chromatic  3=Sad  4=Happy"));
+    Serial.println(F("# Send 0-5 to switch sound sets:"));
+    Serial.println(F("#   0=D Kurd 1=Just 2=Chromatic 3=Sad 4=Happy 5=Bright Pentatonic"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,7 +379,7 @@ void loop()
     if (Serial.available())
     {
         char c = Serial.read();
-        if (c >= '0' && c <= '4')
+        if (c >= '0' && c <= '5')
             loadSoundSet(c - '0');
     }
 
@@ -327,7 +432,26 @@ void loop()
         bool  isTouch;
         updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
 
-        if (isTouch) onTouch(i, sensorState[i].velocity);
+        if (isTouch)
+        {
+            // Contact velocity drives the dynamics (provisional level now;
+            // refined to the peak over the next BELL_STRIKE_WIN_MS).
+            onTouch(i, sensorState[i].velocity, now);
+        }
+        else if (now < bellArmMs[i])
+        {
+            if (sensorState[i].velocity > bellPeakV[i])
+            {
+                bellPeakV[i] = sensorState[i].velocity;
+                bellSetAmp(i, bellPeakV[i]); // re-level during the attack
+            }
+        }
+        else if (bellHeld[i] && intensity < BELL_HOLD_RELEASE)
+        {
+            // Finger lifted off the pad → ADSR release (the ring tails out).
+            bellEnv[i].noteOff();
+            bellHeld[i] = false;
+        }
         onProximity(i, intensity);
 
         // ── LFO pitch drift ──────────────────────────────────────────────────

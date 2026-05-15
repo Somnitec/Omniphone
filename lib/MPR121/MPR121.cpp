@@ -34,7 +34,8 @@ void MPR121::burstRead(uint8_t reg, uint8_t* buf, uint8_t n) {
 
 // ── Initialisation ────────────────────────────────────────────────────────────
 
-bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh) {
+bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
+                   uint8_t cdc, uint8_t cdt) {
     // ① Soft reset — all registers return to power-on defaults.
     write(SRST, 0x63);
     delay(50);
@@ -46,10 +47,10 @@ bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh) {
     // Default ESI=16ms causes one long PWM freeze per 8ms PWM period → flicker.
     // ESI=2ms spreads four short freezes (~144µs each) evenly across the 8ms
     // period, making the dimming nearly invisible.
-    //   CDC_CFG: FFI=00 (6 samples, fast scan), CDC=10µA charge current
-    //   CDT_CFG: CDT=2µs, SFI=4, ESI=2ms
-    write(CDC_CFG, 0b00001010);
-    write(CDT_CFG, 0b01100001);
+    //   CDC_CFG: FFI=00 (6 samples, fast scan), CDC = charge current
+    //   CDT_CFG: CDT charge time, SFI=00, ESI=2ms (flicker-free LEDs)
+    write(CDC_CFG, (uint8_t)(cdc & 0x3F));
+    write(CDT_CFG, (uint8_t)(((cdt & 0x07) << 5) | 0b001));
 
     // ── Touch / release thresholds ────────────────────────────────────────
     for (uint8_t i = 0; i < numElectrodes; i++) {

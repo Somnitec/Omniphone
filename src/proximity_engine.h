@@ -30,7 +30,8 @@ struct ProximityConfig {
     float    fastAlphaFall = 0.35f;  // EMA coefficient when hand is retreating
     float    slowAlpha     = 0.01f;  // slow EMA coefficient (ambient drift)
     float    velAlpha      = 0.30f;  // smoothing for the velocity estimate
-    uint32_t cooldownMs    = 400;    // minimum ms between touch events per pad
+    float    releaseRatio  = 0.5f;   // re-arm once jump falls below this × jumpThreshold
+    uint32_t cooldownMs    = 30;     // edge debounce — min ms between events per pad
 };
 
 // ── Per-sensor mutable state ─────────────────────────────────────────────────
@@ -39,7 +40,8 @@ struct SensorState {
     float    slow        = 0.0f; // slow EMA → ambient drift reference
     float    velocity    = 0.0f; // smoothed d(fast)/dt → approach speed at contact
     float    prevFast    = 0.0f;
-    uint32_t lastTouchMs = 0;    // timestamp of last touch event (ms)
+    uint32_t lastTouchMs = 0;     // timestamp of last touch event (ms)
+    bool     inContact   = false; // edge latch: true between a strike and its release
 };
 
 // ── Seed state from an initial reading ───────────────────────────────────────
@@ -51,6 +53,7 @@ inline void seedSensorState(SensorState& s, float initialDelta) {
     s.prevFast    = initialDelta;
     s.velocity    = 0.0f;
     s.lastTouchMs = 0;
+    s.inContact   = false;
 }
 
 // ── Update one sensor for the current frame ───────────────────────────────────
@@ -81,13 +84,23 @@ inline void updateProximity(float rawDelta, uint32_t nowMs,
     float norm     = (state.fast - cfg.proxDeadband) / (cfg.proxMax - cfg.proxDeadband);
     outIntensity   = norm < 0.0f ? 0.0f : (norm > 1.0f ? 1.0f : norm);
 
-    // ── Contact detection ─────────────────────────────────────────────────────
-    // The jump spikes when the hand suddenly contacts metal:
-    // fast catches the step change; slow cannot keep up.
+    // ── Contact detection (edge-triggered, with hysteresis) ───────────────────
+    // jump spikes when the hand suddenly contacts metal (fast catches the step,
+    // slow cannot keep up). Fire ONCE on the rising edge — not continuously
+    // while the pad is held. The latch re-arms only after jump falls back below
+    // releaseRatio × jumpThreshold (the hand has lifted), so a sustained hold
+    // never re-triggers and successive taps each register as their own edge.
     float jump = state.fast - state.slow;
-    outTouch   = (jump > cfg.jumpThreshold)
-                 && ((nowMs - state.lastTouchMs) > cfg.cooldownMs);
-    if (outTouch) {
-        state.lastTouchMs = nowMs;
+    outTouch   = false;
+
+    if (!state.inContact) {
+        if (jump > cfg.jumpThreshold &&
+            (nowMs - state.lastTouchMs) > cfg.cooldownMs) {
+            state.inContact   = true;
+            state.lastTouchMs = nowMs;
+            outTouch          = true;
+        }
+    } else if (jump < cfg.jumpThreshold * cfg.releaseRatio) {
+        state.inContact = false; // released — armed for the next strike
     }
 }
