@@ -37,17 +37,19 @@ AudioOutputI2S i2sOut;
 static constexpr uint8_t NUM_BELLS = NUM_SENSORS;
 static_assert(NUM_BELLS == 11, "BELL_WIRING below is hand-wired for 11 voices");
 
-AudioSynthWaveformSine bellOscA[NUM_BELLS];
-AudioSynthWaveformSine bellOscB[NUM_BELLS];
-AudioMixer4            bellVoiceMix[NUM_BELLS];
-AudioEffectEnvelope    bellEnv[NUM_BELLS];
-AudioMixer4            bellGroup[3]; // 4+4+3 voices
-AudioMixer4            bellSum;      // groups → master ch 3
+AudioSynthWaveformSine   bellOscA[NUM_BELLS];
+AudioSynthWaveformSine   bellOscB[NUM_BELLS];
+AudioMixer4              bellVoiceMix[NUM_BELLS];
+AudioFilterStateVariable bellFilt[NUM_BELLS]; // per-voice LP for pressure aftertouch
+AudioEffectEnvelope      bellEnv[NUM_BELLS];
+AudioMixer4              bellGroup[3]; // 4+4+3 voices
+AudioMixer4              bellSum;      // groups → master ch 3
 
 #define BELL_WIRING(K, G, CH)                                                \
     AudioConnection bw##K##a(bellOscA[K],     0, bellVoiceMix[K], 0);        \
     AudioConnection bw##K##b(bellOscB[K],     0, bellVoiceMix[K], 1);        \
-    AudioConnection bw##K##m(bellVoiceMix[K], 0, bellEnv[K],      0);        \
+    AudioConnection bw##K##f(bellVoiceMix[K], 0, bellFilt[K],     0);        \
+    AudioConnection bw##K##m(bellFilt[K],     0, bellEnv[K],      0);        \
     AudioConnection bw##K##e(bellEnv[K],      0, bellGroup[G],    CH);
 BELL_WIRING( 0, 0, 0)
 BELL_WIRING( 1, 0, 1)
@@ -83,8 +85,13 @@ VOICE_WIRING(10, stageMix[2], 2)
 AudioConnection pm0(stageMix[0], 0, masterMix, 0);
 AudioConnection pm1(stageMix[1], 0, masterMix, 1);
 AudioConnection pm2(stageMix[2], 0, masterMix, 2);
-AudioConnection pmL(masterMix, 0, i2sOut, 0);
-AudioConnection pmR(masterMix, 0, i2sOut, 1);
+// Balanced output: I2S L = +master, R = −master (180° inverted) so the two
+// channels drive a balanced differential line out (L−R = 2× signal, common-
+// mode noise cancels).
+AudioAmplifier  rInv;
+AudioConnection pmL (masterMix, 0, i2sOut, 0);
+AudioConnection pmRa(masterMix, 0, rInv,   0);
+AudioConnection pmR (rInv,      0, i2sOut, 1);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hardware
@@ -124,6 +131,53 @@ static uint8_t activeSet = 0;
 // ─────────────────────────────────────────────────────────────────────────────
 
 static uint32_t lastUpdateMs = 0;
+
+// Idle-recalibration state — kicks a full MPR121 baseline reload after a
+// long quiet period so slow drift can't produce phantom blips.
+static uint32_t lastActivityMs = 0;
+static uint32_t lastRecalMs    = 0;
+
+// Per-pad MPE / MIDI state.
+static uint8_t  midiNote     [NUM_BELLS] = { 0 };
+static uint8_t  lastPress127 [NUM_BELLS] = { 0 };
+static uint32_t lastPressMs  [NUM_BELLS] = { 0 };
+
+static inline uint8_t midiNoteFromFreq(float hz)
+{
+    int n = (int)lroundf(69.0f + 12.0f * log2f(hz / 440.0f));
+    if (n < 0)   n = 0;
+    if (n > 127) n = 127;
+    return (uint8_t)n;
+}
+
+static inline uint8_t mpeChannelFor(uint8_t pad)
+{
+    return (uint8_t)(MPE_MEMBER_BASE_CH + pad);
+}
+
+// Force a full MPR121 baseline reload (CL=11) on every board and re-seed the
+// proximity EMAs. ~60 ms of sensor pause; only ever called during a quiet
+// period so it isn't audible.
+static void recalibrateBaselines()
+{
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        boards[b].write(MPR121Reg::ECR, 0x00);
+        delay(10);
+        boards[b].write(MPR121Reg::ECR, (uint8_t)(0b11000000 | SENSE_ELECTRODES[b]));
+        delay(50);
+    }
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
+        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
+        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
+        int16_t raw = (int16_t)base - (int16_t)filt;
+        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+    }
+    Serial.println(F("# baseline recalibrated (idle)"));
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Load a sound set — configures all voices
@@ -172,6 +226,23 @@ static void onProximity(uint8_t sensorIndex, float intensity)
 static bool     bellHeld[NUM_BELLS]   = { false }; // sounding, awaiting lift → release
 static uint32_t bellArmMs[NUM_BELLS]  = { 0 };     // peak-velocity window deadline
 static float    bellPeakV[NUM_BELLS]  = { 0.0f };  // peak contact velocity so far
+static float    bellPress[NUM_BELLS]  = { 0.0f };  // smoothed aftertouch pressure 0–1
+
+// While a pad is held, the live contact strength modulates the bell's loudness
+// and its low-pass cutoff (polyphonic-aftertouch feel). `fast` is the raw
+// proximity EMA (hundreds when pressing metal), not the saturated intensity.
+static void bellApplyPressure(uint8_t k, float fast)
+{
+    float p = (fast - BELL_AFTER_MIN) / (BELL_AFTER_MAX - BELL_AFTER_MIN);
+    p = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
+    bellPress[k] += BELL_PRESS_SMOOTH * (p - bellPress[k]); // 1-pole anti-zipper
+    float ps = bellPress[k];
+
+    float amp = BELL_AMP * (BELL_FLOOR + (1.0f - BELL_FLOOR) * ps);
+    bellOscA[k].amplitude(amp);
+    bellOscB[k].amplitude(amp * 0.5f);
+    bellFilt[k].frequency(BELL_FILT_MIN_HZ + ps * (BELL_FILT_MAX_HZ - BELL_FILT_MIN_HZ));
+}
 
 // Contact velocity → bell oscillator amplitude (the dynamics curve).
 static float bellAmpFromVel(float vel)
@@ -209,6 +280,23 @@ static void onTouch(uint8_t sensorIndex, float velocity, uint32_t nowMs)
     bellHeld[k]  = true;                          // sustain until the finger lifts
     bellArmMs[k] = nowMs + BELL_STRIKE_WIN_MS;    // refine level for this long
     bellPeakV[k] = velocity;
+
+    // Seed the aftertouch pressure from the hit strength so the sustain
+    // doesn't dip before the live pressure tracking eases in.
+    float n = (velocity - BELL_VEL_MIN) / (BELL_VEL_MAX - BELL_VEL_MIN);
+    bellPress[k] = n < 0.0f ? 0.0f : (n > 1.0f ? 1.0f : n);
+
+    // ── MPE: noteOn on the pad's member channel ──
+    if (MPE_ENABLE)
+    {
+        midiNote[k] = midiNoteFromFreq(ss.freqs[sensorIndex]);
+        int vel = (int)lroundf(n * 127.0f);
+        if (vel < 1)   vel = 1;     // 0 = noteOff in MIDI
+        if (vel > 127) vel = 127;
+        usbMIDI.sendNoteOn(midiNote[k], (uint8_t)vel, mpeChannelFor(k));
+        lastPress127[k] = 0;
+        lastPressMs[k]  = 0;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -296,7 +384,7 @@ void setup()
     }
 
     // ── Teensy Audio ─────────────────────────────────────────────────────────
-    AudioMemory(220); // headroom for 11 voices + 11 bell voices
+    AudioMemory(280); // headroom for 11 voices + 11 filtered bell voices
 
     // Stage mixer gains
     for (int ch = 0; ch < 4; ch++)
@@ -309,6 +397,7 @@ void setup()
     for (int ch = 0; ch < 3; ch++)
         masterMix.gain(ch, MASTER_GAIN);
     masterMix.gain(3, BELL_MIX); // ch 3 = summed bell voices
+    rInv.gain(-1.0f);            // I2S right = inverted master → balanced output
 
     // Bell voices
     for (uint8_t k = 0; k < NUM_BELLS; k++)
@@ -322,6 +411,8 @@ void setup()
         bellEnv[k].decay(BELL_DECAY_MS);
         bellEnv[k].sustain(BELL_SUSTAIN); // rings while the pad is held
         bellEnv[k].release(BELL_RELEASE_MS);
+        bellFilt[k].resonance(BELL_FILT_Q);
+        bellFilt[k].frequency(BELL_FILT_MIN_HZ);
     }
     for (uint8_t g = 0; g < 3; g++)
         for (uint8_t ch = 0; ch < 4; ch++)
@@ -332,11 +423,13 @@ void setup()
     bellSum.gain(3, 0.0f);
 
     // Touch trigger tuning (see config.h)
-    proxCfg.jumpThreshold = TOUCH_JUMP_THRESHOLD;
-    proxCfg.releaseRatio  = TOUCH_RELEASE_RATIO;
-    proxCfg.cooldownMs    = TOUCH_COOLDOWN_MS;
-    proxCfg.proxDeadband  = PROX_DEADBAND;
-    proxCfg.proxMax       = PROX_MAX;
+    proxCfg.jumpThreshold     = TOUCH_JUMP_THRESHOLD;
+    proxCfg.releaseRatio      = TOUCH_RELEASE_RATIO;
+    proxCfg.cooldownMs        = TOUCH_COOLDOWN_MS;
+    proxCfg.confirmFrames     = TOUCH_CONFIRM_FRAMES;
+    proxCfg.proxConfirmFrames = PROX_CONFIRM_FRAMES;
+    proxCfg.proxDeadband      = PROX_DEADBAND;
+    proxCfg.proxMax           = PROX_MAX;
 
     // ── LCD / touch screen ───────────────────────────────────────────────────
 #if ENABLE_SCREEN
@@ -361,6 +454,21 @@ void setup()
     Paint_NewImage(LCD_WIDTH, LCD_HEIGHT, 0, BLACK);
 #endif
     loadSoundSet(5); // start on the new Bright Pentatonic set
+
+    // ── MPE Configuration Message ────────────────────────────────────────────
+    // RPN 6 on the master channel sets up MPE Zone 1: 11 member channels
+    // (pad 0 → ch 2, … pad 10 → ch 12).
+    if (MPE_ENABLE)
+    {
+        const uint8_t mch = MPE_MASTER_CH;
+        usbMIDI.sendControlChange(101, 0,            mch); // RPN MSB
+        usbMIDI.sendControlChange(100, 6,            mch); // RPN LSB = 6 (MCM)
+        usbMIDI.sendControlChange(  6, NUM_BELLS,    mch); // # of member channels
+        usbMIDI.sendControlChange(101, 127,          mch); // RPN null (MSB)
+        usbMIDI.sendControlChange(100, 127,          mch); // RPN null (LSB)
+    }
+
+    lastActivityMs = millis();
 
     Serial.println(F("# Omniphone started"));
     Serial.println(F("# Send 0-5 to switch sound sets:"));
@@ -410,6 +518,8 @@ void loop()
 
     const SoundSet &ss = SOUND_SETS[activeSet];
 
+    bool anyActive = false;
+
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
     {
         const SensorConfig &sc = SENSORS[i];
@@ -432,6 +542,8 @@ void loop()
         bool  isTouch;
         updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
 
+        if (intensity > IDLE_INTENSITY || bellHeld[i]) anyActive = true;
+
         if (isTouch)
         {
             // Contact velocity drives the dynamics (provisional level now;
@@ -446,11 +558,37 @@ void loop()
                 bellSetAmp(i, bellPeakV[i]); // re-level during the attack
             }
         }
-        else if (bellHeld[i] && intensity < BELL_HOLD_RELEASE)
+        else if (bellHeld[i])
         {
-            // Finger lifted off the pad → ADSR release (the ring tails out).
-            bellEnv[i].noteOff();
-            bellHeld[i] = false;
+            if (intensity < BELL_HOLD_RELEASE)
+            {
+                // Finger lifted → ADSR release (the ring tails out).
+                bellEnv[i].noteOff();
+                bellHeld[i] = false;
+                if (MPE_ENABLE)
+                    usbMIDI.sendNoteOff(midiNote[i], 0, mpeChannelFor(i));
+            }
+            else
+            {
+                // Held: live contact strength → bell loudness + filter.
+                bellApplyPressure(i, sensorState[i].fast);
+
+                // MPE: per-channel pressure (poly aftertouch), throttled.
+                if (MPE_ENABLE && (now - lastPressMs[i]) >= MPE_PRESSURE_THROTTLE_MS)
+                {
+                    int p = (int)lroundf(bellPress[i] * 127.0f);
+                    if (p < 0)   p = 0;
+                    if (p > 127) p = 127;
+                    int d = p - (int)lastPress127[i];
+                    if (d < 0) d = -d;
+                    if (d >= (int)MPE_PRESSURE_MIN_DELTA)
+                    {
+                        usbMIDI.sendAfterTouch((uint8_t)p, mpeChannelFor(i));
+                        lastPress127[i] = (uint8_t)p;
+                        lastPressMs[i]  = now;
+                    }
+                }
+            }
         }
         onProximity(i, intensity);
 
@@ -478,6 +616,19 @@ void loop()
     {
         ledBri[b][5] = ledBri[b][6]; // ELE9 ← ELE10
         boards[b].setLEDs8(ledBri[b]);
+    }
+
+    // ── Idle baseline recalibration ──────────────────────────────────────────
+    if (anyActive)
+    {
+        lastActivityMs = now;
+    }
+    else if ((now - lastActivityMs) > IDLE_RECAL_MS &&
+             (now - lastRecalMs)    > RECAL_COOLDOWN_MS)
+    {
+        recalibrateBaselines();
+        lastRecalMs    = now;
+        lastActivityMs = now;
     }
 
     // ── Diagnostic output (10 Hz) ────────────────────────────────────────────

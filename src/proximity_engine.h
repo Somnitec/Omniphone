@@ -32,6 +32,11 @@ struct ProximityConfig {
     float    velAlpha      = 0.30f;  // smoothing for the velocity estimate
     float    releaseRatio  = 0.5f;   // re-arm once jump falls below this × jumpThreshold
     uint32_t cooldownMs    = 30;     // edge debounce — min ms between events per pad
+    uint8_t  confirmFrames = 1;      // consecutive over-threshold frames before firing
+                                     // (1 = instant; >1 rejects single-sample glitches)
+    uint8_t  proxConfirmFrames = 1;  // fast must be over deadband this many frames
+                                     // in a row before intensity is allowed to rise
+                                     // (rejects short proximity blips, ~8 ms each)
 };
 
 // ── Per-sensor mutable state ─────────────────────────────────────────────────
@@ -42,6 +47,8 @@ struct SensorState {
     float    prevFast    = 0.0f;
     uint32_t lastTouchMs = 0;     // timestamp of last touch event (ms)
     bool     inContact   = false; // edge latch: true between a strike and its release
+    uint8_t  overCount   = 0;     // consecutive frames jump has been over-threshold
+    uint8_t  aboveCount  = 0;     // consecutive frames fast has been over the deadband
 };
 
 // ── Seed state from an initial reading ───────────────────────────────────────
@@ -54,6 +61,8 @@ inline void seedSensorState(SensorState& s, float initialDelta) {
     s.velocity    = 0.0f;
     s.lastTouchMs = 0;
     s.inContact   = false;
+    s.overCount   = 0;
+    s.aboveCount  = 0;
 }
 
 // ── Update one sensor for the current frame ───────────────────────────────────
@@ -84,6 +93,15 @@ inline void updateProximity(float rawDelta, uint32_t nowMs,
     float norm     = (state.fast - cfg.proxDeadband) / (cfg.proxMax - cfg.proxDeadband);
     outIntensity   = norm < 0.0f ? 0.0f : (norm > 1.0f ? 1.0f : norm);
 
+    // Hold intensity at 0 until fast has stayed above the deadband for
+    // proxConfirmFrames in a row → kills short single-frame transient blips.
+    if (state.fast > cfg.proxDeadband) {
+        if (state.aboveCount < 255) state.aboveCount++;
+    } else {
+        state.aboveCount = 0;
+    }
+    if (state.aboveCount < cfg.proxConfirmFrames) outIntensity = 0.0f;
+
     // ── Contact detection (edge-triggered, with hysteresis) ───────────────────
     // jump spikes when the hand suddenly contacts metal (fast catches the step,
     // slow cannot keep up). Fire ONCE on the rising edge — not continuously
@@ -96,11 +114,19 @@ inline void updateProximity(float rawDelta, uint32_t nowMs,
     if (!state.inContact) {
         if (jump > cfg.jumpThreshold &&
             (nowMs - state.lastTouchMs) > cfg.cooldownMs) {
-            state.inContact   = true;
-            state.lastTouchMs = nowMs;
-            outTouch          = true;
+            // Require N consecutive over-threshold frames so a single-sample
+            // electrical glitch can't fire a phantom touch.
+            if (++state.overCount >= cfg.confirmFrames) {
+                state.inContact   = true;
+                state.lastTouchMs = nowMs;
+                state.overCount   = 0;
+                outTouch          = true;
+            }
+        } else {
+            state.overCount = 0; // streak broken — reset
         }
     } else if (jump < cfg.jumpThreshold * cfg.releaseRatio) {
         state.inContact = false; // released — armed for the next strike
+        state.overCount = 0;
     }
 }

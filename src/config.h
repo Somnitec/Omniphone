@@ -42,7 +42,7 @@ static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 5, 6 };
 // (~1 cm → plastic → metal) CDC=16 gave the strongest, cleanest spread with
 // idle noise still ~1 (1 cm/plastic ≈ 5/22 vs 3/14 at CDC=10). CDC=48 was
 // over-saturated and felt dead — 16 is the measured sweet spot, not extreme.
-static constexpr uint8_t SENSOR_CDC = 16; // 0–63 (try 10 to A/B; both 1 line)
+static constexpr uint8_t SENSOR_CDC = 14; // 0–63 (try 10 to A/B; both 1 line)
 static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-free LEDs)
 
 // ── Physical sensor layout (post ELE9/ELE10 rework) ──────────────────────────
@@ -304,6 +304,17 @@ static constexpr float BELL_SUSTAIN     = 0.35f;  // ring level while held (0–
 static constexpr float BELL_RELEASE_MS  = 400.0f; // tail after the finger lifts
 static constexpr float BELL_HOLD_RELEASE = 0.15f; // proximity below this = "lifted" → note-off
 
+// Bell pressure aftertouch — while a pad is HELD, the live contact strength
+// (raw fast value, not the saturated 0–1 intensity) modulates the bell's
+// loudness AND a per-voice low-pass filter, like polyphonic aftertouch.
+// From CDC=16 capture: light contact ≈ 22, firm press on metal ≈ 800.
+static constexpr float BELL_AFTER_MIN   = 30.0f;   // fast at/below → quiet & dark
+static constexpr float BELL_AFTER_MAX   = 600.0f;  // fast at/above → loud & bright
+static constexpr float BELL_FILT_MIN_HZ = 350.0f;  // cutoff at min pressure
+static constexpr float BELL_FILT_MAX_HZ = 6500.0f; // cutoff at max pressure
+static constexpr float BELL_FILT_Q      = 1.1f;    // bell filter resonance
+static constexpr float BELL_PRESS_SMOOTH = 0.20f;  // 1-pole smoothing on pressure (anti-zipper)
+
 // Bell dynamics — driven by CONTACT VELOCITY (how fast the hand was moving
 // when it hit the metal). A capacitive pad can't sense press force; approach
 // speed is the only real expressive axis (gentle vs committed strike).
@@ -337,14 +348,42 @@ static constexpr float    TOUCH_JUMP_THRESHOLD = 250.0f; // metal contact jumps 
                                                           // ≪ this → bell only on real touch
 static constexpr float    TOUCH_RELEASE_RATIO  = 0.5f;
 static constexpr uint32_t TOUCH_COOLDOWN_MS    = 10;
+// Consecutive frames the jump must stay over-threshold before a touch fires.
+// 2 rejects single-sample electrical glitches (the idle "blip") at the cost of
+// one extra 8 ms frame of latency. 1 = original instant behaviour.
+static constexpr uint8_t  TOUCH_CONFIRM_FRAMES = 2;
+// Same idea for the proximity intensity: hold at 0 until the fast EMA has
+// stayed above PROX_DEADBAND for this many frames → kills the brief 0.05-ish
+// monitor blips. ~8 ms of added onset latency per extra frame.
+static constexpr uint8_t  PROX_CONFIRM_FRAMES  = 2;
 
 // ── Proximity → volume mapping (intensity = (fast−deadband)/(proxMax−deadband))
 // From the CDC=16 capture: idle noise ≈ 1, ~1 cm ≈ 5, on plastic ≈ 22. So the
 // playable swell lives between a light near-touch and resting on the shell;
 // deadband sits just above idle noise, proxMax ≈ firm-plastic so the sound is
 // full by the time you rest on it (metal contact then adds the bell).
-static constexpr float PROX_DEADBAND = 2.0f;
+static constexpr float PROX_DEADBAND = 4.0f;  // ↑ from 2: rejects small idle transients
+                                              // (1 cm ≈ 5 at CDC=16 still registers)
 static constexpr float PROX_MAX      = 18.0f;
+
+// ── Idle baseline recalibration ──────────────────────────────────────────────
+// If nothing is happening for IDLE_RECAL_MS, force a full MPR121 baseline
+// reload + re-seed the EMAs to kill drift-induced phantom blips. Skipped if a
+// recal already ran within RECAL_COOLDOWN_MS (avoid hammering).
+static constexpr uint32_t IDLE_RECAL_MS      = 5000;
+static constexpr uint32_t RECAL_COOLDOWN_MS  = 10000;
+static constexpr float    IDLE_INTENSITY     = 0.02f; // any pad above this counts as active
+
+// ── MPE (USB-MIDI) output ────────────────────────────────────────────────────
+// Each pad gets its own member channel for polyphonic aftertouch (channel
+// pressure). Notes are sent at the nearest semitone — DAW handles any further
+// tuning. The Teensy keeps producing audio at the same time (dual mode);
+// unplug the audio jack if you only want the MIDI.
+static constexpr bool     MPE_ENABLE              = true;
+static constexpr uint8_t  MPE_MASTER_CH           = 1;   // 1-indexed MIDI channel
+static constexpr uint8_t  MPE_MEMBER_BASE_CH      = 2;   // pad 0 → ch 2, pad 10 → ch 12
+static constexpr uint32_t MPE_PRESSURE_THROTTLE_MS = 20; // ≤50 Hz per pad
+static constexpr uint8_t  MPE_PRESSURE_MIN_DELTA  = 2;   // skip if change < this (0–127)
 
 // Update timing
 static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz sensor update rate
