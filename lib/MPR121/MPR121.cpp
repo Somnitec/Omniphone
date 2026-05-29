@@ -34,59 +34,52 @@ void MPR121::burstRead(uint8_t reg, uint8_t* buf, uint8_t n) {
 
 // ── Initialisation ────────────────────────────────────────────────────────────
 
-bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
-                   uint8_t cdc, uint8_t cdt) {
-    // ① Soft reset — all registers return to power-on defaults.
+// Configure the chip but leave it stopped — no scanning yet. Use this when
+// you want to read raw filtered data with the baseline frozen (CL=00) before
+// committing the final baseline lock via lockBaseline().
+bool MPR121::beginConfig(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
+                         uint8_t cdc, uint8_t cdt) {
     write(SRST, 0x63);
     delay(50);
-
-    // ② Stop mode — most registers can only be written while the chip is stopped.
     write(ECR, 0x00);
 
-    // ── Scan timing (flicker fix) ──────────────────────────────────────────
-    // Default ESI=16ms causes one long PWM freeze per 8ms PWM period → flicker.
-    // ESI=2ms spreads four short freezes (~144µs each) evenly across the 8ms
-    // period, making the dimming nearly invisible.
-    //   CDC_CFG: FFI=00 (6 samples, fast scan), CDC = charge current
-    //   CDT_CFG: CDT charge time, SFI=00, ESI=2ms (flicker-free LEDs)
     write(CDC_CFG, (uint8_t)(cdc & 0x3F));
     write(CDT_CFG, (uint8_t)(((cdt & 0x07) << 5) | 0b001));
 
-    // ── Touch / release thresholds ────────────────────────────────────────
     for (uint8_t i = 0; i < numElectrodes; i++) {
         write(TOUCH_TH0 + 2 * i, touchTh);
         write(REL_TH0   + 2 * i, releaseTh);
     }
 
-    // ── Baseline filter tuning ────────────────────────────────────────────
-    // Rising path (filt > baseline): happens at rest and after hand leaves.
-    // Track quickly so the baseline re-locks between interactions.
-    write(MHD_R,  4);   // Up to 4 counts per sample step
-    write(NHD_R,  2);   // 2-count increments when drifting
-    write(NCL_R,  5);   // Only 5 consecutive samples needed to update
-    write(FDL_R,  5);   // Short filter delay → fast recovery
-    //
-    // Falling path (filt < baseline): happens when hand approaches.
-    // Track very slowly so the baseline does NOT chase the hand signal
-    // and cancel the measurement.
-    write(MHD_F,   1);
-    write(NHD_F,   1);
-    write(NCL_F, 200);  // 200 consecutive samples before baseline moves
-    write(FDL_F, 255);  // Maximum delay → baseline essentially frozen during approach
+    write(MHD_R,  4);  write(NHD_R,  2);  write(NCL_R,   5); write(FDL_R,   5);
+    write(MHD_F,  1);  write(NHD_F,  1);  write(NCL_F, 200); write(FDL_F, 255);
+    return true;
+}
 
-    // ── Start mode ────────────────────────────────────────────────────────
-    // CL=10: load baseline from the first measurement (clean instrument start).
-    // ELE_EN: enable the requested number of electrodes.
-    write(ECR, static_cast<uint8_t>(0b10000000 | (numElectrodes & 0x0F)));
+// Start scanning. baselineMode is the CL field (00=no init/frozen,
+// 10=load from 5 MSBs, 11=load from full 10 bits then track).
+void MPR121::startScanning(uint8_t numElectrodes, uint8_t baselineMode) {
+    write(ECR, (uint8_t)(((baselineMode & 0x03) << 6) | (numElectrodes & 0x0F)));
     delay(50);
+}
 
-    // Force a clean full-precision baseline reload:
-    // wait for filtered data to settle, then re-enter with CL=11 (full 10-bit load).
+// Force the chip to take the current filtered data as the new baseline (CL=11
+// reload). Use after a quiet period — anything sitting under the hand becomes
+// the new zero. Must be in run mode already (this stops, settles, restarts).
+void MPR121::lockBaseline(uint8_t numElectrodes) {
+    // 200 ms ≈ 100 scan cycles at ESI=2 ms — plenty for filtered EMA to settle.
     delay(200);
     write(ECR, 0x00);
     delay(10);
-    write(ECR, static_cast<uint8_t>(0b11000000 | (numElectrodes & 0x0F)));
+    write(ECR, (uint8_t)(0b11000000 | (numElectrodes & 0x0F)));
     delay(50);
+}
+
+bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
+                   uint8_t cdc, uint8_t cdt) {
+    if (!beginConfig(numElectrodes, touchTh, releaseTh, cdc, cdt)) return false;
+    startScanning(numElectrodes, 0b10); // CL=10: track from first sample
+    lockBaseline(numElectrodes);         // CL=11: full reload after settle
 
     return true; // The chip has no WHO_AM_I register; connectivity is assumed OK.
 }

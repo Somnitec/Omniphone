@@ -155,29 +155,8 @@ static inline uint8_t mpeChannelFor(uint8_t pad)
     return (uint8_t)(MPE_MEMBER_BASE_CH + pad);
 }
 
-// Force a full MPR121 baseline reload (CL=11) on every board and re-seed the
-// proximity EMAs. ~60 ms of sensor pause; only ever called during a quiet
-// period so it isn't audible.
-static void recalibrateBaselines()
-{
-    for (uint8_t b = 0; b < NUM_BOARDS; b++)
-    {
-        boards[b].write(MPR121Reg::ECR, 0x00);
-        delay(10);
-        boards[b].write(MPR121Reg::ECR, (uint8_t)(0b11000000 | SENSE_ELECTRODES[b]));
-        delay(50);
-    }
-    for (uint8_t i = 0; i < NUM_SENSORS; i++)
-    {
-        const SensorConfig &sc = SENSORS[i];
-        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
-        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
-        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
-        int16_t raw = (int16_t)base - (int16_t)filt;
-        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
-    }
-    Serial.println(F("# baseline recalibrated (idle)"));
-}
+// Forward decl — definition is below the bell state (uses bellHeld / bellPress).
+static void recalibrateBaselines();
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Load a sound set — configures all voices
@@ -193,6 +172,9 @@ static void loadSoundSet(uint8_t index)
     {
         initVoice(voices[i], ss, ss.freqs[i]);
     }
+
+    // Per-set bell loudness in the master mixer.
+    masterMix.gain(3, ss.bellMix);
 
 #if ENABLE_SCREEN
     Paint_Clear(BLACK);
@@ -227,6 +209,48 @@ static bool     bellHeld[NUM_BELLS]   = { false }; // sounding, awaiting lift �
 static uint32_t bellArmMs[NUM_BELLS]  = { 0 };     // peak-velocity window deadline
 static float    bellPeakV[NUM_BELLS]  = { 0.0f };  // peak contact velocity so far
 static float    bellPress[NUM_BELLS]  = { 0.0f };  // smoothed aftertouch pressure 0–1
+
+// Per-pad "stuck" window — to detect a baseline shift that's faking activity.
+static uint32_t stuckStartMs[NUM_SENSORS] = { 0 };
+static float    stuckMin    [NUM_SENSORS] = { 0.0f };
+static float    stuckMax    [NUM_SENSORS] = { 0.0f };
+
+// Force a full MPR121 baseline reload (CL=11) on every board, release any
+// sustained bells, and re-seed the proximity EMAs. ~60 ms of sensor pause;
+// only called during a quiet period or when a stuck pad is detected, so the
+// existing 8 ms voice ramp + 400 ms bell release handle the fade.
+static void recalibrateBaselines()
+{
+    for (uint8_t i = 0; i < NUM_BELLS; i++)
+    {
+        if (bellHeld[i])
+        {
+            bellEnv[i].noteOff();
+            bellHeld[i] = false;
+            if (MPE_ENABLE)
+                usbMIDI.sendNoteOff(midiNote[i], 0, mpeChannelFor(i));
+        }
+        bellPress[i] = 0.0f;
+    }
+
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        boards[b].write(MPR121Reg::ECR, 0x00);
+        delay(10);
+        boards[b].write(MPR121Reg::ECR, (uint8_t)(0b11000000 | SENSE_ELECTRODES[b]));
+        delay(50);
+    }
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
+        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
+        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
+        int16_t raw = (int16_t)base - (int16_t)filt;
+        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+    }
+    Serial.println(F("# baseline recalibrated"));
+}
 
 // While a pad is held, the live contact strength modulates the bell's loudness
 // and its low-pass cutoff (polyphonic-aftertouch feel). `fast` is the raw
@@ -311,14 +335,14 @@ static void playStartupAnimation()
         memset(bri, v, sizeof(bri));
         for (uint8_t b = 0; b < NUM_BOARDS; b++)
             boards[b].setLEDs8(bri);
-        delay(10);
+        delay(5);
     }
     for (uint8_t v = 15; v > 0; v--)
     {
         memset(bri, v, sizeof(bri));
         for (uint8_t b = 0; b < NUM_BOARDS; b++)
             boards[b].setLEDs8(bri);
-        delay(10);
+        delay(5);
     }
     memset(bri, 0, sizeof(bri));
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
@@ -345,10 +369,10 @@ void setup()
     Wire.begin();
     Wire.setClock(100000);
 
-    // ── MPR121 boards ────────────────────────────────────────────────────────
+    // ── MPR121 boards (staged init so we can read pads BEFORE baseline lock) ─
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
     {
-        if (!boards[b].begin(SENSE_ELECTRODES[b], 40, 20, SENSOR_CDC, SENSOR_CDT))
+        if (!boards[b].beginConfig(SENSE_ELECTRODES[b], 40, 20, SENSOR_CDC, SENSOR_CDT))
         {
             Serial.print(F("ERROR: MPR121 board "));
             Serial.print(b);
@@ -362,18 +386,38 @@ void setup()
             Serial.print(b);
             Serial.println(F(" OK"));
         }
+        // CL=00 = baseline frozen at 0 → raw filtered reads. Lets us see if a
+        // finger is on a pad before we commit a baseline that would hide it.
+        boards[b].startScanning(SENSE_ELECTRODES[b], 0b00);
         boards[b].beginLEDs();
     }
 
-    // ── Seed per-sensor EMA state ────────────────────────────────────────────
-    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    // ── Pick the startup sound set: pad-held overrides default ───────────────
+    delay(25); // let filtered data populate
+    uint8_t startupSet = STARTUP_SET_DEFAULT;
+    uint8_t heldPad    = 0xFF; // 0xFF = none
     {
-        const SensorConfig &sc = SENSORS[i];
-        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
-        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
-        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
-        int16_t raw = (int16_t)base - (int16_t)filt;
-        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+        const SensorConfig &refS = SENSORS[STARTUP_REF_PAD];
+        uint16_t refF = boards[refS.boardIndex].filteredData(refS.electrode);
+
+        // Finger lowers the filtered value sharply. List order = priority.
+        for (uint8_t bi = 0; bi < NUM_STARTUP_BINDINGS; bi++)
+        {
+            const StartupBinding &b = STARTUP_BINDINGS[bi];
+            const SensorConfig   &s = SENSORS[b.pad];
+            uint16_t padF = boards[s.boardIndex].filteredData(s.electrode);
+            if ((int16_t)refF - (int16_t)padF > STARTUP_HOLD_THRESHOLD)
+            {
+                startupSet = b.soundSet;
+                heldPad    = b.pad;
+                break;
+            }
+        }
+        if (heldPad != 0xFF)
+        {
+            Serial.print(F("# hold detected on pad ")); Serial.print(heldPad);
+            Serial.print(F(" → set "));                 Serial.println(startupSet);
+        }
     }
 
     // ── LFO phases — spread evenly, rates slightly different per voice ───────
@@ -446,14 +490,69 @@ void setup()
         Serial.println(F("Touchscreen not found"));
 #endif
 
-    // ── Startup animation ────────────────────────────────────────────────────
-    playStartupAnimation();
+    // ── Startup animation / hold-confirmation sequence ──────────────────────
+    if (heldPad == 0xFF)
+    {
+        // Normal boot — quick LED ramp is also the "settle" window.
+        playStartupAnimation();
+    }
+    else
+    {
+        // Hold-override boot — keep ALL LEDs solid while the user is pressing
+        // (visual confirmation the override took), fade them after release,
+        // then wait 1 s before locking the baseline so the chip sees the
+        // fully-released state.
+        const SensorConfig &refS  = SENSORS[STARTUP_REF_PAD];
+        const SensorConfig &heldS = SENSORS[heldPad];
 
-    // ── Load default sound set ───────────────────────────────────────────────
+        uint8_t fullBri[8];
+        memset(fullBri, 15, sizeof(fullBri));
+        uint32_t holdStart = millis();
+        while (true)
+        {
+            for (uint8_t b = 0; b < NUM_BOARDS; b++) boards[b].setLEDs8(fullBri);
+            delay(20);
+            uint16_t refF = boards[refS.boardIndex ].filteredData(refS.electrode);
+            uint16_t padF = boards[heldS.boardIndex].filteredData(heldS.electrode);
+            // Hysteresis on release: drop below half-threshold = released.
+            if ((int16_t)refF - (int16_t)padF < STARTUP_HOLD_THRESHOLD / 2) break;
+            // Safety: don't hang forever (30 s max).
+            if (millis() - holdStart > 30000) break;
+        }
+
+        // Fade LEDs down.
+        uint8_t bri[8];
+        for (int v = 15; v >= 0; v--)
+        {
+            memset(bri, (uint8_t)v, sizeof(bri));
+            for (uint8_t b = 0; b < NUM_BOARDS; b++) boards[b].setLEDs8(bri);
+            delay(25);
+        }
+
+        // 1 s pause so any residual finger capacitance settles.
+        delay(1000);
+    }
+
+    // ── Commit the baseline now that the finger is (presumably) released ─────
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+        boards[b].lockBaseline(SENSE_ELECTRODES[b]);
+
+    // ── Seed per-sensor EMA state from the freshly locked baseline ──────────
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
+        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
+        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
+        int16_t raw = (int16_t)base - (int16_t)filt;
+        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+    }
+
+    // ── Load chosen sound set (default OR overridden by a startup-held pad) ──
 #if ENABLE_SCREEN
     Paint_NewImage(LCD_WIDTH, LCD_HEIGHT, 0, BLACK);
 #endif
-    loadSoundSet(5); // start on the new Bright Pentatonic set
+    loadSoundSet(startupSet);
 
     // ── MPE Configuration Message ────────────────────────────────────────────
     // RPN 6 on the master channel sets up MPE Zone 1: 11 member channels
@@ -471,8 +570,8 @@ void setup()
     lastActivityMs = millis();
 
     Serial.println(F("# Omniphone started"));
-    Serial.println(F("# Send 0-5 to switch sound sets:"));
-    Serial.println(F("#   0=D Kurd 1=Just 2=Chromatic 3=Sad 4=Happy 5=Bright Pentatonic"));
+    Serial.println(F("# Send 0-6 to switch sound sets:"));
+    Serial.println(F("#   0=D Kurd 1=Just 2=Chromatic 3=Sad 4=Happy 5=Pentatonic 6=Harm.Minor"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -487,7 +586,7 @@ void loop()
     if (Serial.available())
     {
         char c = Serial.read();
-        if (c >= '0' && c <= '5')
+        if (c >= '0' && c <= '6')
             loadSoundSet(c - '0');
     }
 
@@ -543,6 +642,49 @@ void loop()
         updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
 
         if (intensity > IDLE_INTENSITY || bellHeld[i]) anyActive = true;
+
+        // ── Stuck-pad detection (baseline drift faking activity) ─────────────
+        // A real hand jitters; a stuck wire drift does not. Only watch pads
+        // that are "active" but neither touch-confirmed nor bell-sustaining.
+        bool exempt = (intensity <= 0.0f)
+                    || sensorState[i].inContact
+                    || bellHeld[i];
+        if (exempt)
+        {
+            stuckStartMs[i] = 0; // reset the window — legitimate state
+        }
+        else if (stuckStartMs[i] == 0)
+        {
+            stuckStartMs[i] = now;
+            stuckMin[i] = stuckMax[i] = sensorState[i].fast;
+        }
+        else
+        {
+            float f = sensorState[i].fast;
+            if (f < stuckMin[i]) stuckMin[i] = f;
+            if (f > stuckMax[i]) stuckMax[i] = f;
+            if ((now - stuckStartMs[i]) > STUCK_WINDOW_MS)
+            {
+                if ((stuckMax[i] - stuckMin[i]) < STUCK_JITTER_FLOOR)
+                {
+                    Serial.print(F("# stuck pad ")); Serial.print(i);
+                    Serial.println(F(" — recalibrating"));
+                    recalibrateBaselines();
+                    lastRecalMs    = now;
+                    lastActivityMs = now;
+                    for (uint8_t j = 0; j < NUM_SENSORS; j++) stuckStartMs[j] = 0;
+                    break; // sensorState[] was reseeded — abort this loop pass
+                }
+                else
+                {
+                    // Rolling window: this 2 s had too much movement, restart
+                    // clean. Without this restart a single jump in an otherwise
+                    // stuck pad would permanently widen min/max → never triggers.
+                    stuckStartMs[i] = now;
+                    stuckMin[i] = stuckMax[i] = f;
+                }
+            }
+        }
 
         if (isTouch)
         {

@@ -81,6 +81,13 @@ public:
                uint8_t touchTh = 40, uint8_t releaseTh = 20,
                uint8_t cdc = 10, uint8_t cdt = 3);
 
+    // Staged init pieces — used together to read filtered data BEFORE
+    // committing the baseline (e.g. to detect a pad held at boot).
+    bool beginConfig   (uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
+                        uint8_t cdc, uint8_t cdt);
+    void startScanning (uint8_t numElectrodes, uint8_t baselineMode = 0b10);
+    void lockBaseline  (uint8_t numElectrodes);
+
     // ── Sensor reads ─────────────────────────────────────────────────────────
 
     // 10-bit filtered capacitance value. Lower value = more capacitance = hand close.

@@ -45,6 +45,33 @@ static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 5, 6 };
 static constexpr uint8_t SENSOR_CDC = 14; // 0–63 (try 10 to A/B; both 1 line)
 static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-free LEDs)
 
+// ── Startup sound-set picker (hold a pad while booting) ──────────────────────
+// Read with the MPR121 in CL=00 mode (baseline frozen at 0) so the raw
+// filtered value reflects whether a finger is on the pad — bypassing the
+// usual baseline contamination. A held pad reads MUCH lower than an idle one.
+// REF pad is something the user is unlikely to be touching (idx 0 = top Ding).
+// Threshold is in raw 10-bit ADC counts; finger on metal usually drops the
+// reading by hundreds, so 80 has wide margin against noise.
+static constexpr uint8_t STARTUP_SET_DEFAULT    = 5; // Bright Pentatonic
+static constexpr uint8_t STARTUP_REF_PAD        = 0; // assumed-untouched reference
+static constexpr int16_t STARTUP_HOLD_THRESHOLD = 80;
+
+// Hold one of these pads at boot to load its sound set instead of the default.
+// First match wins, so list order = priority. Add or remove rows freely — the
+// firmware iterates the array, so any number of bindings works (up to all 11).
+struct StartupBinding { uint8_t pad; uint8_t soundSet; };
+static constexpr StartupBinding STARTUP_BINDINGS[] = {
+    { 10, 6 }, //  pad 10 → Harmonic Minor
+    {  6, 3 }, //  pad  6 → Sad Vibes
+    {  1, 2 }, //  pad  1 → Chromatic
+    // add more here as you decide them, e.g.:
+    // {  2, 1 }, //  pad  2 → Just Intonation
+    // {  3, 4 }, //  pad  3 → Happy Vibes
+    // {  4, 0 }, //  pad  4 → D Kurd
+};
+static constexpr uint8_t NUM_STARTUP_BINDINGS =
+    static_cast<uint8_t>(sizeof(STARTUP_BINDINGS) / sizeof(STARTUP_BINDINGS[0]));
+
 // ── Physical sensor layout (post ELE9/ELE10 rework) ──────────────────────────
 // 11 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C").
 // LED pin AND LED board are explicit per pad. Rework summary:
@@ -90,6 +117,7 @@ struct SoundSet {
     float        filterBaseHz;    // filter cutoff when hand is far (dark)
     float        filterMaxHz;     // filter cutoff when hand is close (bright)
     float        filterQ;         // resonance (0.7 = flat, 1.5 = warm, 3.0 = aggressive)
+    float        bellMix;         // per-set bell loudness in master ch 3 (0 = no bell)
 };
 
 // ── Note frequencies ─────────────────────────────────────────────────────────
@@ -173,7 +201,7 @@ namespace JI {
 }
 
 // ── Sound sets ───────────────────────────────────────────────────────────────
-static constexpr uint8_t NUM_SOUND_SETS = 6;
+static constexpr uint8_t NUM_SOUND_SETS = 7;
 
 static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
     // ── 0: Hangdrum / D Kurd ─────────────────────────────────────────────────
@@ -189,6 +217,7 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         200.0f,         // filterBaseHz — dark when far
         5000.0f,        // filterMaxHz — opens up when close
         1.5f,           // filterQ — warm resonance
+        0.04f,          // bellMix — subtle, meditative
     },
 
     // ── 1: Just Intonation (D root) ──────────────────────────────────────────
@@ -203,6 +232,7 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         250.0f,
         6000.0f,
         1.2f,           // lower Q to let the pure intervals shine
+        0.06f,          // bellMix — modest crystalline sparkle
     },
 
     // ── 2: Chromatic ─────────────────────────────────────────────────────────
@@ -217,6 +247,7 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         300.0f,
         7000.0f,
         1.8f,           // brighter, edgier character
+        0.03f,          // bellMix — keep low, the chromatic content is busy
     },
 
     // ── 3: Sad Vibes / D Dorian ──────────────────────────────────────────────
@@ -231,6 +262,7 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         180.0f,         // darker base
         4000.0f,        // doesn't open as far
         2.0f,           // more resonance for moodiness
+        0.08f,          // bellMix — a little glint in the dark
     },
 
     // ── 4: Happy Vibes / C Major Pentatonic ──────────────────────────────────
@@ -245,6 +277,7 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         350.0f,         // brighter starting point
         8000.0f,        // opens wide
         1.0f,           // clean, minimal resonance
+        0.05,          // bellMix — joyful sparkle
     },
 
     // ── 5: Bright Pentatonic (default) ───────────────────────────────────────
@@ -264,6 +297,26 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         400.0f,         // bright base
         8500.0f,        // opens wide and shimmery
         0.9f,           // clean, minimal resonance (no clip colouring)
+        0.05f,          // bellMix — sparkly bright
+    },
+
+    // ── 6: Harmonic Minor (A) — default ──────────────────────────────────────
+    // Melancholic, slightly Eastern. The augmented 2nd between F and G♯ is the
+    // signature interval — placed at idx10 so it sings when the lower-ring
+    // front is combined with the upper ring. Low Ding on A3, ascending tones
+    // around the rings, doubled octaves for handpan-style thickness.
+    {
+        "Harmonic Minor",
+        //  0=Ding  1     2      3      4      5         (top + upper ring)
+        { Note::A3, Note::E4, Note::A4, Note::C5, Note::D5, Note::E5,
+        //  6     7      8      9      10                (lower ring)
+          Note::B3, Note::C4, Note::D4, Note::F4, Note::Ab4 },
+        WAVEFORM_TRIANGLE,
+        0.30f,          // warmer sub for the melancholic weight
+        220.0f,         // darker base — broody when the hand is far
+        5500.0f,        // opens to a soft, present body
+        1.5f,           // warm resonance — gives the minor a hint of cry
+        0.05,          // bellMix — most prominent: brightens the dark minor
     },
 };
 
@@ -373,6 +426,17 @@ static constexpr float PROX_MAX      = 18.0f;
 static constexpr uint32_t IDLE_RECAL_MS      = 5000;
 static constexpr uint32_t RECAL_COOLDOWN_MS  = 10000;
 static constexpr float    IDLE_INTENSITY     = 0.02f; // any pad above this counts as active
+
+// ── "Stuck pad" recalibration ────────────────────────────────────────────────
+// If a pad's `fast` value stays within STUCK_JITTER_FLOOR for STUCK_WINDOW_MS
+// while showing intensity > 0 and not being touched/held, it's almost
+// certainly a baseline shift (e.g. wire moved). Real hands jitter naturally
+// — wire drift does not — so this distinguishes them. Touch-confirmed pads
+// (state.inContact) and pads with a sustained bell are exempt.
+static constexpr uint32_t STUCK_WINDOW_MS    = 2000;
+static constexpr float    STUCK_JITTER_FLOOR = 4.0f;  // raw delta units; raise if real
+                                                      // hover false-triggers, lower if a
+                                                      // jittery stuck pad still isn't caught
 
 // ── MPE (USB-MIDI) output ────────────────────────────────────────────────────
 // Each pad gets its own member channel for polyphonic aftertouch (channel
