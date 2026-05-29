@@ -289,7 +289,7 @@ static constexpr float LFO_RATE_SPREAD = 0.15f; // each voice's LFO rate offset 
 
 // Bell — short metallic transient fired on a metal-contact (touch) event,
 // i.e. when the delta spikes after the proximity volume is already maxed.
-static constexpr float BELL_MIX        = 0.20f;  // bell level in the master mixer (ch 3)
+static constexpr float BELL_MIX        = 0.01f;  // bell level in the master mixer (ch 3)
 static constexpr float BELL_AMP        = 0.55f;  // bell oscillator peak amplitude
 static constexpr float BELL_PARTIAL    = 2.76f;  // inharmonic 2nd partial → bell timbre
 static constexpr float BELL_OCTAVES    = 2.0f;   // bell pitch = note × this (sparkle above)

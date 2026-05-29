@@ -339,11 +339,11 @@ extern "C" void startup_late_hook(void) {
 void setup()
 {
     Serial.begin(115200);
-    while (!Serial && millis() < 2000) {}
+    while (!Serial && millis() < 200) {}
 
     // ── I2C bus ──────────────────────────────────────────────────────────────
     Wire.begin();
-    Wire.setClock(400000);
+    Wire.setClock(100000);
 
     // ── MPR121 boards ────────────────────────────────────────────────────────
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
@@ -384,7 +384,7 @@ void setup()
     }
 
     // ── Teensy Audio ─────────────────────────────────────────────────────────
-    AudioMemory(280); // headroom for 11 voices + 11 filtered bell voices
+    AudioMemory(100); // headroom for 11 voices + 11 filtered bell voices (peak polyphony)
 
     // Stage mixer gains
     for (int ch = 0; ch < 4; ch++)
