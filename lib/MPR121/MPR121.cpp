@@ -114,11 +114,13 @@ uint16_t MPR121::touchStatus() {
 
 // ── LED helpers ───────────────────────────────────────────────────────────────
 
-void MPR121::beginLEDs() {
-    // Configure ELE5–ELE11 (GPIO bits 1–7) as high-side open-drain outputs.
+void MPR121::beginLEDs(uint8_t mask) {
+    // Configure the selected GPIO bits as high-side open-drain LED outputs.
+    // bit 0 = ELE4 (GPIO0) ... bit 7 = ELE11 (GPIO7).
     // CTL0=CTL1=1 is the open-drain LED-driver mode the hardware PWM needs.
-    // (ELE4/bit0 stays a touch electrode, so it's left out of the mask.)
-    constexpr uint8_t mask = 0xFE; // bits 1..7 = ELE5..ELE11
+    // Bits outside this mask are left as touch electrodes (or unconfigured).
+    // The chip ignores GPIO writes for electrodes still in the touch range
+    // (ELE_EN), so any overlap is benign.
     write(GPIOEN,   mask);
     write(GPIODIR,  mask);
     write(GPIOCTL0, mask);
@@ -176,8 +178,10 @@ void MPR121::setLEDs8(const uint8_t bri[8]) {
     uint8_t setMask = 0, clrMask = 0;
     uint8_t pwm[4] = {0, 0, 0, 0}; // PWM0..PWM3 = 0x81..0x84
 
-    // g = GPIO bit; ELE(g+4). g=0 (ELE4) skipped — it's a touch electrode.
-    for (uint8_t g = 1; g < 8; g++) {
+    // g = GPIO bit; ELE(g+4). Iterates all 8 GPIO bits including g=0 (ELE4)
+    // so boards that free ELE4 from touch can use it as an LED. Bits inside
+    // the chip's touch range are silently ignored by the hardware.
+    for (uint8_t g = 0; g < 8; g++) {
         if (bri[g] == 0) {
             clrMask |= (uint8_t)(1u << g);
         } else {

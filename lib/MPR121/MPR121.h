@@ -95,8 +95,12 @@ public:
 
     // ── LED helpers (ELE6–ELE11 wired as open-drain PWM LED outputs) ─────────
 
-    // Call once after begin() to configure ELE6–ELE11 as LED outputs.
-    void beginLEDs();
+    // Call once after begin() to configure GPIO/LED outputs. `mask` bits 0..7
+    // correspond to ELE4..ELE11 (GPIO0..GPIO7). Default 0xFE = ELE5..ELE11
+    // (keeps existing callers — ELE4 stays a touch electrode by convention).
+    // Pass a custom mask to include ELE4 as LED (e.g. when a board has fewer
+    // than 4 touch electrodes), or to exclude electrodes used for touch.
+    void beginLEDs(uint8_t mask = 0xFE);
 
     // Set brightness of one LED: ledIndex 0–5, bri 0 (off) or 1–15 (dim–full).
     void setLED(uint8_t ledIndex, uint8_t bri);
