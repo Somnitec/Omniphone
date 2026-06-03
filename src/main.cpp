@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Audio.h>
+#include <EEPROM.h>
 #include <math.h>
 
 #include "LCD_Driver.h"
@@ -126,6 +127,28 @@ static float lfoRate[NUM_SENSORS];
 
 static uint8_t activeSet = 0;
 
+// ── Persisted selection (survives power-off) ─────────────────────────────────
+// Teensy 4.0 emulated EEPROM. A magic byte validates the slot so a blank or
+// previously-unused chip falls back to the compile-time default rather than
+// reading whatever garbage happens to be there.
+static constexpr int     EEPROM_ADDR_MAGIC = 0;
+static constexpr int     EEPROM_ADDR_SET   = 1;
+static constexpr uint8_t EEPROM_MAGIC      = 0xA7;
+
+static uint8_t loadStoredSet(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_SET);
+    return (v < NUM_SOUND_SETS) ? v : fallback;
+}
+
+static void storeSet(uint8_t index)
+{
+    // .update() only writes when the byte differs → avoids needless EEPROM wear.
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_SET, index);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Update timing
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,6 +189,7 @@ static void loadSoundSet(uint8_t index)
 {
     if (index >= NUM_SOUND_SETS) return;
     activeSet = index;
+    storeSet(index); // remember choice across power-off
     const SoundSet &ss = SOUND_SETS[index];
 
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
@@ -210,15 +234,60 @@ static uint32_t bellArmMs[NUM_BELLS]  = { 0 };     // peak-velocity window deadl
 static float    bellPeakV[NUM_BELLS]  = { 0.0f };  // peak contact velocity so far
 static float    bellPress[NUM_BELLS]  = { 0.0f };  // smoothed aftertouch pressure 0–1
 
-// Per-pad "stuck" window — to detect a baseline shift that's faking activity.
-static uint32_t stuckStartMs[NUM_SENSORS] = { 0 };
-static float    stuckMin    [NUM_SENSORS] = { 0.0f };
-static float    stuckMax    [NUM_SENSORS] = { 0.0f };
+// Per-board outlier check on the freshly committed baselines. A hand hovering
+// over a single pad at lock time leaves that pad's baseline much lower than
+// its neighbours' — afterwards the pad is "barely sensitive" because the
+// baseline ≈ near-touch reading. Compares each sense pad's baseline against
+// the per-board median and rewrites any that fall too far below it. Runs
+// while the chip is in normal scan mode; the next baseline-tracking tick will
+// continue from the rewritten value.
+static void fixOutlierBaselines()
+{
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        uint8_t n = SENSE_ELECTRODES[b];
+        if (n == 0) continue;
+
+        uint16_t bases[12];
+        for (uint8_t e = 0; e < n; e++) bases[e] = boards[b].baselineData(e);
+
+        // Insertion sort to find the median (n ≤ 6).
+        uint16_t sorted[12];
+        for (uint8_t e = 0; e < n; e++) sorted[e] = bases[e];
+        for (uint8_t i = 1; i < n; i++)
+        {
+            uint16_t v = sorted[i];
+            int j = (int)i - 1;
+            while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+            sorted[j + 1] = v;
+        }
+        uint16_t median = sorted[n / 2];
+
+        for (uint8_t e = 0; e < n; e++)
+        {
+            if (bases[e] + BASELINE_OUTLIER_DELTA < median)
+            {
+                // BASE register holds the upper 8 of the 10-bit baseline.
+                boards[b].write((uint8_t)(MPR121Reg::BASE_0 + e),
+                                (uint8_t)(median >> 2));
+                Serial.print(F("# baseline outlier: board "));
+                Serial.print(b);
+                Serial.print(F(" ELE"));
+                Serial.print(e);
+                Serial.print(F(" was "));
+                Serial.print(bases[e]);
+                Serial.print(F(", median "));
+                Serial.print(median);
+                Serial.println(F(" → rewritten"));
+            }
+        }
+    }
+}
 
 // Force a full MPR121 baseline reload (CL=11) on every board, release any
 // sustained bells, and re-seed the proximity EMAs. ~60 ms of sensor pause;
-// only called during a quiet period or when a stuck pad is detected, so the
-// existing 8 ms voice ramp + 400 ms bell release handle the fade.
+// only called during a quiet period, so the existing 8 ms voice ramp +
+// 400 ms bell release handle the fade.
 static void recalibrateBaselines()
 {
     for (uint8_t i = 0; i < NUM_BELLS; i++)
@@ -240,6 +309,7 @@ static void recalibrateBaselines()
         boards[b].write(MPR121Reg::ECR, (uint8_t)(0b11000000 | SENSE_ELECTRODES[b]));
         delay(50);
     }
+    fixOutlierBaselines();
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
     {
         const SensorConfig &sc = SENSORS[i];
@@ -394,7 +464,7 @@ void setup()
 
     // ── Pick the startup sound set: pad-held overrides default ───────────────
     delay(25); // let filtered data populate
-    uint8_t startupSet = STARTUP_SET_DEFAULT;
+    uint8_t startupSet = loadStoredSet(STARTUP_SET_DEFAULT); // last saved, else default
     uint8_t heldPad    = 0xFF; // 0xFF = none
     {
         const SensorConfig &refS = SENSORS[STARTUP_REF_PAD];
@@ -536,6 +606,7 @@ void setup()
     // ── Commit the baseline now that the finger is (presumably) released ─────
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
         boards[b].lockBaseline(SENSE_ELECTRODES[b]);
+    fixOutlierBaselines();
 
     // ── Seed per-sensor EMA state from the freshly locked baseline ──────────
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
@@ -642,49 +713,6 @@ void loop()
         updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
 
         if (intensity > IDLE_INTENSITY || bellHeld[i]) anyActive = true;
-
-        // ── Stuck-pad detection (baseline drift faking activity) ─────────────
-        // A real hand jitters; a stuck wire drift does not. Only watch pads
-        // that are "active" but neither touch-confirmed nor bell-sustaining.
-        bool exempt = (intensity <= 0.0f)
-                    || sensorState[i].inContact
-                    || bellHeld[i];
-        if (exempt)
-        {
-            stuckStartMs[i] = 0; // reset the window — legitimate state
-        }
-        else if (stuckStartMs[i] == 0)
-        {
-            stuckStartMs[i] = now;
-            stuckMin[i] = stuckMax[i] = sensorState[i].fast;
-        }
-        else
-        {
-            float f = sensorState[i].fast;
-            if (f < stuckMin[i]) stuckMin[i] = f;
-            if (f > stuckMax[i]) stuckMax[i] = f;
-            if ((now - stuckStartMs[i]) > STUCK_WINDOW_MS)
-            {
-                if ((stuckMax[i] - stuckMin[i]) < STUCK_JITTER_FLOOR)
-                {
-                    Serial.print(F("# stuck pad ")); Serial.print(i);
-                    Serial.println(F(" — recalibrating"));
-                    recalibrateBaselines();
-                    lastRecalMs    = now;
-                    lastActivityMs = now;
-                    for (uint8_t j = 0; j < NUM_SENSORS; j++) stuckStartMs[j] = 0;
-                    break; // sensorState[] was reseeded — abort this loop pass
-                }
-                else
-                {
-                    // Rolling window: this 2 s had too much movement, restart
-                    // clean. Without this restart a single jump in an otherwise
-                    // stuck pad would permanently widen min/max → never triggers.
-                    stuckStartMs[i] = now;
-                    stuckMin[i] = stuckMax[i] = f;
-                }
-            }
-        }
 
         if (isTouch)
         {

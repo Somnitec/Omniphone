@@ -420,23 +420,25 @@ static constexpr float PROX_DEADBAND = 4.0f;  // ↑ from 2: rejects small idle 
 static constexpr float PROX_MAX      = 18.0f;
 
 // ── Idle baseline recalibration ──────────────────────────────────────────────
-// If nothing is happening for IDLE_RECAL_MS, force a full MPR121 baseline
-// reload + re-seed the EMAs to kill drift-induced phantom blips. Skipped if a
-// recal already ran within RECAL_COOLDOWN_MS (avoid hammering).
-static constexpr uint32_t IDLE_RECAL_MS      = 5000;
-static constexpr uint32_t RECAL_COOLDOWN_MS  = 10000;
+// Recal fires when EVERY pad's intensity is below IDLE_INTENSITY for
+// IDLE_RECAL_MS in a row (and a sustained bell on any pad blocks it too —
+// see `anyActive` in main). A pad sitting at saturated 1.0 (firm grip on the
+// plastic) keeps anyActive true and prevents recal; metal contact keeps the
+// bell sustaining, same effect. RECAL_COOLDOWN_MS prevents hammering.
+static constexpr uint32_t IDLE_RECAL_MS      = 1000;
+static constexpr uint32_t RECAL_COOLDOWN_MS  = 2000;
 static constexpr float    IDLE_INTENSITY     = 0.02f; // any pad above this counts as active
 
-// ── "Stuck pad" recalibration ────────────────────────────────────────────────
-// If a pad's `fast` value stays within STUCK_JITTER_FLOOR for STUCK_WINDOW_MS
-// while showing intensity > 0 and not being touched/held, it's almost
-// certainly a baseline shift (e.g. wire moved). Real hands jitter naturally
-// — wire drift does not — so this distinguishes them. Touch-confirmed pads
-// (state.inContact) and pads with a sustained bell are exempt.
-static constexpr uint32_t STUCK_WINDOW_MS    = 2000;
-static constexpr float    STUCK_JITTER_FLOOR = 4.0f;  // raw delta units; raise if real
-                                                      // hover false-triggers, lower if a
-                                                      // jittery stuck pad still isn't caught
+// ── Baseline outlier rewrite ─────────────────────────────────────────────────
+// After every baseline lock (startup + recal), pads on the same board should
+// land at similar baseline values — they share the same chip, supply, and
+// environment. A pad whose baseline ends up much lower than its neighbours
+// almost always means a hand was hovering over it at lock time, contaminating
+// its filtered reading. Symptom: that pad is "barely sensitive" afterwards
+// because rawDelta = baseline − filtered clamps to 0 until you actually touch
+// the metal. Fix: detect outliers (baseline > this many 10-bit counts below
+// the per-board median) and rewrite them to the median.
+static constexpr uint16_t BASELINE_OUTLIER_DELTA = 30;
 
 // ── MPE (USB-MIDI) output ────────────────────────────────────────────────────
 // Each pad gets its own member channel for polyphonic aftertouch (channel
