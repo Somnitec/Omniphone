@@ -34,8 +34,19 @@ void MPR121::burstRead(uint8_t reg, uint8_t* buf, uint8_t n) {
 
 // ── Initialisation ────────────────────────────────────────────────────────────
 
+bool MPR121::isConnected() {
+    // The MPR121 has no WHO_AM_I, but it ACKs its I2C address when present.
+    // endTransmission() returns 0 only if a device acknowledged the address.
+    _wire.beginTransmission(_addr);
+    return _wire.endTransmission() == 0;
+}
+
 bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
                    uint8_t cdc, uint8_t cdt) {
+    // ⓪ Presence check — bail out if no chip ACKs this address, so callers get a
+    // truthful connected/not-connected result instead of an assumed success.
+    if (!isConnected()) return false;
+
     // ① Soft reset — all registers return to power-on defaults.
     write(SRST, 0x63);
     delay(50);
@@ -88,7 +99,9 @@ bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
     write(ECR, static_cast<uint8_t>(0b11000000 | (numElectrodes & 0x0F)));
     delay(50);
 
-    return true; // The chip has no WHO_AM_I register; connectivity is assumed OK.
+    // Confirm the chip is still ACKing after the full init sequence (catches a
+    // device that dropped off the bus mid-configuration, e.g. brown-out).
+    return isConnected();
 }
 
 // ── Sensor reads ──────────────────────────────────────────────────────────────

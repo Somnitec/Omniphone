@@ -1,6 +1,25 @@
 #pragma once
 #include <stdint.h>
-#include <Audio.h> // for WAVEFORM_* constants
+
+// ── Waveform tags ─────────────────────────────────────────────────────────────
+// SoundSet.waveformType uses the Teensy Audio Library's WAVEFORM_* numbering so
+// the Teensy build can pass it straight into AudioSynthWaveform::begin(). On the
+// non-Teensy builds (Pico / ESP32-S3, which use Mozzi instead of the Teensy
+// Audio Library) <Audio.h> doesn't exist, so we define the same tags ourselves
+// and the Mozzi engine maps them to wavetables. Keep the values in sync with
+// Teensy's synth_waveform.h.
+#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
+  #ifndef WAVEFORM_SINE
+    #define WAVEFORM_SINE                0
+    #define WAVEFORM_SAWTOOTH            1
+    #define WAVEFORM_SQUARE              2
+    #define WAVEFORM_TRIANGLE            3
+    #define WAVEFORM_SAWTOOTH_REVERSE    6
+    #define WAVEFORM_BANDLIMIT_SAWTOOTH 11
+  #endif
+#else
+  #include <Audio.h> // Teensy: real WAVEFORM_* constants
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Instrument configuration
@@ -22,18 +41,36 @@ static constexpr uint8_t BOARD_ADDRESSES[] = { 0x5A, 0x5C, 0x00, 0x00 };
 // ── Sensor descriptor ────────────────────────────────────────────────────────
 static constexpr uint8_t NO_PIN = 0xFF; // disabled pad / no LED
 
+// ledBoard sentinel: the LED is wired straight to a microcontroller GPIO pin
+// (PWM), not to an MPR121 LED driver. Use this when the chip's LED pins run out
+// (13 pads need 13 LEDs but two MPR121s only free up ~11 LED pins once 13
+// electrodes are spent on sensing). Set ledBoard = LED_GPIO and put the GPIO
+// pin number in ledEle. On the Pico build these are RP2040 GPIO pins.
+static constexpr uint8_t LED_GPIO = 0xFE;
+
 struct SensorConfig {
     uint8_t boardIndex; // SENSE board: index into BOARD_ADDRESSES[]
-    uint8_t electrode;  // ELE0–ELE5 touch input, or NO_PIN if this pad is disabled
-    uint8_t ledBoard;   // LED board (may differ from boardIndex — see idx1)
-    uint8_t ledEle;     // ELE5–ELE11 LED pin, or NO_PIN if no LED
+    uint8_t electrode;  // ELE0–ELE6 touch input, or NO_PIN if this pad is disabled
+    uint8_t ledBoard;   // LED board index, or LED_GPIO for a direct MCU GPIO LED
+    uint8_t ledEle;     // MPR121 LED pin (ELE6–ELE11), OR an MCU pin # when
+                        // ledBoard == LED_GPIO, or NO_PIN if no LED
 };
 
 // Touch electrodes per board, indexed by board. ELE_EN is a contiguous count
 // from ELE0, so LED pins can only live above the last sense electrode.
+#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
+// ── 13-pad split (Pico / ESP32-S3) ───────────────────────────────────────────
+//   A (0x5A, idx0): ELE0–ELE5 (6 sense)  → LED pins ELE6–ELE11 (6 free)
+//   C (0x5C, idx1): ELE0–ELE6 (7 sense)  → LED pins ELE7–ELE11 (5 free)
+// 13 sense electrodes total; 11 chip LED pins free → the remaining 2 LEDs live
+// on MCU GPIO pins (LED_GPIO). See the 13-pad SENSORS[] table below.
+static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 6, 7 };
+#else
+// ── 11-pad legacy split (Teensy) ──────────────────────────────────────────────
 //   A (0x5A): ELE0–ELE4 (5)  — ELE5 freed as a GPIO LED pin (idx1's lamp)
 //   C (0x5C): ELE0–ELE5 (6)  — idx5 senses on ELE5, LEDs limited to ELE6–ELE11
 static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 5, 6 };
+#endif
 
 // MPR121 charge current / time (sensor gain). Controlled measurement
 // (test/proximity_tuning) shows the electrode does NOT couple beyond ~1 cm at
@@ -45,7 +82,46 @@ static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 5, 6 };
 static constexpr uint8_t SENSOR_CDC = 14; // 0–63 (try 10 to A/B; both 1 line)
 static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-free LEDs)
 
-// ── Physical sensor layout (post ELE9/ELE10 rework) ──────────────────────────
+// ── Physical sensor layout ────────────────────────────────────────────────────
+// Hangdrum "ding" layout: TOP is the central low fundamental, the upper ring is
+// the melodic tone fields ascending around it, the lower ring is bass voicings.
+//                       sense                LED
+//                       board, ele,          board, ele
+#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
+// ── 13-pad layout (Pico / ESP32-S3) ──────────────────────────────────────────
+// 13 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C").
+//   • Board C (idx1): top + 6-pad upper ring  → sense ELE0–ELE6 (7 electrodes)
+//   • Board A (idx0): 6-pad lower/bass ring    → sense ELE0–ELE5 (6 electrodes)
+// LED budget: A frees ELE6–ELE11 (6 pins), C frees ELE7–ELE11 (5 pins) = 11 chip
+// LED pins for 13 LEDs, so the top pad and the last upper-ring pad drive their
+// LEDs from MCU GPIO instead (LED_GPIO + a Pico GP pin).
+//
+// >>> CONFIRM AGAINST YOUR PCB <<< electrode↔pad and LED assignments below are a
+// clean default for a 6 (A) + 7 (C) sense split; reorder rows to match the
+// physical ring positions. ELE9/ELE10 LED drivers were flaky on the old MPR121
+// modules — if yours are too, move those LEDs (idx3,idx4,idx10,idx11) to GPIO.
+static constexpr SensorConfig SENSORS[] = {
+        // Top sensor — the "Ding" (central low fundamental), board C
+    { 0, 0,  LED_GPIO, 28 }, //0  top              — sense C ELE0, LED GPIO pin 14
+
+        // Upper concentric ring — tone fields (board C)
+    { 0, 1,  LED_GPIO, 27 },        //1  upper ring 0      — sense C ELE1, LED C ELE7
+    { 0, 3,  LED_GPIO, 8  },        //2  upper ring 1      — sense C ELE2, LED C ELE8
+    { 0, 5,  LED_GPIO, 9  },        //3  upper ring 2      — sense C ELE3, LED C ELE9
+    { 0, 7,  LED_GPIO, 10 },        //4  upper ring 3      — sense C ELE4, LED C ELE10
+    { 0, 9,  LED_GPIO, 1  },        //5  upper ring 4      — LED GP1  (was GP11: collided with GP27)
+    { 1, 1,  LED_GPIO, 15 }, //6  upper ring 5      — sense C ELE6, LED GPIO pin 15
+
+        // Lower concentric ring — bass register (board A)
+    { 0, 2,  LED_GPIO, 6  },        //7  lower ring 0      — sense A ELE0, LED A ELE6
+    { 0, 4,  LED_GPIO, 7  },        //8  lower ring 1      — sense A ELE1, LED A ELE7
+    { 0, 6,  LED_GPIO, 2  },        //9  lower ring 2      — LED GP2  (was GP8: duplicate of idx2)
+    { 0, 3,  LED_GPIO, 3  },        //10 lower ring 3      — LED GP3  (was GP9: duplicate of idx3)
+    { 1, 0,  LED_GPIO, 0 },        //11 lower ring 4      — sense A ELE4, LED A ELE10
+    { 1, 2,  LED_GPIO, 13 },        //12 lower ring 5      — LED GP13 (was GP11: duplicate/collision)
+};
+#else
+// ── 11-pad legacy layout (Teensy, post ELE9/ELE10 rework) ─────────────────────
 // 11 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C").
 // LED pin AND LED board are explicit per pad. Rework summary:
 //   • A: the LED that was on A-ELE9 is now on A-ELE6   (idx8)
@@ -54,11 +130,6 @@ static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-
 //   • idx5 (upper ring 4) still senses on C-ELE5; its LED stays C-ELE11
 //   • ELE10 LEDs (idx3 A, idx10 C) only light if ELE9 is driven identically;
 //     nothing is wired to ELE9 — handled in main (mirror ELE9 ← ELE10 per board).
-//
-// Hangdrum "ding" layout: TOP is the central low fundamental, upper ring is
-// the melodic tone fields ascending around it, lower ring is bass voicings.
-//                       sense                LED
-//                       board, ele,          board, ele
 static constexpr SensorConfig SENSORS[] = {
         // Top sensor — the "Ding" (central low fundamental)
     { 1, 0,  1, 6  },  //0  top                  — sense C ELE0, LED C ELE6
@@ -77,14 +148,21 @@ static constexpr SensorConfig SENSORS[] = {
     { 0, 1,  0, 7  },  //9  lower ring 3         — sense A ELE1, LED A ELE7
     { 1, 4,  1, 10 },  //10 lower ring 4         — sense C ELE4, LED C ELE10 (+ELE9 mirror)
 };
+#endif
 
 static constexpr uint8_t NUM_SENSORS =
     static_cast<uint8_t>(sizeof(SENSORS) / sizeof(SENSORS[0]));
 
+// Largest pad count any layout uses — sizes the per-pad arrays in SoundSet so
+// the same table is valid for both the 11-pad (Teensy) and 13-pad builds.
+static constexpr uint8_t MAX_PADS = 13;
+
 // ── Sound set definition ─────────────────────────────────────────────────────
 struct SoundSet {
     const char*  name;
-    float        freqs[11];       // one per sensor, in SENSORS[] order
+    float        freqs[MAX_PADS]; // one per sensor, in SENSORS[] order. Sets that
+                                  // list fewer than MAX_PADS notes leave the
+                                  // trailing pads silent (zero-filled).
     short        waveformType;    // WAVEFORM_TRIANGLE, WAVEFORM_BANDLIMIT_SAWTOOTH, etc.
     float        subMix;          // sub-oscillator level (0.0–1.0)
     float        filterBaseHz;    // filter cutoff when hand is far (dark)
@@ -173,7 +251,10 @@ namespace JI {
 }
 
 // ── Sound sets ───────────────────────────────────────────────────────────────
-static constexpr uint8_t NUM_SOUND_SETS = 6;
+// NOTE: sets 0–5 below predate the 13-pad build and only list 11 notes; on the
+// 13-pad (Pico/ESP32-S3) layout their last two pads stay silent (zero-filled).
+// Set 6 "Juno Harmonic Minor" lists all 13 and is the 13-pad default.
+static constexpr uint8_t NUM_SOUND_SETS = 7;
 
 static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
     // ── 0: Hangdrum / D Kurd ─────────────────────────────────────────────────
@@ -265,7 +346,32 @@ static const SoundSet SOUND_SETS[NUM_SOUND_SETS] = {
         8500.0f,        // opens wide and shimmery
         0.9f,           // clean, minimal resonance (no clip colouring)
     },
+
+    // ── 6: Juno Harmonic Minor (13-pad default) ──────────────────────────────
+    // A harmonic minor (A B C D E F G#) voiced ascending across all 13 pads —
+    // two octaves, top pad = low root. The "Juno" timbre: deep saw pad, heavy
+    // sub, low-ish round filter and gentle resonance (Men-I-Trust dreamy).
+    {
+        "Juno Harmonic Minor",
+        //  0=top  1     2     3     4     5     6        (top + upper ring)
+        { Note::A3,  Note::B3,  Note::C4,  Note::D4,  Note::E4,  Note::F4, Note::Ab4,
+        //  7     8     9     10    11    12               (lower ring)
+          Note::A4,  Note::B4,  Note::C5,  Note::D5,  Note::E5,  Note::F5 },
+        WAVEFORM_BANDLIMIT_SAWTOOTH,
+        0.42f,          // heavy sub — deep Juno weight
+        220.0f,         // low/round base cutoff
+        4200.0f,        // opens gently, never harsh
+        1.1f,           // soft resonance
+    },
 };
+
+// Default sound set loaded at boot. The 13-pad build starts on Juno Harmonic
+// Minor (set 6); the legacy 11-pad Teensy build keeps Bright Pentatonic (set 5).
+#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
+static constexpr uint8_t DEFAULT_SOUND_SET = 6;
+#else
+static constexpr uint8_t DEFAULT_SOUND_SET = 5;
+#endif
 
 // ── Synth parameters ─────────────────────────────────────────────────────────
 // Voice architecture

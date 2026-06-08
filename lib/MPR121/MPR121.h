@@ -81,6 +81,10 @@ public:
                uint8_t touchTh = 40, uint8_t releaseTh = 20,
                uint8_t cdc = 10, uint8_t cdt = 3);
 
+    // True if a device ACKs this board's I²C address. The MPR121 has no
+    // WHO_AM_I register, so an address-ACK probe is the real presence test.
+    bool isConnected();
+
     // ── Sensor reads ─────────────────────────────────────────────────────────
 
     // 10-bit filtered capacitance value. Lower value = more capacitance = hand close.
