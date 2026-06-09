@@ -13,7 +13,10 @@
 #define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
 #define TELEPLOT_HOST  ""              // IP of the machine running Teleplot, e.g. "192.168.1.20"
 
+// OTA upload password (recommended on a shared network). Must match the shell env
+// var OMNIPHONE_OTA_PASSWORD that the `…-ota` upload passes as --auth. "" = no auth.
+#define OTA_PASSWORD   ""
+
 // Optional overrides (otherwise config.h defaults apply):
 // #define OTA_HOSTNAME  "omniphone-esp32"
-// #define OTA_PASSWORD  ""
 // #define TELEPLOT_PORT 47269
