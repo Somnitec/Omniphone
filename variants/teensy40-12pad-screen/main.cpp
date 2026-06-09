@@ -1,0 +1,1266 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Audio.h>
+#include <EEPROM.h>
+#include <math.h>
+
+#include "config.h"
+#include "display.h"   // all LCD/touch/GUI code (no-op when ENABLE_SCREEN == 0)
+#include "proximity_engine.h"
+#include "sound_engine.h"
+#include "benjolin.h"    // Benjolin-mode chaos source
+#include "cracklebox.h"  // Cracklebox-mode chaos source
+#include <MPR121.h>
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audio graph — Subtractive synth architecture
+//
+// 12 independent voices, each with:
+//   mainOsc (triangle/saw) + subOsc (sine, -1 oct) -> voiceMix -> filter (LP)
+//   -> ampGate (multiplied by dcAmp for click-free level control) -> stage mixer
+//
+// Three-stage mixer tree to stereo I2S output (PCM5102A DAC).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── Voice instances ──────────────────────────────────────────────────────────
+static Voice voices[NUM_SENSORS];
+
+// ── Mixer tree ───────────────────────────────────────────────────────────────
+AudioMixer4    stageMix[3];  // stage 1: up to 4 voices each
+AudioMixer4    masterMix;    // stage 2: combines 3 stage mixers + bell on ch 3
+AudioOutputI2S i2sOut;
+
+// ── Bell — one touch-transient voice per pad ─────────────────────────────────
+// One voice per pad (indexed by sensor) so several players striking different
+// pads at once never steal each other. Each voice: two sine partials
+// (fundamental + inharmonic) → fast envelope → 3-mixer tree → master ch 3.
+static constexpr uint8_t NUM_BELLS = NUM_SENSORS;
+static_assert(NUM_BELLS == 12, "BELL_WIRING below is hand-wired for 12 voices");
+
+AudioSynthWaveformSine   bellOscA[NUM_BELLS];
+AudioSynthWaveformSine   bellOscB[NUM_BELLS];
+AudioMixer4              bellVoiceMix[NUM_BELLS];
+AudioFilterStateVariable bellFilt[NUM_BELLS]; // per-voice LP for pressure aftertouch
+AudioEffectEnvelope      bellEnv[NUM_BELLS];
+AudioMixer4              bellGroup[3]; // 4+4+4 voices
+AudioMixer4              bellSum;      // groups → master ch 3
+
+#define BELL_WIRING(K, G, CH)                                                \
+    AudioConnection bw##K##a(bellOscA[K],     0, bellVoiceMix[K], 0);        \
+    AudioConnection bw##K##b(bellOscB[K],     0, bellVoiceMix[K], 1);        \
+    AudioConnection bw##K##f(bellVoiceMix[K], 0, bellFilt[K],     0);        \
+    AudioConnection bw##K##m(bellFilt[K],     0, bellEnv[K],      0);        \
+    AudioConnection bw##K##e(bellEnv[K],      0, bellGroup[G],    CH);
+BELL_WIRING( 0, 0, 0)
+BELL_WIRING( 1, 0, 1)
+BELL_WIRING( 2, 0, 2)
+BELL_WIRING( 3, 0, 3)
+BELL_WIRING( 4, 1, 0)
+BELL_WIRING( 5, 1, 1)
+BELL_WIRING( 6, 1, 2)
+BELL_WIRING( 7, 1, 3)
+BELL_WIRING( 8, 2, 0)
+BELL_WIRING( 9, 2, 1)
+BELL_WIRING(10, 2, 2)
+BELL_WIRING(11, 2, 3)
+AudioConnection bgs0(bellGroup[0], 0, bellSum, 0);
+AudioConnection bgs1(bellGroup[1], 0, bellSum, 1);
+AudioConnection bgs2(bellGroup[2], 0, bellSum, 2);
+AudioConnection bellOut(bellSum, 0, masterMix, 3);
+
+// ── Per-voice wiring (macro expands to 6 internal + 1 output connection) ─────
+//                      voice index, stage mixer,  channel
+VOICE_WIRING( 0, stageMix[0], 0)
+VOICE_WIRING( 1, stageMix[0], 1)
+VOICE_WIRING( 2, stageMix[0], 2)
+VOICE_WIRING( 3, stageMix[0], 3)
+VOICE_WIRING( 4, stageMix[1], 0)
+VOICE_WIRING( 5, stageMix[1], 1)
+VOICE_WIRING( 6, stageMix[1], 2)
+VOICE_WIRING( 7, stageMix[1], 3)
+VOICE_WIRING( 8, stageMix[2], 0)
+VOICE_WIRING( 9, stageMix[2], 1)
+VOICE_WIRING(10, stageMix[2], 2)
+VOICE_WIRING(11, stageMix[2], 3)
+
+// ── Mixer tree wiring ────────────────────────────────────────────────────────
+AudioConnection pm0(stageMix[0], 0, masterMix, 0);
+AudioConnection pm1(stageMix[1], 0, masterMix, 1);
+AudioConnection pm2(stageMix[2], 0, masterMix, 2);
+
+// ── FM mode: mono FM carrier + a modulator bus that taps the 12 voice oscs ───
+// In FM mode the normal voices are muted but their oscillators keep running at
+// the held-pad pitches; we sum the modulator pads into the carrier's FM input.
+AudioSynthWaveformModulated fmCarrier;
+AudioMixer4          fmModMix[3]; // 12 mainOsc taps → 3 mixers
+AudioMixer4          fmModSum;    // 3 → 1 → carrier FM input
+AudioSynthWaveformDc fmDc;        // carrier amplitude (click-free gate)
+AudioEffectMultiply  fmGate;
+#define FM_MOD_WIRING(N, MIX, CH) AudioConnection fmmod##N(voices[N].mainOsc, 0, fmModMix[MIX], CH);
+FM_MOD_WIRING( 0, 0, 0) FM_MOD_WIRING( 1, 0, 1) FM_MOD_WIRING( 2, 0, 2) FM_MOD_WIRING( 3, 0, 3)
+FM_MOD_WIRING( 4, 1, 0) FM_MOD_WIRING( 5, 1, 1) FM_MOD_WIRING( 6, 1, 2) FM_MOD_WIRING( 7, 1, 3)
+FM_MOD_WIRING( 8, 2, 0) FM_MOD_WIRING( 9, 2, 1) FM_MOD_WIRING(10, 2, 2) FM_MOD_WIRING(11, 2, 3)
+AudioConnection fms0(fmModMix[0], 0, fmModSum,  0);
+AudioConnection fms1(fmModMix[1], 0, fmModSum,  1);
+AudioConnection fms2(fmModMix[2], 0, fmModSum,  2);
+AudioConnection fmci(fmModSum,    0, fmCarrier, 0); // FM input
+AudioConnection fmg0(fmCarrier,   0, fmGate,    0);
+AudioConnection fmg1(fmDc,        0, fmGate,    1);
+
+// ── Benjolin / Cracklebox modes: chaos sources ──────────────────────────────
+AudioBenjolin   benjolin;
+AudioCracklebox crackle;
+
+// ── Final bus: normal / FM / Benjolin / Cracklebox → chorus → output ─────────
+// finalMix ch0 = normal voice+bell master (also FM Poly), ch1 = mono FM,
+// ch2 = Benjolin, ch3 = Cracklebox. The active mode raises the right one(s).
+AudioMixer4 finalMix;
+AudioConnection fx0(masterMix, 0, finalMix, 0);
+AudioConnection fx1(fmGate,    0, finalMix, 1);
+AudioConnection fx2(benjolin,  0, finalMix, 2);
+AudioConnection fx3(crackle,   0, finalMix, 3);
+
+// Chorus send on the final bus (for the Juno timbre's ensemble shimmer).
+AudioEffectChorus chorus;
+#define CHORUS_DELAY_LEN (16 * AUDIO_BLOCK_SAMPLES)
+static short chorusDelayLine[CHORUS_DELAY_LEN];
+
+// Balanced output: I2S L = +master, R = −master (180° inverted) so the two
+// channels drive a balanced differential line out (L−R = 2× signal, common-
+// mode noise cancels). The chorus sits between the final mix and the split.
+AudioAmplifier  rInv;
+AudioConnection pmC (finalMix, 0, chorus, 0);
+AudioConnection pmL (chorus,   0, i2sOut, 0);
+AudioConnection pmRa(chorus,   0, rInv,   0);
+AudioConnection pmR (rInv,     0, i2sOut, 1);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Hardware
+// ─────────────────────────────────────────────────────────────────────────────
+
+static MPR121 boards[NUM_BOARDS] = {
+    MPR121(BOARD_ADDRESSES[0]),
+    MPR121(BOARD_ADDRESSES[1]),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-sensor state
+// ─────────────────────────────────────────────────────────────────────────────
+
+static SensorState sensorState[NUM_SENSORS];
+static ProximityConfig proxCfg;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// LFO — per-voice pitch drift
+//
+// Each voice has an independent LFO with a slightly different rate
+// (spread by LFO_RATE_SPREAD) so adjacent notes drift out of sync,
+// giving the instrument a slightly unstable, analogue feel.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static float lfoPhase[NUM_SENSORS];
+static float lfoRate[NUM_SENSORS];
+
+// Per-voice glided base frequency (pre-LFO). On a live scale change this slides
+// toward the new note over SET_GLIDE_MS (fixed-time log sweep), then stops.
+static float    glideFreq[NUM_SENSORS];  // current (live) pitch per voice
+static float    glideStart[NUM_SENSORS]; // pitch at the moment the glide began
+static uint32_t glideStartMs = 0;        // millis() when the current glide began
+
+// Live (morphing) timbre params. On a live timbre change the filter cutoff
+// range, resonance and sub blend slide from the start snapshot to the target
+// over TIMBRE_MORPH_MS; the waveform switches instantly. cur* are what the
+// voices actually use each frame (onProximity reads cur cutoffs).
+static float    curSub  = 0, curBaseHz = 0, curMaxHz = 0, curQ = 0;
+static float    morphStartSub = 0, morphStartBase = 0, morphStartMax = 0, morphStartQ = 0;
+static float    morphTgtSub   = 0, morphTgtBase   = 0, morphTgtMax   = 0, morphTgtQ   = 0;
+static uint32_t timbreMorphStartMs = 0;
+
+// ── Play mode + arpeggiator state ────────────────────────────────────────────
+static uint8_t  activeMode    = MODE_PROX;             // play mode (see PlayMode)
+static uint8_t  arpCurrentPad = 0xFF;                  // pad sounding now (0xFF = none)
+static uint32_t arpNextTickMs = 0;                     // when to step to the next held pad
+static float    lastIntensity[NUM_SENSORS] = { 0.0f }; // prev-frame intensity → held detect
+static uint32_t holdStartMs[NUM_SENSORS]   = { 0 };    // when each pad became held (0 = released)
+                                                       // → press order for FM carrier / Benjolin
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Sound state — scale (notes) and timbre (character) are independent
+// ─────────────────────────────────────────────────────────────────────────────
+
+static uint8_t activeScale  = 0; // index into SCALE_SETS  (swipe left/right)
+static uint8_t activeTimbre = 0; // index into TIMBRE_SETS (swipe up/down)
+
+// ── Persisted selection (survives power-off) ─────────────────────────────────
+// Teensy 4.0 emulated EEPROM. A magic byte validates the slots so a blank or
+// previously-unused chip falls back to the compile-time defaults rather than
+// reading whatever garbage happens to be there. Scale and timbre live in
+// separate bytes so each is remembered on its own.
+static constexpr int     EEPROM_ADDR_MAGIC  = 0;
+static constexpr int     EEPROM_ADDR_SCALE  = 1;
+static constexpr int     EEPROM_ADDR_TIMBRE = 2;
+static constexpr int     EEPROM_ADDR_MODE   = 3;
+static constexpr uint8_t EEPROM_MAGIC       = 0xA9; // bumped: added mode byte
+
+static uint8_t loadStoredScale(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_SCALE);
+    return (v < NUM_SCALE_SETS) ? v : fallback;
+}
+
+static uint8_t loadStoredTimbre(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_TIMBRE);
+    return (v < NUM_TIMBRE_SETS) ? v : fallback;
+}
+
+static void storeScale(uint8_t index)
+{
+    // .update() only writes when the byte differs → avoids needless EEPROM wear.
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_SCALE, index);
+}
+
+static void storeTimbre(uint8_t index)
+{
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_TIMBRE, index);
+}
+
+static uint8_t loadStoredMode(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_MODE);
+    return (v < NUM_MODES) ? v : fallback;
+}
+
+static void storeMode(uint8_t index)
+{
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_MODE, index);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Update timing
+// ─────────────────────────────────────────────────────────────────────────────
+
+static uint32_t lastUpdateMs = 0;
+
+// Idle-recalibration state — kicks a full MPR121 baseline reload after a
+// long quiet period so slow drift can't produce phantom blips.
+static uint32_t lastActivityMs = 0;
+static uint32_t lastRecalMs    = 0;
+
+// Per-pad MPE / MIDI state.
+static uint8_t  midiNote     [NUM_BELLS] = { 0 };
+static uint8_t  lastPress127 [NUM_BELLS] = { 0 };
+static uint32_t lastPressMs  [NUM_BELLS] = { 0 };
+
+static inline uint8_t midiNoteFromFreq(float hz)
+{
+    int n = (int)lroundf(69.0f + 12.0f * log2f(hz / 440.0f));
+    if (n < 0)   n = 0;
+    if (n > 127) n = 127;
+    return (uint8_t)n;
+}
+
+static inline uint8_t mpeChannelFor(uint8_t pad)
+{
+    return (uint8_t)(MPE_MEMBER_BASE_CH + pad);
+}
+
+// Forward decl — definition is below the bell state (uses bellHeld / bellPress).
+static void recalibrateBaselines();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load scale / timbre — independent. Both redraw the screen and persist.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Swipe LEFT/RIGHT — change the SCALE (which note each pad plays). Pitch only;
+// the voices keep sounding and the loop glides each note to its new target
+// (glide=true). At boot glide=false snaps the glide frequencies into place.
+static void loadScale(uint8_t index, bool glide)
+{
+    if (index >= NUM_SCALE_SETS) return;
+    activeScale = index;
+    storeScale(index); // remember across power-off
+    const ScaleSet &sc = SCALE_SETS[index];
+
+    if (glide)
+    {
+        // Snapshot the current pitches and start a fixed-time glide; the loop
+        // sweeps glideFreq[] from glideStart[] to sc.freqs[] over SET_GLIDE_MS.
+        glideStartMs = millis();
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) glideStart[i] = glideFreq[i];
+    }
+    else
+    {
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) glideFreq[i] = glideStart[i] = sc.freqs[i];
+        glideStartMs = 0; // already-elapsed → no glide at boot
+    }
+
+    if (activeMode == MODE_BENJOLIN) // keep the chaos quantiser on the new scale
+        benjolin.setQuantize(sc.freqs, NUM_SENSORS);
+
+    displayShowScale(sc.name); // incremental redraw of just the scale line
+    Serial.print(F("# Scale: "));
+    Serial.println(sc.name);
+}
+
+// Swipe UP/DOWN — change the TIMBRE (sound character). At boot glide=false does
+// the full voice init; live (glide=true) updates timbre only, leaving amplitude
+// and phase untouched so held notes keep sounding with no pause.
+static void loadTimbre(uint8_t index, bool glide)
+{
+    if (index >= NUM_TIMBRE_SETS) return;
+    activeTimbre = index;
+    storeTimbre(index); // remember across power-off
+    const TimbreSet &t = TIMBRE_SETS[index];
+
+    morphTgtSub  = t.subMix;
+    morphTgtBase = t.filterBaseHz;
+    morphTgtMax  = t.filterMaxHz;
+    morphTgtQ    = t.filterQ;
+
+    if (glide)
+    {
+        // Waveform can't crossfade on a single oscillator, so switch it now;
+        // the filter/sub MORPH from the current live values to the target over
+        // TIMBRE_MORPH_MS (the loop interpolates cur* and applies them).
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) setVoiceWaveform(voices[i], t.waveformType);
+        morphStartSub  = curSub;
+        morphStartBase = curBaseHz;
+        morphStartMax  = curMaxHz;
+        morphStartQ    = curQ;
+        timbreMorphStartMs = millis();
+    }
+    else
+    {
+        // Boot: full voice init + snap the live timbre to the target.
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) initVoice(voices[i], t, glideFreq[i]);
+        curSub = morphStartSub = morphTgtSub;
+        curBaseHz = morphStartBase = morphTgtBase;
+        curMaxHz = morphStartMax = morphTgtMax;
+        curQ = morphStartQ = morphTgtQ;
+        timbreMorphStartMs = 0;
+    }
+    masterMix.gain(3, t.bellMix);          // per-timbre bell loudness (instant)
+    chorus.voices(t.chorus ? 3 : 1);       // wet ensemble for Juno, dry otherwise
+
+    displayShowTimbre(t.name); // incremental redraw of just the timbre line
+    Serial.print(F("# Timbre: "));
+    Serial.println(t.name);
+}
+
+// Play mode — Proximity / Arp Slow / Med / Fast. Tap the screen centre (or
+// serial 'm') to cycle. Persisted across power-off.
+static void loadMode(uint8_t index)
+{
+    if (index >= NUM_MODES) return;
+    activeMode = index;
+    storeMode(index);
+
+    const bool fmMono = (index == MODE_FM);
+    const bool ben    = (index == MODE_BENJOLIN || index == MODE_BENJOLIN_RAW);
+    const bool crk    = (index == MODE_CRACKLE);
+    // Normal voice path is used by Proximity, Arp, AND FM Poly (which self-FMs
+    // the voices). Only mono-FM / Benjolin / Cracklebox replace it.
+    const bool normalPath = !(fmMono || ben || crk);
+
+    finalMix.gain(0, normalPath ? 1.0f : 0.0f);     // normal voices (+ FM Poly)
+    finalMix.gain(1, fmMono ? FM_LEVEL       : 0.0f); // mono FM carrier
+    finalMix.gain(2, ben    ? BENJOLIN_LEVEL : 0.0f); // Benjolin
+    finalMix.gain(3, crk    ? CRACKLE_LEVEL  : 0.0f); // Cracklebox
+
+    arpCurrentPad = 0xFF; arpNextTickMs = millis();
+    if (!fmMono) fmDc.amplitude(0.0f, 8.0f); // hush the mono carrier when leaving FM
+    if (!ben)    benjolin.setAmp(0.0f);      // hush the chaos when leaving Benjolin
+    if (!crk)    crackle.setAmp(0.0f);
+    if (ben)     benjolin.setQuantize(index == MODE_BENJOLIN ? SCALE_SETS[activeScale].freqs : nullptr,
+                                      index == MODE_BENJOLIN ? NUM_SENSORS : 0);
+
+    displayShowMode(MODE_NAMES[index]);
+    Serial.print(F("# Mode: "));
+    Serial.println(MODE_NAMES[index]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Instrument callbacks
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Called every frame for each pad.
+// intensity 0.0 = hand far away, 1.0 = hand very close.
+static void onProximity(uint8_t sensorIndex, float intensity)
+{
+    // Click-free amplitude via DC ramp (sample-accurate interpolation)
+    float targetAmp = intensity * VOICE_MAX_AMP;
+    setVoiceAmplitude(voices[sensorIndex], targetAmp);
+
+    // Proximity-modulated filter cutoff (brighter when closer). Uses the live
+    // (morphing) cutoff range so a timbre change sweeps smoothly.
+    setVoiceFilter(voices[sensorIndex], intensity, curBaseHz, curMaxHz);
+}
+
+// Per-pad bell state.
+static bool     bellHeld[NUM_BELLS]   = { false }; // sounding, awaiting lift → release
+static uint32_t bellArmMs[NUM_BELLS]  = { 0 };     // peak-velocity window deadline
+static float    bellPeakV[NUM_BELLS]  = { 0.0f };  // peak contact velocity so far
+static float    bellPress[NUM_BELLS]  = { 0.0f };  // smoothed aftertouch pressure 0–1
+
+// Per-board outlier check on the freshly committed baselines. A hand hovering
+// over a single pad at lock time leaves that pad's baseline much lower than
+// its neighbours' — afterwards the pad is "barely sensitive" because the
+// baseline ≈ near-touch reading. Compares each sense pad's baseline against
+// the per-board median and rewrites any that fall too far below it. Runs
+// while the chip is in normal scan mode; the next baseline-tracking tick will
+// continue from the rewritten value.
+static void fixOutlierBaselines()
+{
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        uint8_t n = SENSE_ELECTRODES[b];
+        if (n == 0) continue;
+
+        uint16_t bases[12];
+        for (uint8_t e = 0; e < n; e++) bases[e] = boards[b].baselineData(e);
+
+        // Insertion sort to find the median (n ≤ 6).
+        uint16_t sorted[12];
+        for (uint8_t e = 0; e < n; e++) sorted[e] = bases[e];
+        for (uint8_t i = 1; i < n; i++)
+        {
+            uint16_t v = sorted[i];
+            int j = (int)i - 1;
+            while (j >= 0 && sorted[j] > v) { sorted[j + 1] = sorted[j]; j--; }
+            sorted[j + 1] = v;
+        }
+        uint16_t median = sorted[n / 2];
+
+        for (uint8_t e = 0; e < n; e++)
+        {
+            // Rewrite either-direction outliers to the per-board median:
+            //   • baseline ≫ median  → pad rests with a positive rawDelta and
+            //     plays a constant tone (the voice never closes) even though a
+            //     real touch still spikes the jump detector. THIS is the case
+            //     that makes a pad "always sound" while its bell still fires.
+            //   • baseline ≪ median  → pad is "barely sensitive" (rawDelta
+            //     clamps to 0 until a hard touch) — a hand hovering at lock time.
+            int16_t diff = (int16_t)bases[e] - (int16_t)median;
+            if (diff < 0) diff = (int16_t)-diff;
+            if (diff > (int16_t)BASELINE_OUTLIER_DELTA)
+            {
+                // BASE register holds the upper 8 of the 10-bit baseline.
+                boards[b].write((uint8_t)(MPR121Reg::BASE_0 + e),
+                                (uint8_t)(median >> 2));
+#if SERIAL_DEBUG
+                Serial.print(F("# baseline outlier: board "));
+                Serial.print(b);
+                Serial.print(F(" ELE"));
+                Serial.print(e);
+                Serial.print(F(" was "));
+                Serial.print(bases[e]);
+                Serial.print(F(", median "));
+                Serial.print(median);
+                Serial.println(F(" → rewritten"));
+#endif
+            }
+        }
+    }
+}
+
+// Force a full MPR121 baseline reload (CL=11) on every board, release any
+// sustained bells, and re-seed the proximity EMAs. ~60 ms of sensor pause;
+// only called during a quiet period, so the existing 8 ms voice ramp +
+// 400 ms bell release handle the fade.
+static void recalibrateBaselines()
+{
+    for (uint8_t i = 0; i < NUM_BELLS; i++)
+    {
+        if (bellHeld[i])
+        {
+            bellEnv[i].noteOff();
+            bellHeld[i] = false;
+            if (MPE_ENABLE)
+                usbMIDI.sendNoteOff(midiNote[i], 0, mpeChannelFor(i));
+        }
+        bellPress[i] = 0.0f;
+    }
+
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        boards[b].write(MPR121Reg::ECR, 0x00);
+        delay(10);
+        boards[b].write(MPR121Reg::ECR, (uint8_t)(0b11000000 | SENSE_ELECTRODES[b]));
+        delay(50);
+    }
+    fixOutlierBaselines();
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
+        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
+        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
+        int16_t raw = (int16_t)base - (int16_t)filt;
+        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+    }
+#if SERIAL_DEBUG
+    Serial.println(F("# baseline recalibrated"));
+#endif
+}
+
+// While a pad is held, the live contact strength modulates the bell's loudness
+// and its low-pass cutoff (polyphonic-aftertouch feel). `fast` is the raw
+// proximity EMA (hundreds when pressing metal), not the saturated intensity.
+static void bellApplyPressure(uint8_t k, float fast)
+{
+    float p = (fast - BELL_AFTER_MIN) / (BELL_AFTER_MAX - BELL_AFTER_MIN);
+    p = p < 0.0f ? 0.0f : (p > 1.0f ? 1.0f : p);
+    bellPress[k] += BELL_PRESS_SMOOTH * (p - bellPress[k]); // 1-pole anti-zipper
+    float ps = bellPress[k];
+
+    float amp = BELL_AMP * (BELL_FLOOR + (1.0f - BELL_FLOOR) * ps);
+    bellOscA[k].amplitude(amp);
+    bellOscB[k].amplitude(amp * 0.5f);
+    bellFilt[k].frequency(BELL_FILT_MIN_HZ + ps * (BELL_FILT_MAX_HZ - BELL_FILT_MIN_HZ));
+}
+
+// Contact velocity → bell oscillator amplitude (the dynamics curve).
+static float bellAmpFromVel(float vel)
+{
+    float n = (vel - BELL_VEL_MIN) / (BELL_VEL_MAX - BELL_VEL_MIN);
+    n *= BELL_STRIKE_GAIN;
+    n = n < 0.0f ? 0.0f : (n > 1.0f ? 1.0f : n);
+    return BELL_AMP * (BELL_FLOOR + (1.0f - BELL_FLOOR) * powf(n, BELL_CURVE));
+}
+
+static void bellSetAmp(uint8_t k, float vel)
+{
+    float amp = bellAmpFromVel(vel);
+    bellOscA[k].amplitude(amp);
+    bellOscB[k].amplitude(amp * 0.5f);
+}
+
+// Called once on the frame a contact event is detected (rising edge). Triggers
+// the bell immediately at the provisional velocity, then opens a short window
+// during which loop() tracks the PEAK velocity and re-levels — the long-ish
+// attack means that final level lands smoothly with no click or latency.
+// One dedicated bell voice per pad (k = sensorIndex).
+static void onTouch(uint8_t sensorIndex, float velocity, uint32_t nowMs)
+{
+    const ScaleSet &sc = SCALE_SETS[activeScale];
+    float fund = sc.freqs[sensorIndex] * BELL_OCTAVES;
+
+    uint8_t k = sensorIndex; // one bell per pad
+
+    bellOscA[k].frequency(fund);
+    bellOscB[k].frequency(fund * BELL_PARTIAL);
+    bellSetAmp(k, velocity);
+    bellEnv[k].noteOn();
+
+    bellHeld[k]  = true;                          // sustain until the finger lifts
+    bellArmMs[k] = nowMs + BELL_STRIKE_WIN_MS;    // refine level for this long
+    bellPeakV[k] = velocity;
+
+    // Seed the aftertouch pressure from the hit strength so the sustain
+    // doesn't dip before the live pressure tracking eases in.
+    float n = (velocity - BELL_VEL_MIN) / (BELL_VEL_MAX - BELL_VEL_MIN);
+    bellPress[k] = n < 0.0f ? 0.0f : (n > 1.0f ? 1.0f : n);
+
+    // ── MPE: noteOn on the pad's member channel ──
+    if (MPE_ENABLE)
+    {
+        midiNote[k] = midiNoteFromFreq(sc.freqs[sensorIndex]);
+        int vel = (int)lroundf(n * 127.0f);
+        if (vel < 1)   vel = 1;     // 0 = noteOff in MIDI
+        if (vel > 127) vel = 127;
+        usbMIDI.sendNoteOn(midiNote[k], (uint8_t)vel, mpeChannelFor(k));
+        lastPress127[k] = 0;
+        lastPressMs[k]  = 0;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Startup LED animation
+// ─────────────────────────────────────────────────────────────────────────────
+
+static void playStartupAnimation()
+{
+    uint8_t bri[8];
+    for (uint8_t v = 0; v <= 15; v++)
+    {
+        memset(bri, v, sizeof(bri));
+        for (uint8_t b = 0; b < NUM_BOARDS; b++)
+            boards[b].setLEDs8(bri);
+        delay(5);
+    }
+    for (uint8_t v = 15; v > 0; v--)
+    {
+        memset(bri, v, sizeof(bri));
+        for (uint8_t b = 0; b < NUM_BOARDS; b++)
+            boards[b].setLEDs8(bri);
+        delay(5);
+    }
+    memset(bri, 0, sizeof(bri));
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+        boards[b].setLEDs8(bri);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// setup()
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Force USB Full-Speed (12 Mbps) instead of High-Speed (480 Mbps).
+// Runs immediately after usb_init() via weak-symbol override, before the host
+// has time to enumerate — so the HS handshake never happens.
+extern "C" void startup_late_hook(void) {
+    USB1_PORTSC1 |= USB_PORTSC1_PFSC;
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    while (!Serial && millis() < 200) {}
+
+    // ── I2C bus ──────────────────────────────────────────────────────────────
+    Wire.begin();
+    Wire.setClock(400000); // 400 kHz fast-mode I2C: the sensor/LED/touch reads
+                           // fit in a shorter frame → lower sampling latency.
+                           // If you ever see sensor glitches/noise, the wiring
+                           // can't sustain 400 kHz — drop back to 100000 (and
+                           // raise UPDATE_MS to ~8 so the reads still fit).
+
+    // ── MPR121 boards (staged init so we can read pads BEFORE baseline lock) ─
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        if (!boards[b].beginConfig(SENSE_ELECTRODES[b], 40, 20, SENSOR_CDC, SENSOR_CDT))
+        {
+            Serial.print(F("ERROR: MPR121 board "));
+            Serial.print(b);
+            Serial.print(F(" at 0x"));
+            Serial.print(BOARD_ADDRESSES[b], HEX);
+            Serial.println(F(" not found"));
+        }
+        else
+        {
+            Serial.print(F("MPR121 board "));
+            Serial.print(b);
+            Serial.println(F(" OK"));
+        }
+        // CL=00 = baseline frozen at 0 → raw filtered reads. Lets us see if a
+        // finger is on a pad before we commit a baseline that would hide it.
+        boards[b].startScanning(SENSE_ELECTRODES[b], 0b00);
+        boards[b].beginLEDs();
+    }
+
+    // ── Pick the startup scale/timbre: pad-held overrides the stored scale ───
+    delay(25); // let filtered data populate
+    uint8_t startupScale  = loadStoredScale(STARTUP_SCALE_DEFAULT);   // last saved, else default
+    uint8_t startupTimbre = loadStoredTimbre(STARTUP_TIMBRE_DEFAULT); // (timbre isn't pad-pickable)
+    uint8_t startupMode   = loadStoredMode(MODE_PROX);                // play mode
+    uint8_t heldPad       = 0xFF; // 0xFF = none
+    {
+        const SensorConfig &refS = SENSORS[STARTUP_REF_PAD];
+        uint16_t refF = boards[refS.boardIndex].filteredData(refS.electrode);
+
+        // Finger lowers the filtered value sharply. List order = priority.
+        for (uint8_t bi = 0; bi < NUM_STARTUP_BINDINGS; bi++)
+        {
+            const StartupBinding &b = STARTUP_BINDINGS[bi];
+            const SensorConfig   &s = SENSORS[b.pad];
+            uint16_t padF = boards[s.boardIndex].filteredData(s.electrode);
+            if ((int16_t)refF - (int16_t)padF > STARTUP_HOLD_THRESHOLD)
+            {
+                startupScale = b.scale;
+                heldPad      = b.pad;
+                break;
+            }
+        }
+        if (heldPad != 0xFF)
+        {
+            Serial.print(F("# hold detected on pad ")); Serial.print(heldPad);
+            Serial.print(F(" → scale "));               Serial.println(startupScale);
+        }
+    }
+
+    // ── LFO phases — spread evenly, rates slightly different per voice ───────
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        lfoPhase[i] = (float)i / (float)NUM_SENSORS;
+        lfoRate[i]  = LFO_RATE_HZ + LFO_RATE_SPREAD * ((float)i / (float)NUM_SENSORS - 0.5f);
+    }
+
+    // ── Teensy Audio ─────────────────────────────────────────────────────────
+    AudioMemory(170); // 12 voices (+FM mod osc) + 12 bells + FM bus + Benjolin + Cracklebox
+
+    // Chorus send — starts dry (voices(1) = pass-through); loadTimbre() bumps
+    // the voice count for chorused timbres (Juno).
+    chorus.begin(chorusDelayLine, CHORUS_DELAY_LEN, 1);
+
+    // FM carrier + modulator bus (silent until FM mode drives them).
+    fmCarrier.begin(WAVEFORM_SINE);
+    fmCarrier.amplitude(1.0f);
+    fmCarrier.frequencyModulation(FM_DEPTH_OCTAVES);
+    for (uint8_t m = 0; m < 3; m++)
+        for (uint8_t ch = 0; ch < 4; ch++) fmModMix[m].gain(ch, 0.0f);
+    fmModSum.gain(0, 1.0f); fmModSum.gain(1, 1.0f); fmModSum.gain(2, 1.0f); fmModSum.gain(3, 0.0f);
+    fmDc.amplitude(0.0f);
+
+    // Benjolin / Cracklebox defaults (silent until their mode gates them).
+    benjolin.setCross(BENJOLIN_CROSS);
+    benjolin.setRungle(BENJOLIN_RUNGLE);
+    benjolin.setAmp(0.0f);
+    crackle.setAmp(0.0f);
+
+    // Final bus — start on the normal voice path (Proximity mode).
+    finalMix.gain(0, 1.0f); finalMix.gain(1, 0.0f); finalMix.gain(2, 0.0f); finalMix.gain(3, 0.0f);
+
+    // Stage mixer gains
+    for (int ch = 0; ch < 4; ch++)
+    {
+        stageMix[0].gain(ch, STAGE_GAIN);
+        stageMix[1].gain(ch, STAGE_GAIN);
+        stageMix[2].gain(ch, STAGE_GAIN);
+    }
+    // Master mixer
+    for (int ch = 0; ch < 3; ch++)
+        masterMix.gain(ch, MASTER_GAIN);
+    masterMix.gain(3, BELL_MIX); // ch 3 = summed bell voices
+    rInv.gain(-1.0f);            // I2S right = inverted master → balanced output
+
+    // Bell voices
+    for (uint8_t k = 0; k < NUM_BELLS; k++)
+    {
+        bellVoiceMix[k].gain(0, 0.65f); // fundamental partial
+        bellVoiceMix[k].gain(1, 0.35f); // inharmonic partial
+        bellVoiceMix[k].gain(2, 0.0f);
+        bellVoiceMix[k].gain(3, 0.0f);
+        bellEnv[k].attack(BELL_ATTACK_MS);
+        bellEnv[k].hold(0.0f);
+        bellEnv[k].decay(BELL_DECAY_MS);
+        bellEnv[k].sustain(BELL_SUSTAIN); // rings while the pad is held
+        bellEnv[k].release(BELL_RELEASE_MS);
+        bellFilt[k].resonance(BELL_FILT_Q);
+        bellFilt[k].frequency(BELL_FILT_MIN_HZ);
+    }
+    for (uint8_t g = 0; g < 3; g++)
+        for (uint8_t ch = 0; ch < 4; ch++)
+            bellGroup[g].gain(ch, 0.6f); // headroom for many simultaneous bells
+    bellSum.gain(0, 1.0f);
+    bellSum.gain(1, 1.0f);
+    bellSum.gain(2, 1.0f);
+    bellSum.gain(3, 0.0f);
+
+    // Touch trigger tuning (see config.h)
+    proxCfg.jumpThreshold     = TOUCH_JUMP_THRESHOLD;
+    proxCfg.releaseRatio      = TOUCH_RELEASE_RATIO;
+    proxCfg.cooldownMs        = TOUCH_COOLDOWN_MS;
+    proxCfg.confirmFrames     = TOUCH_CONFIRM_FRAMES;
+    proxCfg.proxConfirmFrames = PROX_CONFIRM_FRAMES;
+    proxCfg.proxDeadband      = PROX_DEADBAND;
+    proxCfg.proxMax           = PROX_MAX;
+    proxCfg.proxReleaseDelta  = PROX_RELEASE_DELTA;
+    proxCfg.smoothAlpha       = PROX_SMOOTH_ALPHA;
+    proxCfg.smoothAlphaRise   = PROX_SMOOTH_RISE;
+    proxCfg.fastJumpRef       = PROX_FAST_JUMP_REF;
+
+    // ── Teensy-GPIO LEDs ─────────────────────────────────────────────────────
+    // LEDs offloaded from the MPR121's faulty ELE9/ELE10 drivers (pads 3,4,9,10)
+    // are wired to Teensy pins. Set them up as PWM outputs at an inaudible
+    // frequency so they neither whine nor couple into the audio.
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+        if (sc.ledBoard == LED_TEENSY && sc.ledEle != NO_PIN)
+        {
+            pinMode(sc.ledEle, OUTPUT);
+            analogWriteFrequency(sc.ledEle, 30000); // 30 kHz — inaudible
+            analogWrite(sc.ledEle, 0);
+        }
+    }
+
+    // ── LCD / touch screen ───────────────────────────────────────────────────
+    displayInit(); // no-op when ENABLE_SCREEN == 0
+
+    // ── Startup animation / hold-confirmation sequence ──────────────────────
+    if (heldPad == 0xFF)
+    {
+        // Normal boot — quick LED ramp is also the "settle" window.
+        playStartupAnimation();
+    }
+    else
+    {
+        // Hold-override boot — keep ALL LEDs solid while the user is pressing
+        // (visual confirmation the override took), fade them after release,
+        // then wait 1 s before locking the baseline so the chip sees the
+        // fully-released state.
+        const SensorConfig &refS  = SENSORS[STARTUP_REF_PAD];
+        const SensorConfig &heldS = SENSORS[heldPad];
+
+        uint8_t fullBri[8];
+        memset(fullBri, 15, sizeof(fullBri));
+        uint32_t holdStart = millis();
+        while (true)
+        {
+            for (uint8_t b = 0; b < NUM_BOARDS; b++) boards[b].setLEDs8(fullBri);
+            delay(20);
+            uint16_t refF = boards[refS.boardIndex ].filteredData(refS.electrode);
+            uint16_t padF = boards[heldS.boardIndex].filteredData(heldS.electrode);
+            // Hysteresis on release: drop below half-threshold = released.
+            if ((int16_t)refF - (int16_t)padF < STARTUP_HOLD_THRESHOLD / 2) break;
+            // Safety: don't hang forever (30 s max).
+            if (millis() - holdStart > 30000) break;
+        }
+
+        // Fade LEDs down.
+        uint8_t bri[8];
+        for (int v = 15; v >= 0; v--)
+        {
+            memset(bri, (uint8_t)v, sizeof(bri));
+            for (uint8_t b = 0; b < NUM_BOARDS; b++) boards[b].setLEDs8(bri);
+            delay(25);
+        }
+
+        // 1 s pause so any residual finger capacitance settles.
+        delay(1000);
+    }
+
+    // ── Commit the baseline now that the finger is (presumably) released ─────
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+        boards[b].lockBaseline(SENSE_ELECTRODES[b]);
+    fixOutlierBaselines();
+
+    // ── Seed per-sensor EMA state from the freshly locked baseline ──────────
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
+        uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
+        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
+        int16_t raw = (int16_t)base - (int16_t)filt;
+        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+    }
+
+    // ── Load chosen scale + timbre (scale may be overridden by a held pad) ───
+    displayBeginCanvas();                // no-op when ENABLE_SCREEN == 0
+    loadScale(startupScale, false);      // snaps glideFreq[] to the scale's notes
+    loadTimbre(startupTimbre, false);    // full voice init using those freqs
+    loadMode(startupMode);               // Proximity / Arp*
+
+    // ── MPE Configuration Message ────────────────────────────────────────────
+    // RPN 6 on the master channel sets up MPE Zone 1: 12 member channels
+    // (pad 0 → ch 2, … pad 11 → ch 13).
+    if (MPE_ENABLE)
+    {
+        const uint8_t mch = MPE_MASTER_CH;
+        usbMIDI.sendControlChange(101, 0,            mch); // RPN MSB
+        usbMIDI.sendControlChange(100, 6,            mch); // RPN LSB = 6 (MCM)
+        usbMIDI.sendControlChange(  6, NUM_BELLS,    mch); // # of member channels
+        usbMIDI.sendControlChange(101, 127,          mch); // RPN null (MSB)
+        usbMIDI.sendControlChange(100, 127,          mch); // RPN null (LSB)
+    }
+
+    lastActivityMs = millis();
+
+    Serial.println(F("# Omniphone started"));
+    Serial.println(F("# Scale  (0-8, swipe L/R):  0=DKurd 1=Just 2=Overtones 3=Chromatic 4=Sad 5=Happy 6=Pentatonic 7=HarmMinor 8=Accordion"));
+    Serial.println(F("# Timbre (a-i, swipe U/D):  a=Warm b=Crystal c=Edgy d=Dark e=Soft f=Shimmer g=Cry h=Juno i=Moog"));
+    Serial.println(F("# Mode   (m, long-press):   Proximity / Arp x3 / FM / FM Poly / Benjolin / Benjolin Raw / Cracklebox"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// loop()
+// ─────────────────────────────────────────────────────────────────────────────
+
+void loop()
+{
+    uint32_t now = millis();
+
+    // ── Serial command: 0-6 = scale, a-g = timbre (both glide live) ──────────
+    if (Serial.available())
+    {
+        char c = Serial.read();
+        if (c >= '0' && c <= '8')      loadScale((uint8_t)(c - '0'), true);
+        else if (c >= 'a' && c <= 'i') loadTimbre((uint8_t)(c - 'a'), true);
+        else if (c >= 'A' && c <= 'I') loadTimbre((uint8_t)(c - 'A'), true);
+        else if (c == 'm' || c == 'M') loadMode((uint8_t)((activeMode + 1) % NUM_MODES));
+    }
+
+    // ── Rate-limited sensor update ───────────────────────────────────────────
+    if (now - lastUpdateMs < UPDATE_MS)
+        return;
+    lastUpdateMs = now;
+
+    // ── Burst-read all boards ────────────────────────────────────────────────
+    // Sized for the MPR121 max (12 electrodes); each board only reads its own
+    // SENSE_ELECTRODES[b] count — filtered is 2 bytes/electrode, baseline 1.
+    struct BoardData {
+        uint8_t  filt[24];
+        uint8_t  base[12];
+        uint16_t touch;
+    };
+    static BoardData bd[NUM_BOARDS];
+
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        uint8_t n = SENSE_ELECTRODES[b];
+        boards[b].burstRead(MPR121Reg::FILT_0L, bd[b].filt, (uint8_t)(n * 2));
+        boards[b].burstRead(MPR121Reg::BASE_0,  bd[b].base, n);
+        bd[b].touch = boards[b].touchStatus();
+    }
+
+    // ── Per-sensor update ────────────────────────────────────────────────────
+    // ledBri is indexed by GPIO bit (g → ELE g+4); g=2..7 = ELE6..ELE11 here.
+    static uint8_t ledBri[NUM_BOARDS][8];
+    memset(ledBri, 0, sizeof(ledBri));
+
+    const ScaleSet &scaleSet = SCALE_SETS[activeScale];
+
+    // ── Per-frame interpolation progress (shared by all voices) ──────────────
+    // Pitch glide: fixed-time, 0→1 over SET_GLIDE_MS (applied log per voice).
+    float glideT = (SET_GLIDE_MS > 0.0f)
+                 ? ((float)(now - glideStartMs) / SET_GLIDE_MS) : 1.0f;
+    if (glideT > 1.0f) glideT = 1.0f;
+
+    // Timbre morph: fixed-time linear, 0→1 over TIMBRE_MORPH_MS.
+    float morphT = (TIMBRE_MORPH_MS > 0.0f)
+                 ? ((float)(now - timbreMorphStartMs) / TIMBRE_MORPH_MS) : 1.0f;
+    if (morphT > 1.0f) morphT = 1.0f;
+    curSub    = morphStartSub  + morphT * (morphTgtSub  - morphStartSub);
+    curBaseHz = morphStartBase + morphT * (morphTgtBase - morphStartBase);
+    curMaxHz  = morphStartMax  + morphT * (morphTgtMax  - morphStartMax);
+    curQ      = morphStartQ    + morphT * (morphTgtQ    - morphStartQ);
+
+    // ── Mode flags ───────────────────────────────────────────────────────────
+    const bool arpActive = (activeMode >= MODE_ARP_SLOW && activeMode <= MODE_ARP_FAST);
+    const bool fmMono    = (activeMode == MODE_FM);
+    const bool fmPoly    = (activeMode == MODE_FM_POLY);
+    const bool benActive = (activeMode == MODE_BENJOLIN || activeMode == MODE_BENJOLIN_RAW);
+    const bool crkActive = (activeMode == MODE_CRACKLE);
+    // Normal voices are audible in Proximity, Arp and FM Poly (which self-FMs
+    // them); mono-FM / Benjolin / Cracklebox replace the voice path.
+    const bool normalOut = !(fmMono || benActive || crkActive);
+
+    // ── Arpeggiator step ─────────────────────────────────────────────────────
+    // In an Arp mode, advance to the next HELD pad (ascending pad index,
+    // wrapping) every MODE_ARP_PERIOD_MS. Held = last frame's intensity over the
+    // threshold. arpCurrentPad gates which voice is allowed to sound below.
+    if (arpActive)
+    {
+        if ((int32_t)(now - arpNextTickMs) >= 0)
+        {
+            uint8_t start = (arpCurrentPad == 0xFF) ? (uint8_t)(NUM_SENSORS - 1) : arpCurrentPad;
+            uint8_t next  = 0xFF;
+            for (uint8_t k = 1; k <= NUM_SENSORS; k++)
+            {
+                uint8_t p = (uint8_t)((start + k) % NUM_SENSORS);
+                if (lastIntensity[p] > ARP_HOLD_INTENSITY) { next = p; break; }
+            }
+            arpCurrentPad = next;                       // 0xFF if nothing held
+            arpNextTickMs = now + (uint32_t)MODE_ARP_PERIOD_MS[activeMode];
+        }
+    }
+    else
+    {
+        arpCurrentPad = 0xFF;
+    }
+
+    bool anyActive = false;
+
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        const SensorConfig &sc = SENSORS[i];
+
+        // Disabled pad (e.g. dropped idx5): keep its voice silent, no LED.
+        if (sc.electrode == NO_PIN) { onProximity(i, 0.0f); lastIntensity[i] = 0.0f; continue; }
+
+        const BoardData &b = bd[sc.boardIndex];
+        uint8_t e = sc.electrode;
+
+        // Reconstruct 10-bit values from burst buffers
+        uint16_t filtered = (uint16_t)b.filt[2 * e]
+                          | ((uint16_t)(b.filt[2 * e + 1] & 0x03) << 8);
+        uint16_t baseline = (uint16_t)b.base[e] << 2;
+
+        float rawDelta = (float)((int16_t)baseline - (int16_t)filtered);
+        if (rawDelta < 0.0f) rawDelta = 0.0f;
+
+        float intensity;
+        bool  isTouch;
+        updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
+
+        if (intensity > IDLE_INTENSITY || bellHeld[i]) anyActive = true;
+
+        if (isTouch)
+        {
+            // Contact velocity drives the dynamics (provisional level now;
+            // refined to the peak over the next BELL_STRIKE_WIN_MS).
+            onTouch(i, sensorState[i].velocity, now);
+        }
+        else if (now < bellArmMs[i])
+        {
+            if (sensorState[i].velocity > bellPeakV[i])
+            {
+                bellPeakV[i] = sensorState[i].velocity;
+                bellSetAmp(i, bellPeakV[i]); // re-level during the attack
+            }
+        }
+        else if (bellHeld[i])
+        {
+            if (intensity < BELL_HOLD_RELEASE)
+            {
+                // Finger lifted → ADSR release (the ring tails out).
+                bellEnv[i].noteOff();
+                bellHeld[i] = false;
+                if (MPE_ENABLE)
+                    usbMIDI.sendNoteOff(midiNote[i], 0, mpeChannelFor(i));
+            }
+            else
+            {
+                // Held: live contact strength → bell loudness + filter.
+                bellApplyPressure(i, sensorState[i].fast);
+
+                // MPE: per-channel pressure (poly aftertouch), throttled.
+                if (MPE_ENABLE && (now - lastPressMs[i]) >= MPE_PRESSURE_THROTTLE_MS)
+                {
+                    int p = (int)lroundf(bellPress[i] * 127.0f);
+                    if (p < 0)   p = 0;
+                    if (p > 127) p = 127;
+                    int d = p - (int)lastPress127[i];
+                    if (d < 0) d = -d;
+                    if (d >= (int)MPE_PRESSURE_MIN_DELTA)
+                    {
+                        usbMIDI.sendAfterTouch((uint8_t)p, mpeChannelFor(i));
+                        lastPress127[i] = (uint8_t)p;
+                        lastPressMs[i]  = now;
+                    }
+                }
+            }
+        }
+        // Voice amplitude gating by mode:
+        //  • arp → only the current step's pad sounds
+        //  • FM / Benjolin → normal voices muted (their oscillators still run and
+        //    feed the FM modulator bus; pitches feed the Benjolin)
+        float ampInt = intensity;
+        if (arpActive && i != arpCurrentPad) ampInt = 0.0f;
+        if (!normalOut)                      ampInt = 0.0f;
+        onProximity(i, ampInt);
+        lastIntensity[i] = intensity; // raw (held) value for arp/FM/benjolin
+
+        // Press-order tracking (FM carrier = first held; Benjolin osc pitches).
+        if (intensity > ARP_HOLD_INTENSITY) { if (holdStartMs[i] == 0) holdStartMs[i] = now; }
+        else                                holdStartMs[i] = 0;
+
+        // ── Scale portamento ─────────────────────────────────────────────────
+        // Fixed-time log sweep from glideStart[i] to the new note (constant
+        // cents/sec, finishes at glideT==1). Steady state: glideT==1 → target.
+        float tgt = scaleSet.freqs[i];
+        glideFreq[i] = (glideT >= 1.0f) ? tgt
+                     : glideStart[i] * powf(tgt / glideStart[i], glideT);
+
+        // ── Timbre morph — apply the live sub/resonance to this voice ────────
+        setVoiceMorph(voices[i], curSub, curQ);
+
+        // ── LFO pitch drift ──────────────────────────────────────────────────
+        lfoPhase[i] += lfoRate[i] * (UPDATE_MS / 1000.0f);
+        if (lfoPhase[i] >= 1.0f) lfoPhase[i] -= 1.0f;
+
+        float freq = glideFreq[i] * (1.0f + LFO_AMOUNT * sinf(2.0f * (float)M_PI * lfoPhase[i]));
+        setVoiceFrequency(voices[i], freq);
+
+        // FM Poly: each voice self-FMs, depth ∝ its proximity. Off otherwise.
+        if (fmPoly) setVoiceFM(voices[i], FM_POLY_DEPTH, intensity * FM_POLY_AMT);
+        else        setVoiceFM(voices[i], 0.0f, 0.0f);
+
+        // ── LED brightness ───────────────────────────────────────────────────
+        // Two LED paths:
+        //   • LED_TEENSY → direct Teensy PWM pin (pads 3,4,9,10 — see config).
+        //     8-bit analogWrite, 0–255.
+        //   • MPR121 LED → packed into ledBri for the batch setLEDs8 below.
+        //     4-bit driver, 0–15; GPIO bit = ledEle - 4 (ELE6→2 … ELE11→7).
+        if (sc.ledEle != NO_PIN)
+        {
+            if (sc.ledBoard == LED_TEENSY)
+            {
+                analogWrite(sc.ledEle, (intensity < 0.001f) ? 0
+                    : static_cast<uint8_t>(intensity * 255.0f + 0.5f));
+            }
+            else
+            {
+                ledBri[sc.ledBoard][sc.ledEle - 4] = (intensity < 0.001f) ? 0
+                    : static_cast<uint8_t>(1.0f + intensity * 14.0f + 0.5f);
+            }
+        }
+    }
+
+    // ── Held pads, sorted by press order (for FM / Benjolin / Cracklebox) ────
+    uint8_t order[NUM_SENSORS];
+    uint8_t nHeld = 0;
+    float   maxI  = 0.0f;
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+    {
+        if (lastIntensity[i] > maxI) maxI = lastIntensity[i];
+        if (holdStartMs[i]) order[nHeld++] = i;
+    }
+    for (uint8_t a = 1; a < nHeld; a++) // insertion sort by hold-start time
+    {
+        uint8_t v = order[a]; int b = (int)a - 1;
+        while (b >= 0 && holdStartMs[order[b]] > holdStartMs[v]) { order[b + 1] = order[b]; b--; }
+        order[b + 1] = v;
+    }
+
+    // ── FM (mono): first-held = carrier, the rest modulate it ────────────────
+    if (fmMono)
+    {
+        uint8_t carrier = (nHeld > 0) ? order[0] : 0xFF;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        {
+            float g = (carrier != 0xFF && i != carrier && holdStartMs[i])
+                    ? lastIntensity[i] * FM_MOD_SCALE : 0.0f;
+            fmModMix[i / 4].gain(i % 4, g);
+        }
+        if (carrier != 0xFF)
+        {
+            fmCarrier.frequency(glideFreq[carrier]);
+            fmDc.amplitude(lastIntensity[carrier] * VOICE_MAX_AMP, AMP_RAMP_MS);
+        }
+        else fmDc.amplitude(0.0f, AMP_RAMP_MS);
+    }
+    // ── Benjolin: each touch (in press order) layers in a parameter, and WHICH
+    // pad you use biases it (pad index → 0..1). 1=oscA pitch+gate, 2=oscB pitch,
+    // 3=cross-mod, 4=rungler, 5=tone. More touches → more going on. ────────────
+    else if (benActive)
+    {
+        if (nHeld >= 1)
+        {
+            benjolin.setFreqA(glideFreq[order[0]]);
+            float fB     = (nHeld >= 2) ? glideFreq[order[1]] : glideFreq[order[0]] * 0.75f;
+            float cross  = BENJOLIN_CROSS;
+            float rungle = BENJOLIN_RUNGLE;
+            float cut    = 0.6f;
+            auto bias = [&](uint8_t k){ return (float)order[k] / (float)(NUM_SENSORS - 1); }; // 0..1
+            if (nHeld >= 3) cross  = 0.15f + lastIntensity[order[2]] * (0.3f + 0.6f * bias(2));
+            if (nHeld >= 4) rungle = lastIntensity[order[3]] * (0.4f + 0.9f * bias(3));
+            if (nHeld >= 5) cut    = 0.2f + lastIntensity[order[4]] * 0.8f * (0.4f + 0.6f * bias(4));
+            benjolin.setFreqB(fB);
+            benjolin.setCross(cross);
+            benjolin.setRungle(rungle);
+            benjolin.setCutoff(cut);
+            benjolin.setAmp(maxI);
+        }
+        else benjolin.setAmp(0.0f);
+    }
+    // ── Cracklebox: one square oscillator per held pad (1 = clean square, each
+    // extra pad XORs its tone in), two octaves down; proximity adds coupling. ─
+    else if (crkActive)
+    {
+        uint8_t n = (nHeld > CRACKLE_MAX) ? CRACKLE_MAX : nHeld;
+        for (uint8_t k = 0; k < n; k++)
+            crackle.setBase(k, glideFreq[order[k]] * CRACKLE_OCT);
+        crackle.setActive(n);
+        crackle.setCouple(CRACKLE_COUPLE * maxI);
+        crackle.setAmp(n > 0 ? (0.3f + maxI * 0.7f) : 0.0f);
+    }
+
+    // ── Batch LED update ─────────────────────────────────────────────────────
+    // Current wiring (see config.h SENSORS): the ELE9 LEDs (pads 3 & 9) are on
+    // Teensy GPIO, so the chip's ELE9 driver bit is otherwise unused — and the
+    // chip only lights an ELE10 LED (pads 4 & 10) when ELE9 is driven the same.
+    // Mirror ELE9 (GPIO bit 5) ← ELE10 (GPIO bit 6) per board so ELE10 lights.
+    for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        ledBri[b][5] = ledBri[b][6]; // ELE9 ← ELE10
+        boards[b].setLEDs8(ledBri[b]);
+    }
+
+    // ── Touch screen: swipe / tap-arrow / long-press (rate-limited; I2C bus) ──
+    // Swipe or tap an arrow: L/R = scale, U/D = timbre. LONG-PRESS = cycle mode.
+    static uint32_t lastGestureMs = 0;
+    if (now - lastGestureMs >= 30)
+    {
+        lastGestureMs = now;
+        uint16_t tapX = 0, tapY = 0;
+        DisplayGesture g = displayPollGesture(tapX, tapY); // NONE when screen off
+
+        if (g == GESTURE_TAP)
+        {
+            g = displayTapToGesture(tapX, tapY); // display.h already printed raw+disp
+#if SCREEN_TOUCH_DEBUG
+            Serial.print(F("#   -> zone ")); Serial.println(
+                g == GESTURE_LEFT  ? "LEFT(scale-)"  : g == GESTURE_RIGHT ? "RIGHT(scale+)" :
+                g == GESTURE_UP    ? "UP(timbre-)"   : g == GESTURE_DOWN  ? "DOWN(timbre+)" : "none");
+#endif
+        }
+
+        switch (g)
+        {
+            case GESTURE_RIGHT:
+                loadScale((uint8_t)((activeScale + 1) % NUM_SCALE_SETS), true);
+                break;
+            case GESTURE_LEFT:
+                loadScale((uint8_t)((activeScale + NUM_SCALE_SETS - 1) % NUM_SCALE_SETS), true);
+                break;
+            case GESTURE_DOWN:
+                loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true);
+                break;
+            case GESTURE_UP:
+                loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true);
+                break;
+            case GESTURE_LONGPRESS:
+                loadMode((uint8_t)((activeMode + 1) % NUM_MODES)); // long-press cycles mode
+                break;
+            default:
+                break;
+        }
+
+        // ── Background glow: average intensity across all pads → screen white ─
+        float sum = 0.0f;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) sum += lastIntensity[i];
+        displaySetGlow(sum / (float)NUM_SENSORS); // just sets the target level
+    }
+
+    // Advance the screen's incremental repaint by one small strip every frame —
+    // keeps the glow updating without ever blocking the LEDs or sound engine.
+    displayRenderStep();
+
+    // ── Idle baseline recalibration ──────────────────────────────────────────
+    if (anyActive)
+    {
+        lastActivityMs = now;
+    }
+    else if ((now - lastActivityMs) > IDLE_RECAL_MS &&
+             (now - lastRecalMs)    > RECAL_COOLDOWN_MS)
+    {
+        recalibrateBaselines();
+        lastRecalMs    = now;
+        lastActivityMs = now;
+    }
+
+    // ── Diagnostic output (10 Hz) ────────────────────────────────────────────
+    // Off by default — the constant USB traffic whines into the audio (see
+    // SERIAL_DEBUG in config.h).
+#if SERIAL_DEBUG
+    static uint32_t lastDiagMs = 0;
+    if (now - lastDiagMs >= 100)
+    {
+        lastDiagMs = now;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        {
+            float norm = (sensorState[i].fast - proxCfg.proxDeadband)
+                       / (proxCfg.proxMax - proxCfg.proxDeadband);
+            float intensity = norm < 0.0f ? 0.0f : (norm > 1.0f ? 1.0f : norm);
+
+            Serial.print(i);
+            Serial.print(F(":"));
+            Serial.print(intensity, 2);
+            Serial.print(F(" "));
+        }
+        Serial.print(F(" CPU:"));
+        Serial.print(AudioProcessorUsage(), 1);
+        Serial.print(F("% MEM:"));
+        Serial.print(AudioMemoryUsage());
+        Serial.println();
+    }
+#endif
+}

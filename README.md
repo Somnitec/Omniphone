@@ -54,6 +54,35 @@ Current focus:
  
 ---
  
+## ✦ Code & Building
+
+The firmware is a **PlatformIO monorepo**: every hardware configuration ("variant") lives in its own folder under [`variants/`](variants/) and is selected by a matching `[env:…]` in [`platformio.ini`](platformio.ini). Shared libraries (MPR121 driver, LCD driver) live in [`lib/`](lib/) and compile into every build; bring-up/diagnostic sketches live in [`test/`](test/).
+
+### Variants
+
+| `pio run -e …`           | Board       | Pads | Sensor | Audio          | Notes |
+|--------------------------|-------------|:----:|--------|----------------|-------|
+| `pico-13pad` *(default)* | RPi Pico / RP2040 | 13 | MPR121 | Mozzi (I²S)    | earlephilhower core |
+| `esp32s3-13pad`          | ESP32-S3    | 13   | MPR121 | Mozzi (I²S)    | scaffold — finish I²S pins |
+| `teensy40-11pad`         | Teensy 4.0  | 11   | MPR121 | Teensy Audio   | original firmware |
+| `teensy40-12pad-screen`  | Teensy 4.0  | 12   | MPR121 | Teensy Audio   | + 1.28" round LCD |
+| `teensy32-13pad`         | Teensy 3.2  | 13   | MPR121 | Teensy Audio   | ⚠ WIP — uses a Teensy-4 USB register, won't build for 3.2 yet |
+| `teensy-lc-7voice`       | Teensy LC   | 7    | TSI    | internal DAC   | standalone; WS2812 + PWM LEDs |
+
+```bash
+pio run -e pico-13pad              # build
+pio run -e pico-13pad -t upload    # build + flash
+```
+
+### Working on / adding a variant
+
+- **Each instrument is a folder, not a branch.** To work on one, edit its folder in `variants/` directly on `main`. To freeze a finished instrument, **tag a release** rather than parking a branch.
+- **Backporting** improvements is just editing shared code in `lib/` — every variant picks it up. (Variant-specific code that proves reusable can be promoted into `lib/` over time.)
+- **New variant:** copy the closest `variants/<x>/` folder, adjust its `config.h` (pin map / pad count / layout), and add a `[env:…]` pointing `build_src_filter` at the new folder.
+- **Branches** are for in-progress features/experiments that merge back into `main`.
+
+---
+
 ## ✦ Contributing
  
 This repository is the working codebase for the Omniphone platform. Development is led by Arvid Jense with SoundLab at Muziekgebouw aan 't IJ.
