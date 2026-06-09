@@ -63,6 +63,11 @@ static uint8_t filterCutoffByte = 200; // current cutoff (smoothed)
 static uint8_t filterBaseByte   = 200; // cutoff when all pads are far (dark)
 static uint8_t filterMaxByte    = 230; // cutoff when a pad is fully close (bright)
 
+// Master fade — ramped to 0 for a click-free mute while a scale/timbre switch
+// (wavetable swap + EEPROM write) is applied, then back to unity.
+static int32_t masterGainQ8   = 256;   // current (Q8: 256 = unity gain)
+static int32_t masterTargetQ8 = 256;   // 0 = muted, 256 = full
+
 // Map a config cutoff in Hz to Mozzi LowPassFilter's 0–255 byte (perceptual
 // approximation, not calibrated Hz). ~9700 Hz → 255 ≈ wide open.
 static inline uint8_t hzToCutoff(float hz) {
@@ -96,7 +101,13 @@ inline void init() {
     }
     lpf.setResonance(120);
     lpf.setCutoffFreq(filterCutoffByte);
+    masterGainQ8 = masterTargetQ8 = 256;
 }
+
+// Master mute/unmute for click-free switching. Ramped per sample in updateAudio.
+inline void setMasterOn(bool on) { masterTargetQ8 = on ? 256 : 0; }
+inline bool masterIsLow()  { return masterGainQ8 <= 4; }   // faded out → safe to switch
+inline bool masterIsHigh() { return masterGainQ8 >= 252; } // faded back in
 
 // Load a SCALE: the 13 per-pad frequencies. Reapplies the current osc2 ratio.
 inline void loadScale(const ScaleSet& sc) {
@@ -190,7 +201,9 @@ inline int32_t updateAudio() {
     lp2 += (lp1 - lp2) >> OMNI_OUTPUT_LPF_SHIFT;
     out = lp2;
 #endif
-    return out;
+    // Master fade ramp (~1 ms) — click-free mute around switches.
+    masterGainQ8 += (masterTargetQ8 - masterGainQ8) >> 5;
+    return (out * masterGainQ8) >> 8;
 }
 
 } // namespace mozzisynth

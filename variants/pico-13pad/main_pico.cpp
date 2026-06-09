@@ -120,7 +120,7 @@ static float proxSmooth[NUM_SENSORS];    // de-jittered amplitude (symmetric one
 //   0.20 → ~4 Hz corner / ~40 ms   (very smooth, soft attack)
 //   0.30 → ~6 Hz corner / ~25 ms   (good default)
 //   0.45 → ~10 Hz corner / ~16 ms  (snappier, lets a little jitter back in)
-static constexpr float PROX_SMOOTH_K = 0.30f;
+static constexpr float PROX_SMOOTH_K = 0.45f;
 
 // Audio-path bring-up: set to 1 to ignore the sensors and play a steady 440 Hz
 // tone. If you hear it → the I2S/DAC wiring is good and the problem is sensing;
@@ -170,39 +170,74 @@ static void allLeds(uint8_t level) {
             analogWrite(SENSORS[i].ledEle, pwm);
 }
 
-static void loadScale(uint8_t index) {
+// announce=false skips the Serial.print — used during a runtime switch, where a
+// blocking USB write would stall audioHook() and tick the output.
+static void loadScale(uint8_t index, bool announce = true) {
     if (index >= NUM_SCALES) return;
     activeScale = index;
     mozzisynth::loadScale(SCALES[index]);
-    Serial.print(F("# Scale: "));
-    Serial.println(SCALES[index].name);
+    if (announce) { Serial.print(F("# Scale: ")); Serial.println(SCALES[index].name); }
 }
 
-static void loadTimbre(uint8_t index) {
+static void loadTimbre(uint8_t index, bool announce = true) {
     if (index >= NUM_TIMBRES) return;
     activeTimbre = index;
     mozzisynth::loadTimbre(TIMBRES[index]);
-    Serial.print(F("# Timbre: "));
-    Serial.println(TIMBRES[index].name);
+    if (announce) { Serial.print(F("# Timbre: ")); Serial.println(TIMBRES[index].name); }
 }
 
 // Persist the current scale+timbre to EEPROM so it survives a power-cycle.
+// Silent: any print here would land in the audio-critical path.
 static void saveSelection() {
     StoredSel s{ EE_MAGIC, activeScale, activeTimbre };
     EEPROM.put(EE_ADDR, s);
     EEPROM.commit();
-    Serial.println(F("# selection saved"));
 }
 
+// Deferred switch state: the wavetable swap + EEPROM write are applied only after
+// the master fade has muted AND the I2S DMA buffer has drained to silence, so the
+// flash-write stall can't replay buffered loud audio. phase: 0 idle, 1 = waiting
+// (muted, draining), 2 = fading back in.
+static int8_t   pendingScale    = -1;
+static int8_t   pendingTimbre   = -1;
+static uint8_t  switchPhase     = 0;
+static uint32_t switchApplyAtMs = 0;
+// Mute-ramp (~4 ms) + a little margin so the wavetable swap happens at silence.
+static constexpr uint32_t SWITCH_MUTE_MS = 12;
+
 // Apply a pad number exactly as if it were held at boot: even pad → scale,
-// odd pad → timbre. Then persist. Used by the serial console.
+// odd pad → timbre. Used by the serial console for live auditioning. Switches
+// under a master mute so there's no click. Does NOT write EEPROM — a flash erase
+// (~20–50 ms, longer than the audio buffer) can't be hidden while playing and
+// pops. Persistence is via the boot-hold (saved before audio starts). The chosen
+// combo stays active until power-off regardless.
 static void selectByPad(uint8_t pad) {
     uint8_t scI = scaleForPad(pad);
     uint8_t tbI = timbreForPad(pad);
-    if      (scI != 0xFF) loadScale(scI);
-    else if (tbI != 0xFF) loadTimbre(tbI);
-    else { Serial.print(F("# pad ")); Serial.print(pad); Serial.println(F(" selects nothing")); return; }
-    saveSelection();
+    if (scI == 0xFF && tbI == 0xFF) {
+        Serial.print(F("# pad ")); Serial.print(pad); Serial.println(F(" selects nothing"));
+        return;
+    }
+    pendingScale    = (scI != 0xFF) ? (int8_t)scI : -1;
+    pendingTimbre   = (tbI != 0xFF) ? (int8_t)tbI : -1;
+    mozzisynth::setMasterOn(false);        // fade out
+    switchApplyAtMs = millis() + SWITCH_MUTE_MS;
+    switchPhase     = 1;
+}
+
+// Drive the muted-switch state machine; call once per control tick.
+static void processPendingSwitch() {
+    if (switchPhase == 1) {
+        if ((int32_t)(millis() - switchApplyAtMs) >= 0) {  // muted → swap is silent
+            if (pendingScale  >= 0) loadScale((uint8_t)pendingScale);
+            if (pendingTimbre >= 0) loadTimbre((uint8_t)pendingTimbre);
+            pendingScale = pendingTimbre = -1;
+            mozzisynth::setMasterOn(true);  // fade back in
+            switchPhase = 2;
+        }
+    } else if (switchPhase == 2) {
+        if (mozzisynth::masterIsHigh()) switchPhase = 0;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -278,10 +313,10 @@ void setup() {
     bool stUsable = (stored.magic == EE_MAGIC);
     activeScale  = (stUsable && stored.scale  < NUM_SCALES)  ? stored.scale  : DEFAULT_SCALE;
     activeTimbre = (stUsable && stored.timbre < NUM_TIMBRES) ? stored.timbre : DEFAULT_TIMBRE;
+    const SensorConfig& refS = SENSORS[STARTUP_REF_PAD];
+    int8_t heldScalePad = -1, heldTimbrePad = -1;
     {
-        const SensorConfig& refS = SENSORS[STARTUP_REF_PAD];
         uint16_t refF = boards[refS.boardIndex].filteredData(refS.electrode);
-        int8_t heldScalePad = -1, heldTimbrePad = -1;
         for (uint8_t p = 0; p < NUM_SENSORS; p++) {
             if (p == STARTUP_REF_PAD) continue;
             const SensorConfig& s = SENSORS[p];
@@ -307,12 +342,35 @@ void setup() {
     if (!stUsable || stored.scale != activeScale || stored.timbre != activeTimbre)
         saveSelection();
 
-    // Keep the LEDs solid a moment (visible confirmation), then lock the baseline
-    // and fade the LEDs out once the finger is lifting.
-    delay(700);
-    for (uint8_t b = 0; b < NUM_BOARDS; b++) boards[b].lockBaseline(SENSE_ELECTRODES[b]);
+    // ── Wait for the held pad(s) to be RELEASED, THEN calibrate ──────────────
+    // Locking the baseline while a finger is still on a selection pad bakes the
+    // touch into the baseline (that pad then reads wrong). So: keep the LEDs solid
+    // while the pad is held, fade out on release, let capacitance settle, and only
+    // THEN lock the baseline. 30 s safety cap so it never hangs.
+    if (heldScalePad >= 0 || heldTimbrePad >= 0) {
+        uint32_t holdStart = millis();
+        for (;;) {
+            allLeds(15);
+            delay(20);
+            uint16_t refF = boards[refS.boardIndex].filteredData(refS.electrode);
+            bool stillHeld = false;
+            int8_t pads[2] = { heldScalePad, heldTimbrePad };
+            for (uint8_t k = 0; k < 2; k++) {
+                if (pads[k] < 0) continue;
+                const SensorConfig& s = SENSORS[pads[k]];
+                uint16_t f = boards[s.boardIndex].filteredData(s.electrode);
+                if ((int16_t)refF - (int16_t)f > STARTUP_HOLD_THRESHOLD / 2) stillHeld = true; // hysteresis
+            }
+            if (!stillHeld) break;                      // released
+            if (millis() - holdStart > 30000) break;    // safety
+        }
+    }
+
+    // Fade LEDs out, let residual finger capacitance settle, THEN lock baseline.
     for (int v = 15; v >= 0; v--) { allLeds((uint8_t)v); delay(20); }
     allLeds(0);
+    delay(400); // settle so the lock sees the fully-released state
+    for (uint8_t b = 0; b < NUM_BOARDS; b++) boards[b].lockBaseline(SENSE_ELECTRODES[b]);
 
     // ── Seed per-sensor EMA state from the freshly locked baseline ───────────
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
@@ -384,6 +442,9 @@ void updateControl() {
             serialNum = -1;
         }
     }
+
+    // Apply any queued scale/timbre switch while the master fade has it muted.
+    processPendingSwitch();
 
     uint32_t now = millis();
 
