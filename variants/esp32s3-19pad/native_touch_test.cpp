@@ -37,9 +37,19 @@
 #include "config.h"
 #include "net_console.h"           // WiFi + OTA + serial-over-WiFi (Console)
 
-// Touch GPIOs to scan — any subset of GPIO1–GPIO14. (Currently TOUCH1–TOUCH3.)
-static const uint8_t TOUCH_PINS[] = { 1, 2, 3 };
+// Touch GPIOs to scan — any subset of GPIO1–GPIO14, EXCLUDING BATTERY_ADC_PIN
+// (GPIO4), which is the battery ADC and must not be capsensed. That leaves 13
+// channels: GPIO1,2,3,5,6,7,8,9,10,11,12,13,14 — exactly the 13-pad budget.
+static constexpr uint8_t TOUCH_PINS[] = { 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14 };
 static constexpr uint8_t NUM_TOUCH = sizeof(TOUCH_PINS) / sizeof(TOUCH_PINS[0]);
+
+// Compile-time guard: the battery ADC pin must never be a capsense channel.
+// (Recursive form so it's a valid constexpr regardless of the C++ standard.)
+static constexpr bool touchHasPin(uint8_t p, uint8_t i = 0) {
+    return i >= NUM_TOUCH ? false
+         : (TOUCH_PINS[i] == p ? true : touchHasPin(p, (uint8_t)(i + 1)));
+}
+static_assert(!touchHasPin(BATTERY_ADC_PIN), "BATTERY_ADC_PIN must not be in TOUCH_PINS");
 
 static constexpr uint32_t TOUCH_TELE_PERIOD_MS = 30; // ~33 Hz stream
 
@@ -94,6 +104,13 @@ static void recalibrate() {
         ch[i].base = (float)(acc / 16);
         ch[i].fast = ch[i].base;
     }
+}
+
+// Battery pack voltage (volts). analogReadMilliVolts() is eFuse-calibrated; scale
+// back up by the external divider ratio. ADC1 pin → safe to read with WiFi on.
+static float readBattery() {
+    uint32_t mv = analogReadMilliVolts(BATTERY_ADC_PIN);
+    return (float)mv * BATTERY_DIVIDER / 1000.0f;
 }
 
 static void printParams() {
@@ -152,6 +169,11 @@ void setup() {
     while (!Serial && millis() < 2000) {}
     Serial.println(F("\n# ── Omniphone (ESP32-S3) NATIVE TOUCH + live tuning ──"));
 
+    // Battery ADC (GPIO4 = ADC1_CH3). 11 dB attenuation → full ~0–3.1 V pin range.
+    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db);
+    Serial.printf("# battery on GPIO%u (ADC1, ÷%.2f divider): %.2f V\n",
+                  BATTERY_ADC_PIN, BATTERY_DIVIDER, readBattery());
+
     // Force the touch peripheral to initialise (needed before the level-2 IDF
     // calls), then push our settings and snapshot baselines.
     for (uint8_t i = 0; i < NUM_TOUCH; i++) touchRead(TOUCH_PINS[i]);
@@ -199,6 +221,7 @@ void loop() {
             snprintf(nm, sizeof(nm), "d%u", TOUCH_PINS[i]); Console.tele(nm, delta, 0);
             snprintf(nm, sizeof(nm), "c%u", TOUCH_PINS[i]); Console.tele(nm, cal, 3);
         }
+        Console.tele("vbat", readBattery(), 2);   // battery pack voltage (V)
         Console.teleEnd();
     }
 }

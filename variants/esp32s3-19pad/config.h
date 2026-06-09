@@ -45,6 +45,16 @@ static constexpr uint32_t I2C_CLOCK  = 400000; // 400 kHz fast-mode
 // strips. Keep it clear of the I²C (8/9) and I²S (5/6/7) pins above.
 // static constexpr uint8_t PIN_LED_DATA = 21;  // → WS2812 DIN
 
+// ── Battery voltage sensing ──────────────────────────────────────────────────
+// Read pack voltage on an ADC1 pin. ADC1 (GPIO1–10 on the S3) keeps working while
+// WiFi is on; ADC2 does NOT — so use an ADC1 pin. GPIO4 = ADC1_CH3. Wire the
+// battery through a resistor divider to this pin; BATTERY_DIVIDER = Vbat / Vpin
+// (2.0 for two equal resistors). analogReadMilliVolts() applies the chip's eFuse
+// ADC calibration, so the reading is already in millivolts at the pin.
+// IMPORTANT: this pin must NOT appear in the native-touch pin list (no capsense).
+#define BATTERY_ADC_PIN  4
+#define BATTERY_DIVIDER  2.0f
+
 // ── MPR121 boards ─────────────────────────────────────────────────────────────
 // Sense boards first, then LED boards. ADDR strap → address:
 //   0x5A = GND   0x5B = VCC   0x5C = SDA   0x5D = SCL
