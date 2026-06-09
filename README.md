@@ -63,7 +63,7 @@ The firmware is a **PlatformIO monorepo**: every hardware configuration ("varian
 | `pio run -e …`           | Board       | Pads | Sensor | Audio          | Notes |
 |--------------------------|-------------|:----:|--------|----------------|-------|
 | `pico-13pad` *(default)* | RPi Pico / RP2040 | 13 | MPR121 | Mozzi (I²S)    | earlephilhower core |
-| `esp32s3-13pad`          | ESP32-S3    | 13   | MPR121 | Mozzi (I²S)    | scaffold — finish I²S pins |
+| `esp32s3-19pad`          | ESP32-S3 (LilyGO T8-S3) | 19 | 4× MPR121 | TBD | WiFi/OTA — capsense bring-up test (Teleplot + web view) |
 | `teensy40-11pad`         | Teensy 4.0  | 11   | MPR121 | Teensy Audio   | original firmware |
 | `teensy40-12pad-screen`  | Teensy 4.0  | 12   | MPR121 | Teensy Audio   | + 1.28" round LCD |
 | `teensy32-13pad`         | Teensy 3.2  | 13   | MPR121 | Teensy Audio   | ⚠ WIP — uses a Teensy-4 USB register, won't build for 3.2 yet |

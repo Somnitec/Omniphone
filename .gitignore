@@ -3,3 +3,7 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Local secrets (WiFi creds, host IPs) — never commit. Use secrets.example.h.
+secrets.h
+**/secrets.h
