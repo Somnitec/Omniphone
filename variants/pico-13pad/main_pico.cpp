@@ -1,13 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Omniphone — Raspberry Pi Pico (RP2040) firmware, Mozzi audio backend
 //
-// 13-pad, no screen. Shares config.h (scales/layout), proximity_engine.h and the
-// MPR121 driver with the Teensy build; the synthesis is Mozzi (sound_engine_
-// mozzi.h) because the Teensy Audio Library can't run on the RP2040.
+// 13-pad, no screen. Synthesis is Mozzi (sound_engine_mozzi.h), which runs on the
+// RP2040 — unlike the Teensy Audio Library. Reads this variant's config.h (pin
+// map / layout / scales / timbres) and proximity_engine.h, plus the shared MPR121
+// driver in lib/.
 //
-// Built only for the [env:pico] / [env:esp32s3] PlatformIO environments
-// (build_src_filter excludes the Teensy main.cpp there, and excludes this file
-// from the Teensy build).
+// Built for the pico-13pad PlatformIO environment (its build_src_filter points at
+// this variants/ folder).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include <Arduino.h>
@@ -47,18 +47,9 @@
 // can't drain it → no buzz/rattle even reading every control tick. (Set directly
 // to bypass Mozzi's generic 256-sample cap on MOZZI_OUTPUT_BUFFER_SIZE.)
 #define MOZZI_RP2040_BUFFER_SIZE 512
-#if defined(OMNIPHONE_PICO)
-  #define MOZZI_I2S_PIN_BCK  20
-  #define MOZZI_I2S_PIN_WS   21                 // = BCK + 1 (PIO requirement)
-  #define MOZZI_I2S_PIN_DATA 22
-#elif defined(OMNIPHONE_ESP32S3)
-  // TODO(esp32-s3): set the LilyGO T-FPGA's PCM5102A I2S pins here. The ESP32
-  //   I2S peripheral has no BCK=WS+1 constraint; pick any free GPIOs the board
-  //   routes to the DAC (and the FPGA, if it sits on the audio path).
-  #define MOZZI_I2S_PIN_BCK  5
-  #define MOZZI_I2S_PIN_WS   6
-  #define MOZZI_I2S_PIN_DATA 7
-#endif
+#define MOZZI_I2S_PIN_BCK  20
+#define MOZZI_I2S_PIN_WS   21                   // = BCK + 1 (PIO requirement)
+#define MOZZI_I2S_PIN_DATA 22
 #include <Mozzi.h>
 
 #include "config.h"
@@ -70,7 +61,7 @@
 #define OMNI_OUTPUT_LPF_SHIFT 1
 #include "sound_engine_mozzi.h"
 #include <MPR121.h>
-#include <EEPROM.h>   // flash-backed emulation (RP2040 last sector / ESP32 NVS)
+#include <EEPROM.h>   // flash-backed emulation (RP2040 last flash sector)
 
 // ── Persistent selection (survives power-off) ─────────────────────────────────
 // Stored in emulated EEPROM. A magic byte tags a valid record; bump it to
@@ -92,24 +83,19 @@ static SensorState   sensorState[NUM_SENSORS];
 static ProximityConfig proxCfg;
 static bool          boardOk[NUM_BOARDS] = { false }; // MPR121 connection status
 
-// LFO — per-voice pitch drift for analogue feel
-static float lfoPhase[NUM_SENSORS];
-static float lfoRate[NUM_SENSORS];
-
 static uint8_t activeScale  = DEFAULT_SCALE;
 static uint8_t activeTimbre = DEFAULT_TIMBRE;
 
 // ── Diagnostics ───────────────────────────────────────────────────────────────
-// Periodic serial readout of every pad's proximity intensity (+ touch events
-// and idle recals). Set to 0 for silent running. ~10 Hz so it never starves the
-// Mozzi audio buffer.
-#define PICO_DIAG 0  // TEST: serial off — if the ~5 Hz rattle stops, the diagnostic print was the cause.
-#define DIAG_ONELINE 0  // 0 = one value per line (Teleplot). 1 = all on one tab-separated line (plain monitor, NOT Teleplot-parseable).
-static constexpr uint32_t DIAG_PERIOD_MS = 100;
-// Sensor I2C read period. Reading every control tick (128 Hz) starves Mozzi's
-// audio buffer (→ buzz); ~30 Hz lets the buffer recover between the ~2 ms reads.
-// Lower = snappier touch but more audio risk; raise if the audio still buzzes.
-static constexpr uint32_t SENSE_PERIOD_MS = 0;   // 0 = read every control tick (responsive); the big DMA buffer now absorbs the I2C blocks
+// PICO_DIAG=1 streams every pad's proximity intensity (and touch events) over
+// serial for plotting; keep 0 for normal use. Teleplot reads ">name:value" lines.
+#define PICO_DIAG    0
+#define DIAG_ONELINE 0  // 0 = one ">pN:value" per line (Teleplot). 1 = all tab-separated on one line (plain monitor; Teleplot can't parse it).
+static constexpr uint32_t DIAG_PERIOD_MS = 100; // ~10 Hz; slow enough not to starve audio
+// Sensor I2C read period. 0 = read every control tick (most responsive); the big
+// I2S DMA buffer absorbs the ~2 ms I2C bursts. Raise (e.g. 30) only if you hear
+// buzz on slower hardware — the trade is laggier touch.
+static constexpr uint32_t SENSE_PERIOD_MS = 0;
 static float diagIntensity[NUM_SENSORS]; // last intensity per pad, for the readout
 static float proxSmooth[NUM_SENSORS];    // de-jittered amplitude (symmetric one-pole)
 
@@ -170,20 +156,18 @@ static void allLeds(uint8_t level) {
             analogWrite(SENSORS[i].ledEle, pwm);
 }
 
-// announce=false skips the Serial.print — used during a runtime switch, where a
-// blocking USB write would stall audioHook() and tick the output.
-static void loadScale(uint8_t index, bool announce = true) {
+static void loadScale(uint8_t index) {
     if (index >= NUM_SCALES) return;
     activeScale = index;
     mozzisynth::loadScale(SCALES[index]);
-    if (announce) { Serial.print(F("# Scale: ")); Serial.println(SCALES[index].name); }
+    Serial.print(F("# Scale: ")); Serial.println(SCALES[index].name);
 }
 
-static void loadTimbre(uint8_t index, bool announce = true) {
+static void loadTimbre(uint8_t index) {
     if (index >= NUM_TIMBRES) return;
     activeTimbre = index;
     mozzisynth::loadTimbre(TIMBRES[index]);
-    if (announce) { Serial.print(F("# Timbre: ")); Serial.println(TIMBRES[index].name); }
+    Serial.print(F("# Timbre: ")); Serial.println(TIMBRES[index].name);
 }
 
 // Persist the current scale+timbre to EEPROM so it survives a power-cycle.
@@ -258,13 +242,9 @@ void setup() {
     Serial.println(F("\n# ── Omniphone (Pico/Mozzi) boot ──"));
 
     // ── I2C bus (re-pointed to the GPIOs above) ──────────────────────────────
-#if defined(OMNIPHONE_PICO)
     Wire.setSDA(PIN_I2C_SDA);
     Wire.setSCL(PIN_I2C_SCL);
     Wire.begin();
-#else // ESP32-S3: SDA/SCL are arguments to begin()
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-#endif
     Wire.setClock(400000);
 
     // ── MPR121 staged init ────────────────────────────────────────────────────
@@ -382,12 +362,6 @@ void setup() {
         seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
     }
 
-    // ── LFO phases / rates ────────────────────────────────────────────────────
-    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        lfoPhase[i] = (float)i / (float)NUM_SENSORS;
-        lfoRate[i]  = LFO_RATE_HZ + LFO_RATE_SPREAD * ((float)i / NUM_SENSORS - 0.5f);
-    }
-
     // ── Proximity tuning ──────────────────────────────────────────────────────
     proxCfg.jumpThreshold     = TOUCH_JUMP_THRESHOLD;
     proxCfg.releaseRatio      = TOUCH_RELEASE_RATIO;
@@ -431,7 +405,8 @@ void setup() {
 // ─────────────────────────────────────────────────────────────────────────────
 void updateControl() {
     // Serial (testing): send a PAD NUMBER (0–12) + Enter — same mapping as the
-    // boot hold (even pad → scale, odd pad → timbre). Persisted like a hold.
+    // boot hold (even pad → scale, odd pad → timbre). Live audition only; not
+    // saved to EEPROM (see selectByPad).
     static int serialNum = -1; // -1 = no digits buffered yet
     while (Serial.available()) {
         char c = Serial.read();
@@ -508,9 +483,6 @@ void updateControl() {
         proxSmooth[i] += (intensity - proxSmooth[i]) * PROX_SMOOTH_K;
         mozzisynth::setVoiceIntensity(i, proxSmooth[i]);
 
-        // Pitch drift (LFO) removed for this version — frequency stays at the
-        // scale base set by loadScale(), so steady notes are dead steady.
-
         ledSet(sc, proxSmooth[i]);
     }
 
@@ -551,11 +523,12 @@ void updateControl() {
 // Mozzi audio-rate callback (MOZZI_AUDIO_RATE Hz)
 // ─────────────────────────────────────────────────────────────────────────────
 AudioOutput updateAudio() {
-    // 13-bit headroom: a full 13-voice chord peaks near this, while a single pad
-    // is still clearly audible. fromAlmostNBit clips safely on the loudest chords.
-    // Mono synth duplicated to both I2S channels (confirmed: stereo fills L+R).
+    // The engine returns a signed mono sample; fromAlmostNBit maps it to the DAC.
+    // 19 bits leaves headroom for ~8 simultaneous full-gain voices before clipping
+    // (a 13-voice chord rarely peaks all at once). Lower it for more loudness,
+    // raise it for more headroom. Duplicated to L+R so both I2S channels sound.
     int32_t out = mozzisynth::updateAudio();
-    return StereoOutput::fromAlmostNBit(19, out, out);   // 19 keeps today's loudness with full-precision voices (~8-voice headroom)
+    return StereoOutput::fromAlmostNBit(19, out, out);
 }
 
 void loop() {

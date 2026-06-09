@@ -1,12 +1,11 @@
 #pragma once
 // ─────────────────────────────────────────────────────────────────────────────
-// Sound engine — Mozzi backend (Pico / ESP32-S3)
+// Sound engine — Mozzi backend (Raspberry Pi Pico / RP2040)
 //
 // The Teensy build uses the Teensy Audio Library (sound_engine.h), which is
-// DMA/hardware-specific and does NOT run on the RP2040 or ESP32-S3. This file
-// reimplements the same musical idea with Mozzi, which DOES support all three
-// MCUs, so the rest of the firmware (config.h scales, proximity_engine.h) is
-// shared unchanged.
+// DMA/hardware-specific and does NOT run on the RP2040. This file reimplements
+// the same musical idea with Mozzi (which does), reusing the rest of the variant
+// (config.h scales/layout, proximity_engine.h) unchanged.
 //
 // Scale and timbre are independent (see config.h). A SCALE supplies the 13
 // per-pad frequencies; a TIMBRE supplies the waveform, a 2nd oscillator (sub or
@@ -106,8 +105,7 @@ inline void init() {
 
 // Master mute/unmute for click-free switching. Ramped per sample in updateAudio.
 inline void setMasterOn(bool on) { masterTargetQ8 = on ? 256 : 0; }
-inline bool masterIsLow()  { return masterGainQ8 <= 4; }   // faded out → safe to switch
-inline bool masterIsHigh() { return masterGainQ8 >= 252; } // faded back in
+inline bool masterIsHigh() { return masterGainQ8 >= 252; } // true once faded back in
 
 // Load a SCALE: the 13 per-pad frequencies. Reapplies the current osc2 ratio.
 inline void loadScale(const ScaleSet& sc) {
@@ -138,7 +136,8 @@ inline void loadTimbre(const TimbreSet& t) {
     lpf.setResonance((uint8_t)(60.0f + (q - 0.7f) * 70.0f));
 }
 
-// Live pitch update for one voice (e.g. LFO drift). Cheap — just reprograms inc.
+// Live pitch change for one voice (used by the audio-path self-test; also handy
+// for future pitch modulation). Cheap — just reprograms the phase increment.
 inline void setVoiceFreq(uint8_t i, float hz) {
     if (hz <= 1.0f) return;
     baseFreq[i] = hz;

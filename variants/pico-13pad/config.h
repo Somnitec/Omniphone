@@ -1,25 +1,16 @@
 #pragma once
 #include <stdint.h>
 
-// ── Waveform tags ─────────────────────────────────────────────────────────────
-// TimbreSet.waveformType uses the Teensy Audio Library's WAVEFORM_* numbering so
-// the Teensy build can pass it straight into AudioSynthWaveform::begin(). On the
-// non-Teensy builds (Pico / ESP32-S3, which use Mozzi instead of the Teensy
-// Audio Library) <Audio.h> doesn't exist, so we define the same tags ourselves
-// and the Mozzi engine maps them to wavetables. Keep the values in sync with
-// Teensy's synth_waveform.h.
-#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
-  #ifndef WAVEFORM_SINE
-    #define WAVEFORM_SINE                0
-    #define WAVEFORM_SAWTOOTH            1
-    #define WAVEFORM_SQUARE              2
-    #define WAVEFORM_TRIANGLE            3
-    #define WAVEFORM_SAWTOOTH_REVERSE    6
-    #define WAVEFORM_BANDLIMIT_SAWTOOTH 11
-  #endif
-#else
-  #include <Audio.h> // Teensy: real WAVEFORM_* constants
-#endif
+// ── Waveform IDs ──────────────────────────────────────────────────────────────
+// TimbreSet.waveformType uses these IDs. The values follow the Teensy Audio
+// Library's WAVEFORM_* numbering (the project's tables have always used it); the
+// Mozzi engine maps each ID to a wavetable in tableForWaveform() — see
+// sound_engine_mozzi.h. Add a new waveform by adding an ID here and a case there.
+#define WAVEFORM_SINE                0
+#define WAVEFORM_SAWTOOTH            1
+#define WAVEFORM_SQUARE              2
+#define WAVEFORM_TRIANGLE            3
+#define WAVEFORM_BANDLIMIT_SAWTOOTH 11
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Instrument configuration
@@ -32,11 +23,7 @@
 
 // ── Board setup ──────────────────────────────────────────────────────────────
 static constexpr uint8_t NUM_BOARDS        = 2;
-static constexpr uint8_t BOARD_ADDRESSES[] = { 0x5A, 0x5C, 0x00, 0x00 };
-
-// Set to 1 only if a round LCD/touch screen is attached. 0 skips all LCD and
-// touchscreen init (and the GUI draws) — noticeably faster startup.
-#define ENABLE_SCREEN 0
+static constexpr uint8_t BOARD_ADDRESSES[] = { 0x5A, 0x5C };
 
 // ── Sensor descriptor ────────────────────────────────────────────────────────
 static constexpr uint8_t NO_PIN = 0xFF; // disabled pad / no LED
@@ -56,21 +43,12 @@ struct SensorConfig {
                         // ledBoard == LED_GPIO, or NO_PIN if no LED
 };
 
-// Touch electrodes per board, indexed by board. ELE_EN is a contiguous count
-// from ELE0, so LED pins can only live above the last sense electrode.
-#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
-// ── 13-pad split (Pico / ESP32-S3) ───────────────────────────────────────────
-// All LEDs are on MCU GPIO (LED_GPIO), so every chip electrode is free to sense.
-// MUST match the SENSORS[] table below:
+// Sense-electrode count per board. ELE_EN is a contiguous count from ELE0, so any
+// LED pins must live above the last sense electrode — here all LEDs are on MCU
+// GPIO (LED_GPIO), so every chip electrode is free to sense. MUST match SENSORS[]:
 //   board 0 (0x5A, idx0): ELE0–ELE9 (10 sense) → pads 0–9
 //   board 1 (0x5C, idx1): ELE0–ELE2 (3 sense)  → pads 10–12
 static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 10, 3 };
-#else
-// ── 11-pad legacy split (Teensy) ──────────────────────────────────────────────
-//   A (0x5A): ELE0–ELE4 (5)  — ELE5 freed as a GPIO LED pin (idx1's lamp)
-//   C (0x5C): ELE0–ELE5 (6)  — idx5 senses on ELE5, LEDs limited to ELE6–ELE11
-static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 5, 6 };
-#endif
 
 // MPR121 charge current / time (sensor gain). Controlled measurement
 // (test/proximity_tuning) shows the electrode does NOT couple beyond ~1 cm at
@@ -87,72 +65,40 @@ static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-
 // the melodic tone fields ascending around it, the lower ring is bass voicings.
 //                       sense                LED
 //                       board, ele,          board, ele
-#if defined(OMNIPHONE_PICO) || defined(OMNIPHONE_ESP32S3)
-// ── 13-pad layout (Pico / ESP32-S3) ──────────────────────────────────────────
-// 13 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C").
-// LED budget: A frees ELE6–ELE11 (6 pins), C frees ELE7–ELE11 (5 pins) = 11 chip
-// LED pins for 13 LEDs, so the top pad and the last upper-ring pad drive their
-// LEDs from MCU GPIO instead (LED_GPIO + a Pico GP pin).
+// 13 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C"). All LEDs are driven from
+// MCU GPIO (ledBoard = LED_GPIO, ledEle = a Pico GP pin), leaving every chip
+// electrode free to sense.
 //
-// >>> CONFIRM AGAINST YOUR PCB <<< electrode↔pad and LED assignments below are a
-// clean default for a 6 (A) + 7 (C) sense split; reorder rows to match the
-// physical ring positions. ELE9/ELE10 LED drivers were flaky on the old MPR121
-// modules — if yours are too, move those LEDs (idx3,idx4,idx10,idx11) to GPIO.
+// >>> CONFIRM AGAINST YOUR PCB <<< the electrode↔pad and LED-pin assignments are
+// specific to this build's wiring. Reorder rows to match your physical ring
+// positions, and pick LED GPIOs that don't share an RP2040 PWM slice (GPIOs that
+// differ by 16 share a slice → their LEDs would track each other; that's why
+// pads 10–12 use GP6/7/8 rather than GP12/3/2).
 static constexpr SensorConfig SENSORS[] = {
-        // Top sensor — the "Ding" (central low fundamental)
-    { 0, 0,  LED_GPIO, 28 }, //0  top              — sense C ELE0, LED GPIO pin 14
+    // Top sensor — the "Ding" (central low fundamental)
+    { 0, 0,  LED_GPIO, 28 },  //0  top          — sense A ELE0, LED GP28
 
-        // Upper concentric ring — tone fields 
-    { 0, 1,  LED_GPIO, 27 },        //1  
-    { 0, 2,  LED_GPIO, 26  },        //2
-    { 0, 3,  LED_GPIO, 19  },        //3 
-    { 0, 4,  LED_GPIO, 18 },        //4  
-    { 0, 5,  LED_GPIO, 17  },        //5  
-    { 0, 6,  LED_GPIO, 16 }, //6 
-
-        // Lower concentric ring — bass register 
-    { 0, 7,  LED_GPIO, 15  },        //7  
-    { 0, 8,  LED_GPIO, 14  },        //8  
-    { 0, 9,  LED_GPIO, 13  },        //9  
-    { 1, 0,  LED_GPIO, 6 },        //10 LED moved GP12→GP6 (GP12 shares PWM slice6A with pad0/GP28)
-    { 1, 1,  LED_GPIO, 7 },        //11 LED moved GP3 →GP7 (GP3 shares PWM slice1B with pad3/GP19)
-    { 1, 2,  LED_GPIO, 8 },        //12 LED moved GP2 →GP8 (GP2 shares PWM slice1A with pad4/GP18)
-};
-#else
-// ── 11-pad legacy layout (Teensy, post ELE9/ELE10 rework) ─────────────────────
-// 11 pad slots. Boards: 0 = 0x5A ("A"), 1 = 0x5C ("C").
-// LED pin AND LED board are explicit per pad. Rework summary:
-//   • A: the LED that was on A-ELE9 is now on A-ELE6   (idx8)
-//   • C: the LED that was on C-ELE9 is now on A-ELE5   (idx1, cross-board!)
-//   • A: idx7's touch electrode moved A-ELE5 → A-ELE0  (freed A-ELE5 for idx1's LED)
-//   • idx5 (upper ring 4) still senses on C-ELE5; its LED stays C-ELE11
-//   • ELE10 LEDs (idx3 A, idx10 C) only light if ELE9 is driven identically;
-//     nothing is wired to ELE9 — handled in main (mirror ELE9 ← ELE10 per board).
-static constexpr SensorConfig SENSORS[] = {
-        // Top sensor — the "Ding" (central low fundamental)
-    { 1, 0,  1, 6  },  //0  top                  — sense C ELE0, LED C ELE6
-
-        // Upper concentric ring — tone fields
-    { 1, 3,  0, 5  },  //1  upper ring 0 (front) — sense C ELE3, LED A ELE5 (cross-board, was C ELE9)
-    { 1, 1,  1, 7  },  //2  upper ring 1         — sense C ELE1, LED C ELE7
-    { 0, 4,  0, 10 },  //3  upper ring 2         — sense A ELE4, LED A ELE10 (+ELE9 mirror)
-    { 0, 2,  0, 8  },  //4  upper ring 3         — sense A ELE2, LED A ELE8
-    { 1, 5,  1, 11 },  //5  upper ring 4         — sense C ELE5, LED C ELE11
+    // Upper concentric ring — tone fields
+    { 0, 1,  LED_GPIO, 27 },  //1               — sense A ELE1, LED GP27
+    { 0, 2,  LED_GPIO, 26 },  //2               — sense A ELE2, LED GP26
+    { 0, 3,  LED_GPIO, 19 },  //3               — sense A ELE3, LED GP19
+    { 0, 4,  LED_GPIO, 18 },  //4               — sense A ELE4, LED GP18
+    { 0, 5,  LED_GPIO, 17 },  //5               — sense A ELE5, LED GP17
+    { 0, 6,  LED_GPIO, 16 },  //6               — sense A ELE6, LED GP16
 
     // Lower concentric ring — bass register
-    { 1, 2,  1, 8  },  //6  lower ring 0 (front) — sense C ELE2, LED C ELE8
-    { 0, 0,  0, 11 },  //7  lower ring 1         — sense A ELE0, LED A ELE11 (sense was A ELE5)
-    { 0, 3,  0, 6  },  //8  lower ring 2         — sense A ELE3, LED A ELE6 (was A ELE9)
-    { 0, 1,  0, 7  },  //9  lower ring 3         — sense A ELE1, LED A ELE7
-    { 1, 4,  1, 10 },  //10 lower ring 4         — sense C ELE4, LED C ELE10 (+ELE9 mirror)
+    { 0, 7,  LED_GPIO, 15 },  //7               — sense A ELE7, LED GP15
+    { 0, 8,  LED_GPIO, 14 },  //8               — sense A ELE8, LED GP14
+    { 0, 9,  LED_GPIO, 13 },  //9               — sense A ELE9, LED GP13
+    { 1, 0,  LED_GPIO,  6 },  //10              — sense C ELE0, LED GP6
+    { 1, 1,  LED_GPIO,  7 },  //11              — sense C ELE1, LED GP7
+    { 1, 2,  LED_GPIO,  8 },  //12              — sense C ELE2, LED GP8
 };
-#endif
 
 static constexpr uint8_t NUM_SENSORS =
     static_cast<uint8_t>(sizeof(SENSORS) / sizeof(SENSORS[0]));
 
-// Largest pad count any layout uses — sizes the per-pad freqs[] in ScaleSet so
-// the same table is valid for both the 11-pad (Teensy) and 13-pad builds.
+// Sizes the per-pad freqs[] in ScaleSet. Equals NUM_SENSORS for this 13-pad build.
 static constexpr uint8_t MAX_PADS = 13;
 
 // ── Scale & timbre definitions ───────────────────────────────────────────────
@@ -346,73 +292,6 @@ static inline uint8_t timbreForPad(uint8_t pad) {
                ? (uint8_t)((pad - 1u) / 2u) : 0xFF;
 }
 
-// ── Synth parameters ─────────────────────────────────────────────────────────
-// Voice architecture
-// 0.6 (not 1.0): leaves headroom so main+sub and the resonant filter boost
-// don't clip before the dcAmp stage — clipping is what made sines sound buzzy.
-static constexpr float MAIN_OSC_AMPLITUDE = 0.6f;  // DC stage still sets final level
-static constexpr float SUB_OSC_AMPLITUDE  = 1.0f;  // sub osc always full (voiceMix controls blend)
-static constexpr float VOICE_MAX_AMP      = 0.45f; // max DC level per voice (prevents clipping)
-
-// Mixer gain structure
-static constexpr float STAGE_GAIN  = 0.25f; // per-channel gain in stage mixers
-static constexpr float MASTER_GAIN = 0.7f;  // per-channel gain in master mixer
-
-// Amplitude envelope (DC ramp)
-static constexpr float AMP_RAMP_MS = 8.0f;  // matches update interval — smooth linear ramp
-
-// LFO — per-voice pitch drift for analog feel
-static constexpr float LFO_RATE_HZ   = 1.25f;  // slow drift cycle
-static constexpr float LFO_AMOUNT    = 0.003f;  // +/-0.3% pitch deviation (~5 cents at A4)
-static constexpr float LFO_RATE_SPREAD = 0.15f; // each voice's LFO rate offset to prevent phase-locking
-
-// Bell — short metallic transient fired on a metal-contact (touch) event,
-// i.e. when the delta spikes after the proximity volume is already maxed.
-static constexpr float BELL_MIX        = 0.01f;  // bell level in the master mixer (ch 3)
-static constexpr float BELL_AMP        = 0.55f;  // bell oscillator peak amplitude
-static constexpr float BELL_PARTIAL    = 2.76f;  // inharmonic 2nd partial → bell timbre
-static constexpr float BELL_OCTAVES    = 2.0f;   // bell pitch = note × this (sparkle above)
-static constexpr float BELL_FLOOR      = 0.01f;  // min bell level (softest tap)
-// ADSR: attack → decay to the sustain level (held while the pad is touched) →
-// release when the finger lifts. BELL_SUSTAIN = 0 makes it a pure pluck again.
-// NOTE: attack is intentionally ~the strike window so the velocity-derived
-// level locks in smoothly while the envelope is still ramping up (no click).
-static constexpr float BELL_ATTACK_MS   = 20.0f;
-static constexpr float BELL_DECAY_MS    = 280.0f;
-static constexpr float BELL_SUSTAIN     = 0.35f;  // ring level while held (0–1 of peak)
-static constexpr float BELL_RELEASE_MS  = 400.0f; // tail after the finger lifts
-static constexpr float BELL_HOLD_RELEASE = 0.15f; // proximity below this = "lifted" → note-off
-
-// Bell pressure aftertouch — while a pad is HELD, the live contact strength
-// (raw fast value, not the saturated 0–1 intensity) modulates the bell's
-// loudness AND a per-voice low-pass filter, like polyphonic aftertouch.
-// From CDC=16 capture: light contact ≈ 22, firm press on metal ≈ 800.
-static constexpr float BELL_AFTER_MIN   = 30.0f;   // fast at/below → quiet & dark
-static constexpr float BELL_AFTER_MAX   = 600.0f;  // fast at/above → loud & bright
-static constexpr float BELL_FILT_MIN_HZ = 350.0f;  // cutoff at min pressure
-static constexpr float BELL_FILT_MAX_HZ = 6500.0f; // cutoff at max pressure
-static constexpr float BELL_FILT_Q      = 1.1f;    // bell filter resonance
-static constexpr float BELL_PRESS_SMOOTH = 0.20f;  // 1-pole smoothing on pressure (anti-zipper)
-
-// Bell dynamics — driven by CONTACT VELOCITY (how fast the hand was moving
-// when it hit the metal). A capacitive pad can't sense press force; approach
-// speed is the only real expressive axis (gentle vs committed strike).
-//
-//   strike = clamp01( (peakVel − VEL_MIN) / (VEL_MAX − VEL_MIN) )
-//   level  = BELL_AMP × (BELL_FLOOR + (1−BELL_FLOOR) × (strike×GAIN)^CURVE)
-//
-// Starting point from captured taps (pad0, CDC10/CDT3): soft peakVel ≈ 63–80,
-// firm ≈ 86–99. Re-run test/strike_tuning per pad if pads differ a lot.
-//   VEL_MIN  velocity mapped to silence-floor (just below softest tap)
-//   VEL_MAX  velocity mapped to full volume   (≈ a firm strike)
-//   CURVE>1 expander (only committed hits get loud) · <1 more uniform
-//   GAIN scales strike before the curve (result clamped to 1)
-static constexpr float BELL_VEL_MIN     = 60.0f;  // CDC=10 capture: soft ≈ 63–81,
-static constexpr float BELL_VEL_MAX     = 100.0f; //   firm ≈ 86–99 (weak split — expected)
-static constexpr float BELL_CURVE       = 2.0f;
-static constexpr float BELL_STRIKE_GAIN = 1.0f;
-static constexpr uint32_t BELL_STRIKE_WIN_MS = 25; // peak-velocity capture window
-
 // ── Touch (metal-contact) trigger — algorithm lives in proximity_engine.h ─────
 // Tune here if triggering is inconsistent or repeated taps get missed:
 //   JUMP_THRESHOLD  contact spike needed to fire. LOWER = more sensitive and
@@ -424,7 +303,7 @@ static constexpr uint32_t BELL_STRIKE_WIN_MS = 25; // peak-velocity capture wind
 //   COOLDOWN_MS     minimum ms between events per pad (edge debounce).
 static constexpr float    TOUCH_JUMP_THRESHOLD = 250.0f; // metal contact jumps ≫ this
                                                           // (700+ at CDC=16); near-field
-                                                          // ≪ this → bell only on real touch
+                                                          // proximity stays well below it
 static constexpr float    TOUCH_RELEASE_RATIO  = 0.5f;
 static constexpr uint32_t TOUCH_COOLDOWN_MS    = 10;
 // Consecutive frames the jump must stay over-threshold before a touch fires.
@@ -436,33 +315,12 @@ static constexpr uint8_t  TOUCH_CONFIRM_FRAMES = 2;
 // monitor blips. ~8 ms of added onset latency per extra frame.
 static constexpr uint8_t  PROX_CONFIRM_FRAMES  = 2;
 
-// ── Proximity → volume mapping (intensity = (fast−deadband)/(proxMax−deadband))
-// From the CDC=16 capture: idle noise ≈ 1, ~1 cm ≈ 5, on plastic ≈ 22. So the
-// playable swell lives between a light near-touch and resting on the shell;
-// deadband sits just above idle noise, proxMax ≈ firm-plastic so the sound is
-// full by the time you rest on it (metal contact then adds the bell).
-static constexpr float PROX_DEADBAND = 4.0f;  // ↑ from 2: rejects small idle transients
-                                              // (1 cm ≈ 5 at CDC=16 still registers)
+// ── Proximity → volume mapping ───────────────────────────────────────────────
+// intensity = (fast − DEADBAND) / (PROX_MAX − DEADBAND), clamped 0..1, then
+// smoothed in main_pico.cpp (PROX_SMOOTH_K) before it drives voice amplitude.
+// These pads are near-field/touch only (see SENSOR_CDC): from a CDC≈14–16 capture
+// idle noise ≈ 1, ~1 cm ≈ 5, resting on the shell ≈ 22 — so the playable swell
+// lives between a light near-touch and resting on the surface. DEADBAND sits just
+// above idle noise; PROX_MAX ≈ firm contact so the note is full as you rest on it.
+static constexpr float PROX_DEADBAND = 4.0f;
 static constexpr float PROX_MAX      = 18.0f;
-
-// ── Idle baseline recalibration ──────────────────────────────────────────────
-// If nothing is happening for IDLE_RECAL_MS, force a full MPR121 baseline
-// reload + re-seed the EMAs to kill drift-induced phantom blips. Skipped if a
-// recal already ran within RECAL_COOLDOWN_MS (avoid hammering).
-static constexpr uint32_t IDLE_RECAL_MS      = 5000;
-static constexpr uint32_t RECAL_COOLDOWN_MS  = 10000;
-static constexpr float    IDLE_INTENSITY     = 0.02f; // any pad above this counts as active
-
-// ── MPE (USB-MIDI) output ────────────────────────────────────────────────────
-// Each pad gets its own member channel for polyphonic aftertouch (channel
-// pressure). Notes are sent at the nearest semitone — DAW handles any further
-// tuning. The Teensy keeps producing audio at the same time (dual mode);
-// unplug the audio jack if you only want the MIDI.
-static constexpr bool     MPE_ENABLE              = true;
-static constexpr uint8_t  MPE_MASTER_CH           = 1;   // 1-indexed MIDI channel
-static constexpr uint8_t  MPE_MEMBER_BASE_CH      = 2;   // pad 0 → ch 2, pad 10 → ch 12
-static constexpr uint32_t MPE_PRESSURE_THROTTLE_MS = 20; // ≤50 Hz per pad
-static constexpr uint8_t  MPE_PRESSURE_MIN_DELTA  = 2;   // skip if change < this (0–127)
-
-// Update timing
-static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz sensor update rate
