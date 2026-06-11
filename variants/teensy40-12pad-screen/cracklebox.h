@@ -40,6 +40,15 @@ inline void AudioCracklebox::update()
 {
     audio_block_t* out = allocate();
     if (!out) return;
+
+    if (!isfinite(_amp)) _amp = 0; // never let a divergence NaN the whole mix
+
+    // Silent (not the active mode) → emit zeros and skip the per-sample work.
+    if (_n == 0 && _amp < 0.0003f && _ampTarget < 0.0003f) {
+        memset(out->data, 0, sizeof(out->data));
+        transmit(out); release(out); return;
+    }
+
     const float fs = AUDIO_SAMPLE_RATE_EXACT;
 
     for (int s = 0; s < AUDIO_BLOCK_SAMPLES; s++)
@@ -70,7 +79,9 @@ inline void AudioCracklebox::update()
         float logic  = b ? 1.0f : -1.0f;
         float analog = sum / (float)_n;
         float v = 0.65f * logic + 0.35f * analog;
-        out->data[s] = (int16_t)(_amp * v * 9000.0f);
+        float o = _amp * v;
+        if (!isfinite(o)) o = 0.0f; else if (o > 1.0f) o = 1.0f; else if (o < -1.0f) o = -1.0f;
+        out->data[s] = (int16_t)(o * 9000.0f);
     }
 
     transmit(out);

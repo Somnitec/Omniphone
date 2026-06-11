@@ -25,6 +25,10 @@
 // Serial (for aligning the touch coordinates with the on-screen press areas).
 #define SCREEN_TOUCH_DEBUG 0
 
+// Set 1 to render the screen rotated 180° (panel mounted upside down). Touch
+// coordinates are flipped to match.
+#define SCREEN_FLIP 1
+
 enum DisplayGesture : uint8_t {
     GESTURE_NONE = 0, GESTURE_UP, GESTURE_DOWN, GESTURE_LEFT, GESTURE_RIGHT,
     GESTURE_TAP,       // a single tap (tapX/tapY out-params are set)
@@ -49,8 +53,8 @@ static constexpr uint16_t SCALE_T  = 92,  SCALE_H  = 52;  // centred on ~118 ≈
 static constexpr uint16_t TIMBRE_T = 156, TIMBRE_H = 60;
 enum { LINE_TITLE = 0, LINE_MODE, LINE_SCALE, LINE_TIMBRE, LINE_COUNT };
 
-static constexpr uint16_t GLOW_STRIP   = 20;            // rows streamed per frame
-static constexpr uint32_t SCREEN_SPI_HZ = 40000000;    // GC9A01 is happy at 40 MHz
+static constexpr uint16_t GLOW_STRIP   = 30;            // rows streamed per render step
+static constexpr uint32_t SCREEN_SPI_HZ = 40000000;    // GC9A01 SPI clock (proven-safe alongside audio)
 
 namespace {
 static const uint16_t LINE_Y[LINE_COUNT] = { TITLE_T, MODE_T, SCALE_T, TIMBRE_T };
@@ -71,8 +75,17 @@ static const TapBox TAP_BOXES[4] = {
 static char    g_text[LINE_COUNT][20] = { {0}, {0}, {0}, {0} };
 static uint8_t g_bgLevel = 0; // background grey 0 (black) … 255 (white)
 
-// Incremental-repaint state.
-static uint16_t g_row        = 0;     // next strip's top row
+// Lock / visualiser mode: no text, just the glow + a fuzzy 12-pad pie.
+static bool  g_locked = false;
+static float g_pad[NUM_SENSORS]      = { 0 }; // per-pad intensity (0..1)
+static float g_padAngle[NUM_SENSORS] = { 0 }; // each pad's wedge centre angle
+
+// Incremental-repaint state. The screen is painted in strips, in an INSIDE-OUT
+// order (centre strip first, then outward) so a refresh radiates from the middle
+// rather than rolling top-to-bottom — smoother, especially in lock mode.
+static uint8_t  g_stripOrder[16] = { 0 }; // strip indices, centre-out
+static uint8_t  g_nStrips    = 0;     // number of strips (set in displayInit)
+static uint8_t  g_sweepStep  = 0;     // index into g_stripOrder for the next strip
 static uint8_t  g_sweepLevel = 0;     // bg level captured at the top of this sweep
 static bool     g_drawn      = true;  // whole screen matches the target → idle
 
@@ -142,6 +155,36 @@ inline UWORD composePixel(uint16_t x, uint16_t y, int8_t li)
     return grey565(g_bgLevel);
 }
 
+// Lock-mode pixel: a dim base from the overall glow plus a soft ("fuzzy") wedge
+// per pad that brightens with that pad's intensity. Pad 3 sits at the bottom,
+// the rest go counter-clockwise (see g_padAngle, set in displayInit).
+static constexpr float PIE_CENTER_R = 96.0f; // soft black hole radius (px) — big soft centre
+inline UWORD lockPixel(uint16_t x, uint16_t y)
+{
+    float dx = (float)x - (LCD_WIDTH / 2), dy = (float)y - (LCD_HEIGHT / 2);
+    float r2 = dx * dx + dy * dy;
+    if (r2 > 119.0f * 119.0f) return 0;            // outside the round face
+
+    float ang  = atan2f(dy, dx);
+    float v    = (float)g_bgLevel / 255.0f * 0.45f; // dim base from overall touch
+    const float half = (float)(M_PI / 6.0) * 1.5f;  // wedge half-width (~1.5 slices → fuzzy)
+    for (uint8_t p = 0; p < NUM_SENSORS; p++)
+    {
+        if (g_pad[p] <= 0.001f) continue;
+        float d = ang - g_padAngle[p];
+        while (d >  (float)M_PI) d -= 2.0f * (float)M_PI;
+        while (d < -(float)M_PI) d += 2.0f * (float)M_PI;
+        if (d < 0) d = -d;
+        if (d < half) { float w = 1.0f - d / half; v += g_pad[p] * w * w; }
+    }
+    if (v > 1.0f) v = 1.0f;
+
+    // Fuzzy black hole in the centre so the wedges don't meet in a bright point.
+    float hole = r2 / (PIE_CENTER_R * PIE_CENTER_R);
+    if (hole < 1.0f) v *= hole * hole * (3.0f - 2.0f * hole); // smoothstep 0→1
+    return grey565((uint8_t)(v * 255.0f));
+}
+
 // SPI-DMA completion (runs from the transfer ISR): release CS + bus.
 inline void onStripDone(EventResponderRef)
 {
@@ -179,10 +222,35 @@ inline void displayInit()
 
     if (Touch_1IN28_init(XY.mode)) Serial.println(F("Touchscreen OK"));
     else                           Serial.println(F("Touchscreen not found"));
+
+    // Keep the CST816S reporting through a long, motionless 10 s hold: disable
+    // auto-reset (0xFB), long-press-reset (0xFC), and auto-sleep (0xFE = 1).
+    DEV_I2C_Write_Byte(touchAddress, 0xFB, 0x00);
+    DEV_I2C_Write_Byte(touchAddress, 0xFC, 0x00);
+    DEV_I2C_Write_Byte(touchAddress, 0xFE, 0x01); // DisAutoSleep
+
+    // Pie-slice angles, one 30° slice per pad. PIE_BASE = pad-3 wedge centre,
+    // PIE_DIR = +1 counter-clockwise / -1 clockwise. (Flipped 180° from bottom
+    // so it reads right with SCREEN_FLIP; tweak these two if it's still off.)
+    const float PIE_BASE = (float)(M_PI * 1.5); // 3π/2 (was π/2; +π = 180° flip)
+    const float PIE_DIR  = 1.0f;
+    for (uint8_t p = 0; p < NUM_SENSORS; p++) {
+        uint8_t slot = (uint8_t)((p + NUM_SENSORS - 3) % NUM_SENSORS);
+        g_padAngle[p] = PIE_BASE + PIE_DIR * (float)slot * (float)(2.0 * M_PI / NUM_SENSORS);
+    }
+
+    // Inside-out strip order: centre strip first, then alternately outward.
+    g_nStrips = (uint8_t)((LCD_HEIGHT + GLOW_STRIP - 1) / GLOW_STRIP);
+    int mid = (g_nStrips - 1) / 2, k = 0;
+    g_stripOrder[k++] = (uint8_t)mid;
+    for (int d = 1; d < g_nStrips && k < g_nStrips; d++) {
+        if (mid + d < g_nStrips) g_stripOrder[k++] = (uint8_t)(mid + d);
+        if (mid - d >= 0)        g_stripOrder[k++] = (uint8_t)(mid - d);
+    }
 }
 
-// Mark the screen for a fresh incremental repaint from the top.
-namespace { inline void markDirty() { g_drawn = false; g_row = 0; } }
+// Mark the screen for a fresh incremental repaint (from the centre out).
+namespace { inline void markDirty() { g_drawn = false; g_sweepStep = 0; } }
 
 inline void displayBeginCanvas()
 {
@@ -209,39 +277,62 @@ inline void displaySetGlow(float avg)
     if (lvl != g_bgLevel) { g_bgLevel = lvl; markDirty(); }
 }
 
+// Enter/leave the locked visualiser (no text, just glow + pie). Leaving forces
+// a full normal repaint so the text/arrows come back.
+inline void displaySetLocked(bool on) { g_locked = on; if (!on) markDirty(); }
+
+// Feed the per-pad intensities for the lock-mode pie (call each frame).
+inline void displaySetPads(const float* p)
+{
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) g_pad[i] = p[i];
+}
+
 // Advance the repaint by ONE strip. Renders to RAM and kicks a DMA stream, then
 // returns immediately (the transfer finishes in the background). Call once per
 // frame. Returns true while more work remains.
 inline bool displayRenderStep()
 {
-    if (g_dmaBusy) return true;   // a strip is still streaming — come back next frame
-    if (g_drawn)   return false;  // up to date
+    if (g_dmaBusy) return true;             // a strip is still streaming
+    if (g_drawn && !g_locked) return false; // up to date (locked mode never idles)
 
-    if (g_row == 0) g_sweepLevel = g_bgLevel;
-    uint16_t h = GLOW_STRIP;
-    if (g_row + h > LCD_HEIGHT) h = (uint16_t)(LCD_HEIGHT - g_row);
+    if (g_sweepStep == 0) g_sweepLevel = g_bgLevel;
+    uint16_t y0 = (uint16_t)(g_stripOrder[g_sweepStep] * GLOW_STRIP); // inside-out
+    uint16_t h  = GLOW_STRIP;
+    if (y0 + h > LCD_HEIGHT) h = (uint16_t)(LCD_HEIGHT - y0);
 
     // Render the strip into the byte buffer (big-endian 16-bit colour for SPI).
+    // SCREEN_FLIP renders the panel rotated 180°: panel pixel (x,y) shows the
+    // logical content at (W-1-x, H-1-y), so a screen mounted upside down reads
+    // upright. lx/ly are the logical (content) coordinates used everywhere.
     uint32_t idx = 0;
-    for (uint16_t y = g_row; y < g_row + h; y++)
+    for (uint16_t y = y0; y < y0 + h; y++)
     {
+#if SCREEN_FLIP
+        uint16_t ly = (uint16_t)(LCD_HEIGHT - 1 - y);
+#else
+        uint16_t ly = y;
+#endif
         int8_t li = -1;
         for (uint8_t k = 0; k < LINE_COUNT; k++)
-            if (y >= LINE_Y[k] && y < LINE_Y[k] + LINE_H[k]) { li = (int8_t)k; break; }
+            if (ly >= LINE_Y[k] && ly < LINE_Y[k] + LINE_H[k]) { li = (int8_t)k; break; }
         for (uint16_t x = 0; x < LCD_WIDTH; x++)
         {
-            UWORD c = composePixel(x, y, li);
+#if SCREEN_FLIP
+            uint16_t lx = (uint16_t)(LCD_WIDTH - 1 - x);
+#else
+            uint16_t lx = x;
+#endif
+            UWORD c = g_locked ? lockPixel(lx, ly) : composePixel(lx, ly, li);
             g_strip[idx++] = (uint8_t)(c >> 8);
             g_strip[idx++] = (uint8_t)(c & 0xFF);
         }
     }
 
-    startStripDMA(g_row, h);
-    g_row = (uint16_t)(g_row + h);
-    if (g_row >= LCD_HEIGHT)
+    startStripDMA(y0, h);
+    if (++g_sweepStep >= g_nStrips)
     {
-        g_row = 0;
-        if (g_bgLevel == g_sweepLevel) g_drawn = true; // level held steady → done
+        g_sweepStep = 0;
+        if (!g_locked && g_bgLevel == g_sweepLevel) g_drawn = true; // steady → done
     }
     return true;
 }
@@ -283,8 +374,8 @@ inline bool readTouchRaw(uint16_t& x, uint16_t& y)
 // the map is identity + clamp. Flip the SWAP/FLIP knobs if a unit ever comes
 // up rotated or mirrored.
 static constexpr bool TOUCH_SWAP_XY = false;
-static constexpr bool TOUCH_FLIP_X  = false;
-static constexpr bool TOUCH_FLIP_Y  = false;
+static constexpr bool TOUCH_FLIP_X  = SCREEN_FLIP; // match the 180° display flip
+static constexpr bool TOUCH_FLIP_Y  = SCREEN_FLIP;
 inline void touchMap(uint16_t rx, uint16_t ry, uint16_t& dx, uint16_t& dy)
 {
     uint16_t sx = (rx > LCD_WIDTH  - 1) ? (LCD_WIDTH  - 1) : rx;
@@ -342,6 +433,8 @@ inline void displayShowScale(const char*) {}
 inline void displayShowMode(const char*) {}
 inline void displayShowTimbre(const char*) {}
 inline void displaySetGlow(float) {}
+inline void displaySetLocked(bool) {}
+inline void displaySetPads(const float*) {}
 inline bool displayRenderStep() { return false; }
 inline DisplayGesture displayTapToGesture(uint16_t, uint16_t) { return GESTURE_NONE; }
 inline DisplayGesture displayPollGesture(uint16_t&, uint16_t&) { return GESTURE_NONE; }

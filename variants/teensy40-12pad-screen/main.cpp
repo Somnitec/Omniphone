@@ -184,6 +184,12 @@ static float    lastIntensity[NUM_SENSORS] = { 0.0f }; // prev-frame intensity �
 static uint32_t holdStartMs[NUM_SENSORS]   = { 0 };    // when each pad became held (0 = released)
                                                        // → press order for FM carrier / Benjolin
 
+// Screen lock/visualiser state, and the Teleplot per-pad readout (serial 't').
+static bool     lockMode    = false;
+static bool     teleplotOn  = false;
+static uint16_t tpFilt[NUM_SENSORS]  = { 0 }; // last MPR121 filtered reading per pad
+static float    tpDelta[NUM_SENSORS] = { 0 }; // last baseline−filtered delta per pad
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sound state — scale (notes) and timbre (character) are independent
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +206,7 @@ static constexpr int     EEPROM_ADDR_MAGIC  = 0;
 static constexpr int     EEPROM_ADDR_SCALE  = 1;
 static constexpr int     EEPROM_ADDR_TIMBRE = 2;
 static constexpr int     EEPROM_ADDR_MODE   = 3;
+static constexpr int     EEPROM_ADDR_LOCK   = 4;
 static constexpr uint8_t EEPROM_MAGIC       = 0xA9; // bumped: added mode byte
 
 static uint8_t loadStoredScale(uint8_t fallback)
@@ -240,6 +247,18 @@ static void storeMode(uint8_t index)
 {
     EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
     EEPROM.update(EEPROM_ADDR_MODE, index);
+}
+
+static bool loadStoredLock()
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return false;
+    return EEPROM.read(EEPROM_ADDR_LOCK) == 1;
+}
+
+static void storeLock(bool on)
+{
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_LOCK, on ? 1 : 0);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -625,11 +644,10 @@ void setup()
 
     // ── I2C bus ──────────────────────────────────────────────────────────────
     Wire.begin();
-    Wire.setClock(400000); // 400 kHz fast-mode I2C: the sensor/LED/touch reads
-                           // fit in a shorter frame → lower sampling latency.
-                           // If you ever see sensor glitches/noise, the wiring
-                           // can't sustain 400 kHz — drop back to 100000 (and
-                           // raise UPDATE_MS to ~8 so the reads still fit).
+    Wire.setClock(100000); // 100 kHz — the MPR121 pad boards' long wiring can't sustain
+                           // faster (200/400 kHz → corrupted reads → no intensity →
+                           // silence). See the note in loop()'s burst read for the fix
+                           // if you ever want higher (stronger I2C pull-ups / shorter wires).
 
     // ── MPR121 boards (staged init so we can read pads BEFORE baseline lock) ─
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
@@ -846,7 +864,9 @@ void setup()
     displayBeginCanvas();                // no-op when ENABLE_SCREEN == 0
     loadScale(startupScale, false);      // snaps glideFreq[] to the scale's notes
     loadTimbre(startupTimbre, false);    // full voice init using those freqs
-    loadMode(startupMode);               // Proximity / Arp*
+    loadMode(startupMode);               // restore the saved play mode
+    lockMode = loadStoredLock();         // restore the locked-screen state
+    displaySetLocked(lockMode);
 
     // ── MPE Configuration Message ────────────────────────────────────────────
     // RPN 6 on the master channel sets up MPE Zone 1: 12 member channels
@@ -885,6 +905,8 @@ void loop()
         else if (c >= 'a' && c <= 'i') loadTimbre((uint8_t)(c - 'a'), true);
         else if (c >= 'A' && c <= 'I') loadTimbre((uint8_t)(c - 'A'), true);
         else if (c == 'm' || c == 'M') loadMode((uint8_t)((activeMode + 1) % NUM_MODES));
+        else if (c == 't' || c == 'T') { teleplotOn = !teleplotOn;
+            Serial.print(F("# Teleplot readout ")); Serial.println(teleplotOn ? F("ON") : F("OFF")); }
     }
 
     // ── Rate-limited sensor update ───────────────────────────────────────────
@@ -985,6 +1007,9 @@ void loop()
 
         float rawDelta = (float)((int16_t)baseline - (int16_t)filtered);
         if (rawDelta < 0.0f) rawDelta = 0.0f;
+
+        tpFilt[i]  = filtered; // for the Teleplot readout
+        tpDelta[i] = rawDelta;
 
         float intensity;
         bool  isTouch;
@@ -1174,55 +1199,108 @@ void loop()
         boards[b].setLEDs8(ledBri[b]);
     }
 
-    // ── Touch screen: swipe / tap-arrow / long-press (rate-limited; I2C bus) ──
-    // Swipe or tap an arrow: L/R = scale, U/D = timbre. LONG-PRESS = cycle mode.
+    // ── Screen data: background glow + per-pad pie (every frame, so the
+    // visualiser is responsive) ──────────────────────────────────────────────
+    {
+        float sum = 0.0f;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) sum += lastIntensity[i];
+        displaySetGlow(sum / (float)NUM_SENSORS);
+        displaySetPads(lastIntensity);
+    }
+
+    // ── Touch screen (rate-limited; shares the I2C bus) ──────────────────────
+    // Swipe or tap an arrow: L/R = scale, U/D = timbre. A medium press (release
+    // ≥ MODE_PRESS_MIN_MS) cycles the play MODE; a long 10 s hold toggles the
+    // locked visualiser. Press timing is done in firmware (off the raw finger),
+    // so the 10 s hold can't also trip a mode change.
     static uint32_t lastGestureMs = 0;
+    static uint32_t holdAccum     = 0;     // cumulative down-time (lock; tolerates gaps)
+    static uint32_t contPress     = 0;     // continuous-press start (mode; resets on a gap)
+    static uint32_t lastTouchMs   = 0;     // last poll the finger was seen down
+    static uint32_t lastPollMs    = 0;     // for the per-poll dt
+    static bool     pressActed    = false; // lock already toggled for this hold
     if (now - lastGestureMs >= 30)
     {
         lastGestureMs = now;
         uint16_t tapX = 0, tapY = 0;
         DisplayGesture g = displayPollGesture(tapX, tapY); // NONE when screen off
+        if (g == GESTURE_TAP) g = displayTapToGesture(tapX, tapY);
 
-        if (g == GESTURE_TAP)
+        if (!lockMode) // swipes/arrows only do something on the normal screen
         {
-            g = displayTapToGesture(tapX, tapY); // display.h already printed raw+disp
-#if SCREEN_TOUCH_DEBUG
-            Serial.print(F("#   -> zone ")); Serial.println(
-                g == GESTURE_LEFT  ? "LEFT(scale-)"  : g == GESTURE_RIGHT ? "RIGHT(scale+)" :
-                g == GESTURE_UP    ? "UP(timbre-)"   : g == GESTURE_DOWN  ? "DOWN(timbre+)" : "none");
-#endif
+            switch (g)
+            {
+                case GESTURE_RIGHT: loadScale((uint8_t)((activeScale + 1) % NUM_SCALE_SETS), true); break;
+                case GESTURE_LEFT:  loadScale((uint8_t)((activeScale + NUM_SCALE_SETS - 1) % NUM_SCALE_SETS), true); break;
+                case GESTURE_DOWN:  loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true); break;
+                case GESTURE_UP:    loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true); break;
+                default: break;
+            }
         }
 
-        switch (g)
+        // Two press timers (touch reads drop out at the round edges / glitch at
+        // 400 kHz, so neither relies on an unbroken stretch):
+        //   • contPress — continuous press for MODE; restarts after a >250 ms gap,
+        //     so rapid swipes can't accumulate into a mode change.
+        //   • holdAccum — cumulative down-time for the 10 s LOCK; tolerates gaps
+        //     up to 600 ms so an edge dropout doesn't reset the long hold.
+        uint32_t dt  = (lastPollMs  == 0) ? 0 : (now - lastPollMs);
+        uint32_t gap = (lastTouchMs == 0) ? 99999u : (now - lastTouchMs);
+        lastPollMs = now;
+        uint16_t fx, fy;
+        if (displayPollTouch(fx, fy)) // finger down this poll
         {
-            case GESTURE_RIGHT:
-                loadScale((uint8_t)((activeScale + 1) % NUM_SCALE_SETS), true);
-                break;
-            case GESTURE_LEFT:
-                loadScale((uint8_t)((activeScale + NUM_SCALE_SETS - 1) % NUM_SCALE_SETS), true);
-                break;
-            case GESTURE_DOWN:
-                loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true);
-                break;
-            case GESTURE_UP:
-                loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true);
-                break;
-            case GESTURE_LONGPRESS:
-                loadMode((uint8_t)((activeMode + 1) % NUM_MODES)); // long-press cycles mode
-                break;
-            default:
-                break;
+            if (gap > 250) contPress = now; // fresh contact → restart continuous timer
+            holdAccum += dt;
+            lastTouchMs = now;
+            if (!pressActed && holdAccum >= LOCK_HOLD_MS)
+            {
+                lockMode = !lockMode;
+                displaySetLocked(lockMode);
+                storeLock(lockMode); // remember across power-off
+                Serial.print(F("# screen ")); Serial.println(lockMode ? F("LOCKED") : F("unlocked"));
+                pressActed = true;
+            }
         }
-
-        // ── Background glow: average intensity across all pads → screen white ─
-        float sum = 0.0f;
-        for (uint8_t i = 0; i < NUM_SENSORS; i++) sum += lastIntensity[i];
-        displaySetGlow(sum / (float)NUM_SENSORS); // just sets the target level
+        else // finger up this poll
+        {
+            if (contPress != 0 && gap > 250) // continuous press ended → maybe cycle mode
+            {
+                uint32_t held = lastTouchMs - contPress;
+                if (!pressActed && !lockMode && held >= MODE_PRESS_MIN_MS && held < LOCK_HOLD_MS)
+                    loadMode((uint8_t)((activeMode + 1) % NUM_MODES));
+                contPress = 0;
+            }
+            if (holdAccum != 0 && gap > 600) { holdAccum = 0; pressActed = false; } // hold ended
+        }
     }
 
-    // Advance the screen's incremental repaint by one small strip every frame —
-    // keeps the glow updating without ever blocking the LEDs or sound engine.
+    // Advance the screen by ONE strip per sensor frame (inside-out order). Gappy
+    // DMA — leaves the memory bus free between strips so the audio I2S DMA never
+    // starves (continuous streaming was a non-issue once I2C was the real culprit,
+    // but one-strip-per-frame is the proven-good arrangement, so keep it).
     displayRenderStep();
+
+
+    // ── Teleplot readout (toggle with serial 't') ───────────────────────────
+    // First the engine load (cpu %, mem blocks), then per pad: raw (MPR121
+    // filtered), delta (baseline−filtered), int (final 0..1). Teleplot @115200.
+    if (teleplotOn)
+    {
+        static uint32_t lastTpMs = 0;
+        if (now - lastTpMs >= 40)
+        {
+            lastTpMs = now;
+            Serial.print(F(">cpu:")); Serial.println(AudioProcessorUsage(), 1);
+            Serial.print(F(">mem:")); Serial.println(AudioMemoryUsage());
+            for (uint8_t i = 0; i < NUM_SENSORS; i++)
+            {
+                Serial.print(F(">p")); Serial.print(i); Serial.print(F("raw:"));   Serial.println(tpFilt[i]);
+                Serial.print(F(">p")); Serial.print(i); Serial.print(F("delta:")); Serial.println(tpDelta[i], 1);
+                Serial.print(F(">p")); Serial.print(i); Serial.print(F("int:"));   Serial.println(lastIntensity[i], 3);
+            }
+        }
+    }
 
     // ── Idle baseline recalibration ──────────────────────────────────────────
     if (anyActive)

@@ -396,6 +396,10 @@ static constexpr float CRACKLE_LEVEL  = 0.30f;
 static constexpr float CRACKLE_OCT    = 0.25f; // pitch multiplier (0.25 = two octaves down)
 static constexpr float CRACKLE_COUPLE = 0.9f;  // max cross-coupling (× proximity) → chaos
 
+// ── Touch-screen press timing ────────────────────────────────────────────────
+static constexpr uint32_t MODE_PRESS_MIN_MS = 550;   // press ≥ this on release → cycle mode
+static constexpr uint32_t LOCK_HOLD_MS      = 10000; // hold this long → toggle lock/visualiser
+
 // ── Synth parameters ─────────────────────────────────────────────────────────
 // Voice architecture
 // 0.6 (not 1.0): leaves headroom so main+sub and the resonant filter boost
@@ -409,14 +413,14 @@ static constexpr float STAGE_GAIN  = 0.25f; // per-channel gain in stage mixers
 static constexpr float MASTER_GAIN = 0.7f;  // per-channel gain in master mixer
 
 // Amplitude envelope (DC ramp)
-static constexpr float AMP_RAMP_MS = 4.0f;  // matches UPDATE_MS — smooth ramp, snappy onset
+static constexpr float AMP_RAMP_MS = 8.0f;  // matches UPDATE_MS — smooth ramp
 
 // Sound-set change: portamento. On a live scale switch the sustained pitches
 // glide to the new notes over EXACTLY this long, then stop — a fixed-time log
 // (constant cents/sec) sweep, so it both feels musical and finishes promptly.
 // (The old 1-pole had a long tail that made even 200 ms feel like ~2 s.)
 // Amplitude is left untouched, so the change has no pause/click. 0 = instant.
-static constexpr float SET_GLIDE_MS = 500.0f;
+static constexpr float SET_GLIDE_MS = 250.0f;
 
 // Timbre change: the filter (cutoff/resonance) and sub-bass blend morph to the
 // new timbre over this long instead of jumping. The oscillator waveform still
@@ -562,6 +566,4 @@ static constexpr uint32_t MPE_PRESSURE_THROTTLE_MS = 20; // ≤50 Hz per pad
 static constexpr uint8_t  MPE_PRESSURE_MIN_DELTA  = 2;   // skip if change < this (0–127)
 
 // Update timing
-static constexpr uint32_t UPDATE_MS = 4; // ~250 Hz sensor update rate (needs 400 kHz
-                                         // I2C — see Wire.setClock in main). Halves
-                                         // sampling latency vs the old 8 ms.
+static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz; the burst reads fill most of this at 100 kHz I2C

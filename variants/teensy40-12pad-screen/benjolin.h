@@ -56,6 +56,17 @@ inline void AudioBenjolin::update()
     audio_block_t* out = allocate();
     if (!out) return;
 
+    // Sanitise state so a divergence can never propagate NaN into the mix (which
+    // would silence ALL audio via 0×NaN, even at gain 0).
+    if (!isfinite(_amp) || !isfinite(_phaseA) || !isfinite(_phaseB) || !isfinite(_rungleVal))
+        { _amp = 0; _phaseA = 0; _phaseB = 0; _rungleVal = 0; _sr = 0x2D; }
+
+    // Silent (not the active mode) → emit zeros and skip the per-sample work.
+    if (_amp < 0.0003f && _ampTarget < 0.0003f) {
+        memset(out->data, 0, sizeof(out->data));
+        transmit(out); release(out); return;
+    }
+
     const float fs = AUDIO_SAMPLE_RATE_EXACT;
 
     for (int i = 0; i < AUDIO_BLOCK_SAMPLES; i++)
@@ -92,7 +103,9 @@ inline void AudioBenjolin::update()
         // Tone: 1-pole low-pass (cut 0 = dark, 1 = open).
         float coef = 0.04f + _cut * 0.9f;
         _lp += coef * (s - _lp);
-        out->data[i] = (int16_t)(_amp * _lp * 11000.0f);
+        float o = _amp * _lp;
+        if (!isfinite(o)) o = 0.0f; else if (o > 1.0f) o = 1.0f; else if (o < -1.0f) o = -1.0f;
+        out->data[i] = (int16_t)(o * 11000.0f);
     }
 
     transmit(out);
