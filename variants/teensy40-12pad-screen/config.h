@@ -357,14 +357,14 @@ static const TimbreSet TIMBRE_SETS[NUM_TIMBRE_SETS] = {
 // version snaps the rungler to the active scale, "Raw" runs free.
 enum PlayMode : uint8_t {
     MODE_PROX = 0, MODE_ARP_SLOW, MODE_ARP_MED, MODE_ARP_FAST,
-    MODE_FM, MODE_FM_POLY, MODE_BENJOLIN, MODE_BENJOLIN_RAW, MODE_CRACKLE
+    MODE_FM, MODE_FM_POLY, MODE_BENJOLIN, MODE_BENJOLIN_RAW, MODE_CRACKLE, MODE_HANG
 };
-static constexpr uint8_t NUM_MODES = 9;
+static constexpr uint8_t NUM_MODES = 10;
 static const char* const MODE_NAMES[NUM_MODES] =
     { "Proximity", "Arp Slow", "Arp Med", "Arp Fast",
-      "FM", "FM Poly", "Benjolin", "Benjolin Raw", "Cracklebox" };
+      "FM", "FM Poly", "Benjolin", "Benjolin Raw", "Cracklebox", "Hang Bow" };
 static constexpr float MODE_ARP_PERIOD_MS[NUM_MODES] =
-    { 0.0f, 360.0f, 180.0f, 90.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    { 0.0f, 360.0f, 180.0f, 90.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 static constexpr float ARP_HOLD_INTENSITY = 0.10f; // pad counts as "held" above this
 
 // ── FM modes ─────────────────────────────────────────────────────────────────
@@ -396,9 +396,14 @@ static constexpr float CRACKLE_LEVEL  = 0.30f;
 static constexpr float CRACKLE_OCT    = 0.25f; // pitch multiplier (0.25 = two octaves down)
 static constexpr float CRACKLE_COUPLE = 0.9f;  // max cross-coupling (× proximity) → chaos
 
+// ── Hang Bow mode ────────────────────────────────────────────────────────────
+// Bowed handpan physical model (see hangbow.h for the per-voice tuning). All 12
+// pads are sympathetic resonators; proximity bows them. This is just the bus level.
+static constexpr float HANG_LEVEL = 1.0f;
+
 // ── Touch-screen press timing ────────────────────────────────────────────────
-static constexpr uint32_t MODE_PRESS_MIN_MS = 550;   // press ≥ this on release → cycle mode
-static constexpr uint32_t LOCK_HOLD_MS      = 10000; // hold this long → toggle lock/visualiser
+static constexpr uint32_t MODE_PRESS_MIN_MS = 550;   // (unused — mode is on the ‹ › arrows now)
+static constexpr uint32_t LOCK_HOLD_MS      = 5000;  // hold this long → toggle lock/visualiser
 
 // ── Synth parameters ─────────────────────────────────────────────────────────
 // Voice architecture

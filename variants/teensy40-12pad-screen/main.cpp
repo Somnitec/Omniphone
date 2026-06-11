@@ -10,6 +10,7 @@
 #include "sound_engine.h"
 #include "benjolin.h"    // Benjolin-mode chaos source
 #include "cracklebox.h"  // Cracklebox-mode chaos source
+#include "hangbow.h"     // Hang Bow mode: bowed handpan physical model
 #include <MPR121.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,15 +111,22 @@ AudioConnection fmg1(fmDc,        0, fmGate,    1);
 // ── Benjolin / Cracklebox modes: chaos sources ──────────────────────────────
 AudioBenjolin   benjolin;
 AudioCracklebox crackle;
+AudioHangBow    hangBow;
 
 // ── Final bus: normal / FM / Benjolin / Cracklebox → chorus → output ─────────
 // finalMix ch0 = normal voice+bell master (also FM Poly), ch1 = mono FM,
 // ch2 = Benjolin, ch3 = Cracklebox. The active mode raises the right one(s).
+// finalMix is full (4ch), so a second mixer folds in the Hang Bow engine.
 AudioMixer4 finalMix;
 AudioConnection fx0(masterMix, 0, finalMix, 0);
 AudioConnection fx1(fmGate,    0, finalMix, 1);
 AudioConnection fx2(benjolin,  0, finalMix, 2);
 AudioConnection fx3(crackle,   0, finalMix, 3);
+
+// finalMix2 ch0 = everything above, ch1 = Hang Bow (gated by its mode).
+AudioMixer4 finalMix2;
+AudioConnection fx2a(finalMix, 0, finalMix2, 0);
+AudioConnection fx2b(hangBow,  0, finalMix2, 1);
 
 // Chorus send on the final bus (for the Juno timbre's ensemble shimmer).
 AudioEffectChorus chorus;
@@ -129,7 +137,7 @@ static short chorusDelayLine[CHORUS_DELAY_LEN];
 // channels drive a balanced differential line out (L−R = 2× signal, common-
 // mode noise cancels). The chorus sits between the final mix and the split.
 AudioAmplifier  rInv;
-AudioConnection pmC (finalMix, 0, chorus, 0);
+AudioConnection pmC (finalMix2, 0, chorus, 0);
 AudioConnection pmL (chorus,   0, i2sOut, 0);
 AudioConnection pmRa(chorus,   0, rInv,   0);
 AudioConnection pmR (rInv,     0, i2sOut, 1);
@@ -384,22 +392,26 @@ static void loadMode(uint8_t index)
     const bool fmMono = (index == MODE_FM);
     const bool ben    = (index == MODE_BENJOLIN || index == MODE_BENJOLIN_RAW);
     const bool crk    = (index == MODE_CRACKLE);
+    const bool hang   = (index == MODE_HANG);
     // Normal voice path is used by Proximity, Arp, AND FM Poly (which self-FMs
-    // the voices). Only mono-FM / Benjolin / Cracklebox replace it.
-    const bool normalPath = !(fmMono || ben || crk);
+    // the voices). mono-FM / Benjolin / Cracklebox / Hang Bow replace it.
+    const bool normalPath = !(fmMono || ben || crk || hang);
 
     finalMix.gain(0, normalPath ? 1.0f : 0.0f);     // normal voices (+ FM Poly)
     finalMix.gain(1, fmMono ? FM_LEVEL       : 0.0f); // mono FM carrier
     finalMix.gain(2, ben    ? BENJOLIN_LEVEL : 0.0f); // Benjolin
     finalMix.gain(3, crk    ? CRACKLE_LEVEL  : 0.0f); // Cracklebox
+    finalMix2.gain(1, hang  ? HANG_LEVEL     : 0.0f); // Hang Bow
 
     arpCurrentPad = 0xFF; arpNextTickMs = millis();
     if (!fmMono) fmDc.amplitude(0.0f, 8.0f); // hush the mono carrier when leaving FM
     if (!ben)    benjolin.setAmp(0.0f);      // hush the chaos when leaving Benjolin
     if (!crk)    crackle.setAmp(0.0f);
+    if (!hang)   for (uint8_t i = 0; i < NUM_SENSORS; i++) hangBow.setForce(i, 0.0f); // let it ring out
     if (ben)     benjolin.setQuantize(index == MODE_BENJOLIN ? SCALE_SETS[activeScale].freqs : nullptr,
                                       index == MODE_BENJOLIN ? NUM_SENSORS : 0);
 
+    displaySetTimbreUsed(normalPath); // FM/Benjolin/Cracklebox/Hang replace the voice → no timbre
     displayShowMode(MODE_NAMES[index]);
     Serial.print(F("# Mode: "));
     Serial.println(MODE_NAMES[index]);
@@ -731,8 +743,18 @@ void setup()
     benjolin.setAmp(0.0f);
     crackle.setAmp(0.0f);
 
+    // Hang Bow defaults: seed every resonator with its pad's note + level (silent
+    // until its mode gates finalMix2 ch1; forces are 0 so nothing is bowed yet).
+    hangBow.setLevel(1.0f);
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        hangBow.setFreq(i, SCALE_SETS[startupScale].freqs[i]); // current scale's note per pad
+        hangBow.setForce(i, 0.0f);
+    }
+    hangBow.recalcCoupling();
+
     // Final bus — start on the normal voice path (Proximity mode).
     finalMix.gain(0, 1.0f); finalMix.gain(1, 0.0f); finalMix.gain(2, 0.0f); finalMix.gain(3, 0.0f);
+    finalMix2.gain(0, 1.0f); finalMix2.gain(1, 0.0f); // ch1 (Hang Bow) raised by its mode
 
     // Stage mixer gains
     for (int ch = 0; ch < 4; ch++)
@@ -886,7 +908,7 @@ void setup()
     Serial.println(F("# Omniphone started"));
     Serial.println(F("# Scale  (0-8, swipe L/R):  0=DKurd 1=Just 2=Overtones 3=Chromatic 4=Sad 5=Happy 6=Pentatonic 7=HarmMinor 8=Accordion"));
     Serial.println(F("# Timbre (a-i, swipe U/D):  a=Warm b=Crystal c=Edgy d=Dark e=Soft f=Shimmer g=Cry h=Juno i=Moog"));
-    Serial.println(F("# Mode   (m, long-press):   Proximity / Arp x3 / FM / FM Poly / Benjolin / Benjolin Raw / Cracklebox"));
+    Serial.println(F("# Mode   (m, long-press):   Proximity / Arp x3 / FM / FM Poly / Benjolin / Benjolin Raw / Cracklebox / Hang Bow"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -960,9 +982,10 @@ void loop()
     const bool fmPoly    = (activeMode == MODE_FM_POLY);
     const bool benActive = (activeMode == MODE_BENJOLIN || activeMode == MODE_BENJOLIN_RAW);
     const bool crkActive = (activeMode == MODE_CRACKLE);
+    const bool hangActive = (activeMode == MODE_HANG);
     // Normal voices are audible in Proximity, Arp and FM Poly (which self-FMs
-    // them); mono-FM / Benjolin / Cracklebox replace the voice path.
-    const bool normalOut = !(fmMono || benActive || crkActive);
+    // them); mono-FM / Benjolin / Cracklebox / Hang Bow replace the voice path.
+    const bool normalOut = !(fmMono || benActive || crkActive || hangActive);
 
     // ── Arpeggiator step ─────────────────────────────────────────────────────
     // In an Arp mode, advance to the next HELD pad (ascending pad index,
@@ -1187,6 +1210,21 @@ void loop()
         crackle.setCouple(CRACKLE_COUPLE * maxI);
         crackle.setAmp(n > 0 ? (0.3f + maxI * 0.7f) : 0.0f);
     }
+    // ── Hang Bow: every pad is a sympathetic resonator; proximity bows it. Pitch
+    // is live (cheap per-frame); the coupling matrix is rebuilt only while notes
+    // are still gliding to a new scale, then left alone. ────────────────────────
+    else if (hangActive)
+    {
+        static float hangFreqSum = -1.0f;
+        float sum = 0.0f;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        {
+            hangBow.setFreq(i, glideFreq[i]);
+            hangBow.setForce(i, lastIntensity[i]); // proximity = bow force (0 = un-bowed, can still ring)
+            sum += glideFreq[i];
+        }
+        if (fabsf(sum - hangFreqSum) > 0.05f) { hangBow.recalcCoupling(); hangFreqSum = sum; }
+    }
 
     // ── Batch LED update ─────────────────────────────────────────────────────
     // Current wiring (see config.h SENSORS): the ELE9 LEDs (pads 3 & 9) are on
@@ -1215,7 +1253,6 @@ void loop()
     // so the 10 s hold can't also trip a mode change.
     static uint32_t lastGestureMs = 0;
     static uint32_t holdAccum     = 0;     // cumulative down-time (lock; tolerates gaps)
-    static uint32_t contPress     = 0;     // continuous-press start (mode; resets on a gap)
     static uint32_t lastTouchMs   = 0;     // last poll the finger was seen down
     static uint32_t lastPollMs    = 0;     // for the per-poll dt
     static bool     pressActed    = false; // lock already toggled for this hold
@@ -1234,23 +1271,21 @@ void loop()
                 case GESTURE_LEFT:  loadScale((uint8_t)((activeScale + NUM_SCALE_SETS - 1) % NUM_SCALE_SETS), true); break;
                 case GESTURE_DOWN:  loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true); break;
                 case GESTURE_UP:    loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true); break;
+                case GESTURE_MODE_NEXT: loadMode((uint8_t)((activeMode + 1) % NUM_MODES)); break;
+                case GESTURE_MODE_PREV: loadMode((uint8_t)((activeMode + NUM_MODES - 1) % NUM_MODES)); break;
                 default: break;
             }
         }
 
-        // Two press timers (touch reads drop out at the round edges / glitch at
-        // 400 kHz, so neither relies on an unbroken stretch):
-        //   • contPress — continuous press for MODE; restarts after a >250 ms gap,
-        //     so rapid swipes can't accumulate into a mode change.
-        //   • holdAccum — cumulative down-time for the 10 s LOCK; tolerates gaps
-        //     up to 600 ms so an edge dropout doesn't reset the long hold.
+        // Lock hold: holdAccum is cumulative down-time, tolerating gaps up to
+        // 600 ms (touch reads drop out at the round edges) so an edge dropout
+        // doesn't reset the long hold. Mode is on the ‹ › arrows now, not a press.
         uint32_t dt  = (lastPollMs  == 0) ? 0 : (now - lastPollMs);
         uint32_t gap = (lastTouchMs == 0) ? 99999u : (now - lastTouchMs);
         lastPollMs = now;
         uint16_t fx, fy;
         if (displayPollTouch(fx, fy)) // finger down this poll
         {
-            if (gap > 250) contPress = now; // fresh contact → restart continuous timer
             holdAccum += dt;
             lastTouchMs = now;
             if (!pressActed && holdAccum >= LOCK_HOLD_MS)
@@ -1264,13 +1299,6 @@ void loop()
         }
         else // finger up this poll
         {
-            if (contPress != 0 && gap > 250) // continuous press ended → maybe cycle mode
-            {
-                uint32_t held = lastTouchMs - contPress;
-                if (!pressActed && !lockMode && held >= MODE_PRESS_MIN_MS && held < LOCK_HOLD_MS)
-                    loadMode((uint8_t)((activeMode + 1) % NUM_MODES));
-                contPress = 0;
-            }
             if (holdAccum != 0 && gap > 600) { holdAccum = 0; pressActed = false; } // hold ended
         }
     }

@@ -31,8 +31,10 @@
 
 enum DisplayGesture : uint8_t {
     GESTURE_NONE = 0, GESTURE_UP, GESTURE_DOWN, GESTURE_LEFT, GESTURE_RIGHT,
-    GESTURE_TAP,       // a single tap (tapX/tapY out-params are set)
-    GESTURE_LONGPRESS  // a long press → cycle play mode
+    GESTURE_TAP,        // a single tap (tapX/tapY out-params are set)
+    GESTURE_LONGPRESS,  // a long press → cycle play mode
+    GESTURE_MODE_PREV,  // ‹ on the mode line → previous play mode
+    GESTURE_MODE_NEXT   // › on the mode line → next play mode
 };
 
 #if ENABLE_SCREEN
@@ -65,7 +67,9 @@ inline sFONT* lineFont(uint8_t i) { return (i == LINE_TITLE || i == LINE_SCALE) 
 // round panel (left/right at the sides, up/down stacked in the centre-lower
 // area). Edges = scale, centre column = timbre, so they never overlap.
 struct TapBox { uint16_t x0, y0, x1, y1; DisplayGesture act; UWORD dbg; };
-static const TapBox TAP_BOXES[4] = {
+static const TapBox TAP_BOXES[6] = {
+    {   0,  40,  58,  83, GESTURE_MODE_PREV, CYAN    }, // ‹ mode-  (up by the mode text)
+    { 182,  40, 239,  83, GESTURE_MODE_NEXT, MAGENTA }, // › mode+
     {   0,  85,  58, 155, GESTURE_LEFT,  RED    }, // ‹ scale-
     { 182,  85, 239, 155, GESTURE_RIGHT, GREEN  }, // › scale+
     {  60, 118, 179, 193, GESTURE_UP,    BLUE   }, // ▲ timbre-
@@ -74,6 +78,7 @@ static const TapBox TAP_BOXES[4] = {
 
 static char    g_text[LINE_COUNT][20] = { {0}, {0}, {0}, {0} };
 static uint8_t g_bgLevel = 0; // background grey 0 (black) … 255 (white)
+static bool    g_timbreUsed = true; // false → hide the timbre line + ▲▼ (mode ignores it)
 
 // Lock / visualiser mode: no text, just the glow + a fuzzy 12-pad pie.
 static bool  g_locked = false;
@@ -127,9 +132,13 @@ inline bool inArrows(uint16_t x, uint16_t y)
             case 'D': return (dy >= -r && dy <= r && (dx<0?-dx:dx) * 2 <= (r - dy));
         } return false;
     };
-    if (tri(14, scy, 'L') || tri(LCD_WIDTH - 14, scy, 'R')) return true;
-    if (tri(LCD_WIDTH / 2, TIMBRE_T + 9, 'U'))              return true;
-    if (tri(LCD_WIDTH / 2, TIMBRE_T + TIMBRE_H - 9, 'D'))   return true;
+    int mcy = MODE_T + MODE_H / 2;            // mode band centre row
+    if (tri(14, mcy, 'L') || tri(LCD_WIDTH - 14, mcy, 'R')) return true; // mode ‹ ›
+    if (tri(14, scy, 'L') || tri(LCD_WIDTH - 14, scy, 'R')) return true; // scale ‹ ›
+    if (g_timbreUsed) {
+        if (tri(LCD_WIDTH / 2, TIMBRE_T + 9, 'U'))            return true;
+        if (tri(LCD_WIDTH / 2, TIMBRE_T + TIMBRE_H - 9, 'D')) return true;
+    }
     return false;
 }
 
@@ -147,6 +156,7 @@ inline bool debugBoxEdge(uint16_t x, uint16_t y, UWORD& c)
 // Compose one pixel: white glyph/arrow > (debug box) > grey background.
 inline UWORD composePixel(uint16_t x, uint16_t y, int8_t li)
 {
+    if (li == LINE_TIMBRE && !g_timbreUsed) li = -1; // mode ignores timbre → hide its line
     if (li >= 0 && glyphPixel(x, y, LINE_Y[li], LINE_H[li], g_text[li], lineFont(li))) return WHITE;
     if (inArrows(x, y)) return WHITE;
 #if SCREEN_TOUCH_DEBUG
@@ -268,6 +278,9 @@ inline void displayShowMode(const char* s)
 inline void displayShowTimbre(const char* s)
 { strncpy(g_text[LINE_TIMBRE], s, sizeof(g_text[0]) - 1); g_text[LINE_TIMBRE][sizeof(g_text[0]) - 1] = 0; markDirty(); }
 
+// Show/hide the timbre line + ▲▼ (call false for modes that ignore the timbre).
+inline void displaySetTimbreUsed(bool used) { if (used != g_timbreUsed) { g_timbreUsed = used; markDirty(); } }
+
 // Set the glow target from the average pad intensity (0..1). Cheap — just flags
 // a repaint; the work happens a strip at a time in displayRenderStep().
 inline void displaySetGlow(float avg)
@@ -340,8 +353,10 @@ inline bool displayRenderStep()
 // Map a tap position to a control: which arrow box (if any) it landed in.
 inline DisplayGesture displayTapToGesture(uint16_t x, uint16_t y)
 {
-    for (const TapBox& b : TAP_BOXES)
+    for (const TapBox& b : TAP_BOXES) {
+        if (!g_timbreUsed && (b.act == GESTURE_UP || b.act == GESTURE_DOWN)) continue; // timbre hidden
         if (x >= b.x0 && x <= b.x1 && y >= b.y0 && y <= b.y1) return b.act;
+    }
     return GESTURE_NONE;
 }
 
@@ -432,6 +447,7 @@ inline void displayBeginCanvas() {}
 inline void displayShowScale(const char*) {}
 inline void displayShowMode(const char*) {}
 inline void displayShowTimbre(const char*) {}
+inline void displaySetTimbreUsed(bool) {}
 inline void displaySetGlow(float) {}
 inline void displaySetLocked(bool) {}
 inline void displaySetPads(const float*) {}
