@@ -22,6 +22,7 @@
 #include <TFT_eSPI.h>
 
 #include "net_console.h"   // WiFi + OTA + serial-over-WiFi (Console) + secrets
+#include "screen_status.h" // on-screen WiFi status bar (drawNetStatus)
 
 // ── T-Display-S3 board pins ───────────────────────────────────────────────────
 static constexpr uint8_t PIN_LCD_POWER = 15;
@@ -149,7 +150,8 @@ void setup() {
 }
 
 void loop() {
-    Console.handle();  // service OTA + remote serial
+    Console.handle();      // service OTA + remote serial
+    drawNetStatus(tft);    // WiFi status bar (self-throttled ~1 Hz)
 
     static uint32_t lastPoll = 0;
     if (millis() - lastPoll >= 15) {   // ~66 Hz touch poll

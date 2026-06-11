@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiMulti.h>
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -28,14 +29,25 @@ public:
     bool wifiUp = false;
 
     void begin() {
+        WiFi.persistent(false);          // don't wear flash writing creds each boot
         WiFi.mode(WIFI_STA);
+        WiFi.setSleep(false);            // <<< disable WiFi modem sleep — the big one:
+                                         // modem sleep causes latency spikes / dropped
+                                         // packets → OTA stalling mid-transfer and the
+                                         // board going unreachable until a power cycle.
+        WiFi.setAutoReconnect(true);     // bring the link back if it drops
         WiFi.setHostname(OTA_HOSTNAME);
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+        // Multi-AP: join whichever known network is strongest/available.
+        _multi.addAP(WIFI_SSID, WIFI_PASSWORD);
+#if defined(WIFI_SSID2)
+        _multi.addAP(WIFI_SSID2, WIFI_PASSWORD2);
+#endif
         Serial.print(F("# WiFi: connecting"));
         uint32_t t0 = millis();
-        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+        while (_multi.run() != WL_CONNECTED && millis() - t0 < 15000) {
             Serial.print('.');
-            delay(200);
+            delay(100);
         }
         Serial.println();
 
@@ -46,7 +58,8 @@ public:
         }
         wifiUp = true;
         Serial.print(F("# WiFi: connected, IP "));
-        Serial.println(WiFi.localIP());
+        Serial.print(WiFi.localIP());
+        Serial.printf("  RSSI %d dBm  heap %u\n", WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
 
         ArduinoOTA.setHostname(OTA_HOSTNAME);
         if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -68,6 +81,18 @@ public:
     // Pump OTA and accept/maintain a single telnet client. Call every loop.
     void handle() {
         if (!wifiUp) return;
+
+        // WiFi watchdog: if the link dropped, kick a reconnect (non-blocking) so
+        // the board doesn't silently go unreachable until a power cycle.
+        static uint32_t lastCheck = 0;
+        if (millis() - lastCheck > 3000) {
+            lastCheck = millis();
+            if (WiFi.status() != WL_CONNECTED) {
+                Serial.println(F("# WiFi: link down — reconnecting…"));
+                _multi.run();   // re-pick the strongest available known AP
+            }
+        }
+
         ArduinoOTA.handle();
         WiFiClient incoming = _telnet.accept();
         if (incoming) {
@@ -133,6 +158,7 @@ public:
     }
 
 private:
+    WiFiMulti  _multi;
     WiFiServer _telnet{23};
     WiFiClient _client;
 

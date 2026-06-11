@@ -11,6 +11,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #define WIFI_SSID      "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
+// Optional extra networks — the device joins whichever known AP is strongest.
+// #define WIFI_SSID2      "SECOND_SSID"
+// #define WIFI_PASSWORD2  "SECOND_PASSWORD"
 #define TELEPLOT_HOST  ""              // IP of the machine running Teleplot, e.g. "192.168.1.20"
 
 // OTA upload password (recommended on a shared network). Must match the shell env

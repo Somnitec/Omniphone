@@ -27,11 +27,13 @@
 #include "net_console.h"   // WiFi + OTA + serial-over-WiFi (Console)
 
 // ── Hardware ──────────────────────────────────────────────────────────────────
-static MPR121 sense[NUM_SENSE_BOARDS] = {
-    MPR121(SENSE_ADDRESSES[0]),
-    MPR121(SENSE_ADDRESSES[1]),
+static MPR121 sense[NUM_BOARDS] = {
+    MPR121(BOARD_ADDRESSES[0]),
+    MPR121(BOARD_ADDRESSES[1]),
+    MPR121(BOARD_ADDRESSES[2]),
+    MPR121(BOARD_ADDRESSES[3]),
 };
-static bool senseOk[NUM_SENSE_BOARDS] = { false };
+static bool senseOk[NUM_BOARDS] = { false };
 
 // Live, web-tweakable copy of the sensor tuning (seeded from config defaults).
 static SensorSettings settings = DEFAULT_SETTINGS;
@@ -57,7 +59,7 @@ static bool i2cProbe(uint8_t addr) {
 // Scan the whole bus and list every address that ACKs. If this finds NOTHING the
 // problem is the bus itself — wrong SDA/SCL pins, no power, or missing pull-ups —
 // not the addresses. If it finds chips at unexpected addresses, fix the ADDR
-// straps / SENSE_ADDRESSES[] to match.
+// straps / BOARD_ADDRESSES[] to match.
 static void scanI2C() {
     Serial.println(F("# I2C scan:"));
     uint8_t found = 0;
@@ -73,13 +75,14 @@ static void scanI2C() {
 // again whenever the web endpoint changes a tuning value. Probes for the chip
 // first so a missing board is reported (and skipped) instead of flooding errors.
 static void initSensors() {
-    for (uint8_t b = 0; b < NUM_SENSE_BOARDS; b++) {
-        senseOk[b] = i2cProbe(SENSE_ADDRESSES[b]);
+    for (uint8_t b = 0; b < NUM_BOARDS; b++) {
+        if (SENSE_ELECTRODES[b] == 0) continue;   // chip with no sense electrodes
+        senseOk[b] = i2cProbe(BOARD_ADDRESSES[b]);
         if (senseOk[b])
             sense[b].begin(SENSE_ELECTRODES[b], settings.touchTh, settings.releaseTh,
                            settings.cdc, settings.cdt);
         Serial.printf("#   MPR121 sense %u @ 0x%02X  %s  (%u electrodes)\n",
-                      b, SENSE_ADDRESSES[b],
+                      b, BOARD_ADDRESSES[b],
                       senseOk[b] ? "OK" : "*** NOT FOUND — check wiring/addr/power",
                       SENSE_ELECTRODES[b]);
     }
@@ -88,9 +91,9 @@ static void initSensors() {
 // Burst-read both boards and update padFiltered[] / padDelta[].
 static void readSensors() {
     // filtered = 2 bytes/electrode (FILT_0L+2i), baseline = 1 byte/electrode (BASE_0+i)
-    static uint8_t filtBuf[NUM_SENSE_BOARDS][24];
-    static uint8_t baseBuf[NUM_SENSE_BOARDS][12];
-    for (uint8_t b = 0; b < NUM_SENSE_BOARDS; b++) {
+    static uint8_t filtBuf[NUM_BOARDS][24];
+    static uint8_t baseBuf[NUM_BOARDS][12];
+    for (uint8_t b = 0; b < NUM_BOARDS; b++) {
         if (!senseOk[b]) continue;          // skip absent boards (no error flood)
         const uint8_t n = SENSE_ELECTRODES[b];
         sense[b].burstRead(MPR121Reg::FILT_0L, filtBuf[b], (uint8_t)(2 * n));
@@ -197,7 +200,7 @@ void setup() {
 
     scanI2C();
     initSensors();
-    Serial.printf("# pads=%u (sense boards: %u)\n", NUM_SENSORS, NUM_SENSE_BOARDS);
+    Serial.printf("# pads=%u (MPR121 chips: %u)\n", NUM_SENSORS, NUM_BOARDS);
 
     Console.begin();                      // WiFi + OTA + remote serial (non-fatal)
     if (Console.wifiUp) startWebServer();

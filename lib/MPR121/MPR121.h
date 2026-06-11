@@ -113,8 +113,9 @@ public:
     void setAllLEDs(const uint8_t bri[6]);
 
     // Generalised path: brightness indexed by GPIO bit, where index g drives
-    // ELE(g+4). g=0 (ELE4) is ignored (it's a touch electrode); g=1..7 cover
-    // ELE5–ELE11. 0 = off, 1–15 = dim–full. Used by the main firmware.
+    // ELE(g+4) — g=0 → ELE4 (GPIO0/LED0) … g=7 → ELE11. 0 = off, 1–15 = dim–full.
+    // (ELE4 only lights when it isn't an active sense electrode.) Used by the main
+    // firmware.
     void setLEDs8(const uint8_t bri[8]);
 
     // ── Raw register access ──────────────────────────────────────────────────
