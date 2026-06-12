@@ -11,6 +11,15 @@
 #include "benjolin.h"    // Benjolin-mode chaos source
 #include "cracklebox.h"  // Cracklebox-mode chaos source
 #include "hangbow.h"     // Hang Bow mode: bowed handpan physical model
+#include "swarm.h"       // Swarm mode: additive chime cloud
+#include "grainsample.h" // Grain Hang mode: granular hang-drum sample
+#include "strings.h"     // Strings mode: looped string-section sample
+#include "bowls.h"       // Bowls mode: rubbed singing bowls
+#include "tanpura.h"     // Tanpura mode: jawari drone strings
+#include "flute.h"       // Flute mode: breath waveguide wind
+#include "cello.h"       // Cello mode: bowed-string waveguide
+#include "phasechimes.h" // Phase Chimes mode: generative phasing mallets
+#include "freezer.h"     // Freeze mode: click-free windowed freeze layer
 #include <MPR121.h>
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,10 +132,45 @@ AudioConnection fx1(fmGate,    0, finalMix, 1);
 AudioConnection fx2(benjolin,  0, finalMix, 2);
 AudioConnection fx3(crackle,   0, finalMix, 3);
 
-// finalMix2 ch0 = everything above, ch1 = Hang Bow (gated by its mode).
+// ── The calming batch: eight more engines on two sub-mixers ─────────────────
+AudioChimeSwarm  swarm;
+AudioGrainHang   grainHang;
+AudioStringPad   stringPad;
+AudioSingingBowls bowls;
+AudioTanpura     tanpura;
+AudioBreathFlute flutes;
+AudioBowedString cello;
+AudioPhaseChimes phaseChimes;
+AudioMixer4 engMixA;   // ch0 swarm, ch1 grain, ch2 strings, ch3 bowls
+AudioMixer4 engMixB;   // ch0 tanpura, ch1 flute, ch2 cello, ch3 phase chimes
+AudioConnection emA0(swarm,      0, engMixA, 0);
+AudioConnection emA1(grainHang,  0, engMixA, 1);
+AudioConnection emA2(stringPad,  0, engMixA, 2);
+AudioConnection emA3(bowls,      0, engMixA, 3);
+AudioConnection emB0(tanpura,    0, engMixB, 0);
+AudioConnection emB1(flutes,     0, engMixB, 1);
+AudioConnection emB2(cello,      0, engMixB, 2);
+AudioConnection emB3(phaseChimes,0, engMixB, 3);
+
+// finalMix2 ch0 = everything above, ch1 = Hang Bow, ch2/ch3 = the engine
+// sub-mixers (each engine's bus level is set on engMixA/B by loadMode).
 AudioMixer4 finalMix2;
 AudioConnection fx2a(finalMix, 0, finalMix2, 0);
 AudioConnection fx2b(hangBow,  0, finalMix2, 1);
+AudioConnection fx2c(engMixA,  0, finalMix2, 2);
+AudioConnection fx2d(engMixB,  0, finalMix2, 3);
+
+// ── Cathedral / Freeze: stock effects on the summed bus ─────────────────────
+// fxMix ch0 = dry (always 1), ch1 = freeverb wet (Cathedral), ch2 = granular
+// frozen layer (Freeze). The dry path stays untouched in every other mode.
+AudioEffectFreeverb  freeverb;
+AudioFreezeSmear     freezer; // windowed grain-cloud freeze (no loop ticking)
+AudioMixer4 fxMix;
+AudioConnection fxd(finalMix2, 0, fxMix,    0);
+AudioConnection fxv(finalMix2, 0, freeverb, 0);
+AudioConnection fxw(freeverb,  0, fxMix,    1);
+AudioConnection fxg(finalMix2, 0, freezer,  0);
+AudioConnection fxz(freezer,   0, fxMix,    2);
 
 // Chorus send on the final bus (for the Juno timbre's ensemble shimmer).
 AudioEffectChorus chorus;
@@ -137,7 +181,9 @@ static short chorusDelayLine[CHORUS_DELAY_LEN];
 // channels drive a balanced differential line out (L−R = 2× signal, common-
 // mode noise cancels). The chorus sits between the final mix and the split.
 AudioAmplifier  rInv;
-AudioConnection pmC (finalMix2, 0, chorus, 0);
+AudioAmplifier  masterVol;  // ONE global volume for everything (MASTER_VOLUME)
+AudioConnection pmV (fxMix,     0, masterVol, 0);
+AudioConnection pmC (masterVol, 0, chorus,    0);
 AudioConnection pmL (chorus,   0, i2sOut, 0);
 AudioConnection pmRa(chorus,   0, rInv,   0);
 AudioConnection pmR (rInv,     0, i2sOut, 1);
@@ -330,6 +376,7 @@ static void loadScale(uint8_t index, bool glide)
 
     if (activeMode == MODE_BENJOLIN) // keep the chaos quantiser on the new scale
         benjolin.setQuantize(sc.freqs, NUM_SENSORS);
+    phaseChimes.setScale(sc.freqs, NUM_SENSORS); // pattern notes follow the scale
 
     displayShowScale(sc.name); // incremental redraw of just the scale line
     Serial.print(F("# Scale: "));
@@ -383,6 +430,38 @@ static void loadTimbre(uint8_t index, bool glide)
 
 // Play mode — Proximity / Arp Slow / Med / Fast. Tap the screen centre (or
 // serial 'm') to cycle. Persisted across power-off.
+// Freeze-mode state: whether a frozen layer is currently captured, and its
+// fade envelope (slewed each frame, drives fxMix ch2).
+static bool  frzFrozen = false;
+static float frzEnv    = 0.0f;
+
+// Decay setting for Swarm/Strings. In those modes it takes over the TIMBRE
+// line (which they don't use): the line reads "Decay 1.2s" and the same ▲▼
+// arrows adjust it instead of cycling timbres.
+static float swarmDecay = 1.2f;   // Swarm ring-out, seconds
+static float stringsRel = 0.6f;   // Strings release, seconds
+
+static void showDecayParam()
+{
+    char buf[20];
+    float v = (activeMode == MODE_SWARM) ? swarmDecay : stringsRel;
+    snprintf(buf, sizeof(buf), "Decay %.1fs", (double)v);
+    displayShowTimbre(buf);
+}
+
+static void adjustDecay(bool up)
+{
+    float mul = up ? 1.3f : (1.0f / 1.3f);
+    if (activeMode == MODE_SWARM) {
+        swarmDecay = constrain(swarmDecay * mul, 0.2f, 8.0f);
+        swarm.setDecay(swarmDecay);
+    } else {
+        stringsRel = constrain(stringsRel * mul, 0.15f, 6.0f);
+        stringPad.setRelease(stringsRel);
+    }
+    showDecayParam();
+}
+
 static void loadMode(uint8_t index)
 {
     if (index >= NUM_MODES) return;
@@ -393,25 +472,58 @@ static void loadMode(uint8_t index)
     const bool ben    = (index == MODE_BENJOLIN || index == MODE_BENJOLIN_RAW);
     const bool crk    = (index == MODE_CRACKLE);
     const bool hang   = (index == MODE_HANG);
-    // Normal voice path is used by Proximity, Arp, AND FM Poly (which self-FMs
-    // the voices). mono-FM / Benjolin / Cracklebox / Hang Bow replace it.
-    const bool normalPath = !(fmMono || ben || crk || hang);
+    const bool swm = (index == MODE_SWARM),   grn = (index == MODE_GRAIN);
+    const bool str = (index == MODE_STRINGS), tan = (index == MODE_TANPURA);
+    const bool bwl = (index == MODE_BOWLS),   flu = (index == MODE_FLUTE);
+    const bool cel = (index == MODE_CELLO),   pch = (index == MODE_PHASE);
+    const bool cat = (index == MODE_CATHEDRAL), frz = (index == MODE_FREEZE);
+    // Normal voice path is used by Proximity, Arp, FM Poly (which self-FMs the
+    // voices) AND Cathedral/Freeze (which post-process it). The engine modes
+    // replace it entirely.
+    const bool normalPath = !(fmMono || ben || crk || hang ||
+                              swm || grn || str || tan || bwl || flu || cel || pch);
 
-    finalMix.gain(0, normalPath ? 1.0f : 0.0f);     // normal voices (+ FM Poly)
+    finalMix.gain(0, normalPath ? 1.0f : 0.0f);     // normal voices (+ FM Poly, Cathedral, Freeze)
     finalMix.gain(1, fmMono ? FM_LEVEL       : 0.0f); // mono FM carrier
     finalMix.gain(2, ben    ? BENJOLIN_LEVEL : 0.0f); // Benjolin
     finalMix.gain(3, crk    ? CRACKLE_LEVEL  : 0.0f); // Cracklebox
     finalMix2.gain(1, hang  ? HANG_LEVEL     : 0.0f); // Hang Bow
+    engMixA.gain(0, swm ? SWARM_LEVEL   : 0.0f);
+    engMixA.gain(1, grn ? GRAIN_LEVEL   : 0.0f);
+    engMixA.gain(2, str ? STRINGS_LEVEL : 0.0f);
+    engMixA.gain(3, bwl ? BOWLS_LEVEL   : 0.0f);
+    engMixB.gain(0, tan ? TANPURA_LEVEL : 0.0f);
+    engMixB.gain(1, flu ? FLUTE_LEVEL   : 0.0f);
+    engMixB.gain(2, cel ? CELLO_LEVEL   : 0.0f);
+    engMixB.gain(3, pch ? PHASE_LEVEL   : 0.0f);
+    fxMix.gain(1, cat ? CATHEDRAL_WET : 0.0f);      // reverb wet (Cathedral only)
+    fxMix.gain(2, 0.0f);                            // frozen layer (driven per-frame)
 
     arpCurrentPad = 0xFF; arpNextTickMs = millis();
     if (!fmMono) fmDc.amplitude(0.0f, 8.0f); // hush the mono carrier when leaving FM
     if (!ben)    benjolin.setAmp(0.0f);      // hush the chaos when leaving Benjolin
     if (!crk)    crackle.setAmp(0.0f);
-    if (!hang)   for (uint8_t i = 0; i < NUM_SENSORS; i++) hangBow.setForce(i, 0.0f); // let it ring out
+    // Drop every inactive engine's forces to zero — they ring out, then idle.
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        if (!hang) hangBow.setForce(i, 0.0f);
+        if (!swm)  swarm.setForce(i, 0.0f);
+        if (!grn)  grainHang.setForce(i, 0.0f);
+        if (!str)  stringPad.setForce(i, 0.0f);
+        if (!bwl)  bowls.setForce(i, 0.0f);
+        if (!flu)  flutes.setForce(i, 0.0f);
+        if (!cel)  cello.setForce(i, 0.0f);
+        if (!pch)  phaseChimes.setForce(i, 0.0f);
+    }
+    if (!frz) { freezer.freeze(false); frzFrozen = false; frzEnv = 0.0f; }
     if (ben)     benjolin.setQuantize(index == MODE_BENJOLIN ? SCALE_SETS[activeScale].freqs : nullptr,
                                       index == MODE_BENJOLIN ? NUM_SENSORS : 0);
 
-    displaySetTimbreUsed(normalPath); // FM/Benjolin/Cracklebox/Hang replace the voice → no timbre
+    // The timbre line shows the timbre where it applies, and doubles as the
+    // Decay control (same ▲▼) in Swarm/Strings. Other engine modes hide it.
+    displaySetTimbreUsed(normalPath || cat || frz || swm || str);
+    if      (swm) { swarm.setDecay(swarmDecay);       showDecayParam(); }
+    else if (str) { stringPad.setRelease(stringsRel); showDecayParam(); }
+    else if (normalPath || cat || frz) displayShowTimbre(TIMBRE_SETS[activeTimbre].name);
     displayShowMode(MODE_NAMES[index]);
     Serial.print(F("# Mode: "));
     Serial.println(MODE_NAMES[index]);
@@ -722,7 +834,7 @@ void setup()
     }
 
     // ── Teensy Audio ─────────────────────────────────────────────────────────
-    AudioMemory(170); // 12 voices (+FM mod osc) + 12 bells + FM bus + Benjolin + Cracklebox
+    AudioMemory(230); // 12 voices (+FM mod osc) + 12 bells + FM bus + all engines + fx
 
     // Chorus send — starts dry (voices(1) = pass-through); loadTimbre() bumps
     // the voice count for chorused timbres (Juno).
@@ -743,18 +855,29 @@ void setup()
     benjolin.setAmp(0.0f);
     crackle.setAmp(0.0f);
 
-    // Hang Bow defaults: seed every resonator with its pad's note + level (silent
-    // until its mode gates finalMix2 ch1; forces are 0 so nothing is bowed yet).
+    // Hang Bow / Bowls defaults: seed every resonator with its pad's note (silent
+    // until their modes gate them; forces are 0 so nothing is bowed yet).
     hangBow.setLevel(1.0f);
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
-        hangBow.setFreq(i, SCALE_SETS[startupScale].freqs[i]); // current scale's note per pad
+        float f0 = SCALE_SETS[startupScale].freqs[i]; // current scale's note per pad
+        hangBow.setFreq(i, f0);
         hangBow.setForce(i, 0.0f);
+        bowls.setFreq(i, f0);
     }
     hangBow.recalcCoupling();
+    bowls.recalcCoupling();
+
+    // Cathedral / Freeze effects (silent until their modes raise the fx gains).
+    freeverb.roomsize(CATHEDRAL_ROOMSIZE);
+    freeverb.damping(CATHEDRAL_DAMPING);
 
     // Final bus — start on the normal voice path (Proximity mode).
     finalMix.gain(0, 1.0f); finalMix.gain(1, 0.0f); finalMix.gain(2, 0.0f); finalMix.gain(3, 0.0f);
     finalMix2.gain(0, 1.0f); finalMix2.gain(1, 0.0f); // ch1 (Hang Bow) raised by its mode
+    finalMix2.gain(2, 1.0f); finalMix2.gain(3, 1.0f); // engine sub-mixers (levels set there)
+    for (uint8_t ch = 0; ch < 4; ch++) { engMixA.gain(ch, 0.0f); engMixB.gain(ch, 0.0f); }
+    fxMix.gain(0, 1.0f); fxMix.gain(1, 0.0f); fxMix.gain(2, 0.0f); fxMix.gain(3, 0.0f);
+    masterVol.gain(MASTER_VOLUME);
 
     // Stage mixer gains
     for (int ch = 0; ch < 4; ch++)
@@ -767,7 +890,10 @@ void setup()
     for (int ch = 0; ch < 3; ch++)
         masterMix.gain(ch, MASTER_GAIN);
     masterMix.gain(3, BELL_MIX); // ch 3 = summed bell voices
-    rInv.gain(-1.0f);            // I2S right = inverted master → balanced output
+    // Output polarity (config.h OUTPUT_BALANCED): -1 = differential/balanced
+    // pair, +1 = normal unbalanced stereo. Unbalanced is the default — the
+    // inverted right channel cancels (≈silence) when summed on ordinary gear.
+    rInv.gain(OUTPUT_BALANCED ? -1.0f : 1.0f);
 
     // Bell voices
     for (uint8_t k = 0; k < NUM_BELLS; k++)
@@ -908,7 +1034,8 @@ void setup()
     Serial.println(F("# Omniphone started"));
     Serial.println(F("# Scale  (0-8, swipe L/R):  0=DKurd 1=Just 2=Overtones 3=Chromatic 4=Sad 5=Happy 6=Pentatonic 7=HarmMinor 8=Accordion"));
     Serial.println(F("# Timbre (a-i, swipe U/D):  a=Warm b=Crystal c=Edgy d=Dark e=Soft f=Shimmer g=Cry h=Juno i=Moog"));
-    Serial.println(F("# Mode   (m, long-press):   Proximity / Arp x3 / FM / FM Poly / Benjolin / Benjolin Raw / Cracklebox / Hang Bow"));
+    Serial.println(F("# Mode   (m, mode arrows):  Proximity / Arp x3 / FM / FM Poly / Benjolin x2 / Cracklebox / Hang Bow"));
+    Serial.println(F("#                           Swarm / Grain Hang / Strings / Cathedral / Freeze / Tanpura / Bowls / Flute / Cello / Phase Chimes"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -983,9 +1110,20 @@ void loop()
     const bool benActive = (activeMode == MODE_BENJOLIN || activeMode == MODE_BENJOLIN_RAW);
     const bool crkActive = (activeMode == MODE_CRACKLE);
     const bool hangActive = (activeMode == MODE_HANG);
-    // Normal voices are audible in Proximity, Arp and FM Poly (which self-FMs
-    // them); mono-FM / Benjolin / Cracklebox / Hang Bow replace the voice path.
-    const bool normalOut = !(fmMono || benActive || crkActive || hangActive);
+    const bool swmActive = (activeMode == MODE_SWARM);
+    const bool grnActive = (activeMode == MODE_GRAIN);
+    const bool strActive = (activeMode == MODE_STRINGS);
+    const bool tanActive = (activeMode == MODE_TANPURA);
+    const bool bwlActive = (activeMode == MODE_BOWLS);
+    const bool fluActive = (activeMode == MODE_FLUTE);
+    const bool celActive = (activeMode == MODE_CELLO);
+    const bool pchActive = (activeMode == MODE_PHASE);
+    const bool frzActive = (activeMode == MODE_FREEZE);
+    // Normal voices are audible in Proximity, Arp, FM Poly, Cathedral and
+    // Freeze; the engine modes replace the voice path entirely.
+    const bool normalOut = !(fmMono || benActive || crkActive || hangActive ||
+                             swmActive || grnActive || strActive || tanActive ||
+                             bwlActive || fluActive || celActive || pchActive);
 
     // ── Arpeggiator step ─────────────────────────────────────────────────────
     // In an Arp mode, advance to the next HELD pad (ascending pad index,
@@ -1142,6 +1280,11 @@ void loop()
         }
     }
 
+    // Per-pad history for the engine modes: previous (gated) intensity for
+    // approach-velocity & full-touch edges, plus the Strings dynamics memory.
+    static float prevInt[NUM_SENSORS] = { 0 };
+    static float strDyn [NUM_SENSORS] = { 0 };
+
     // ── Held pads, sorted by press order (for FM / Benjolin / Cracklebox) ────
     uint8_t order[NUM_SENSORS];
     uint8_t nHeld = 0;
@@ -1220,11 +1363,91 @@ void loop()
         for (uint8_t i = 0; i < NUM_SENSORS; i++)
         {
             hangBow.setFreq(i, glideFreq[i]);
-            hangBow.setForce(i, lastIntensity[i]); // proximity = bow force (0 = un-bowed, can still ring)
+            hangBow.setForce(i, lastIntensity[i] < INTENSITY_GATE ? 0.0f : lastIntensity[i]);
             sum += glideFreq[i];
         }
         if (fabsf(sum - hangFreqSum) > 0.05f) { hangBow.recalcCoupling(); hangFreqSum = sum; }
     }
+    // ── Bowls: same shape as Hang Bow (modal + coupling matrix), bowl voicing ─
+    else if (bwlActive)
+    {
+        static float bowlFreqSum = -1.0f;
+        float sum = 0.0f;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        {
+            bowls.setFreq(i, glideFreq[i]);
+            bowls.setForce(i, lastIntensity[i] < INTENSITY_GATE ? 0.0f : lastIntensity[i]);
+            sum += glideFreq[i];
+        }
+        if (fabsf(sum - bowlFreqSum) > 0.05f) { bowls.recalcCoupling(); bowlFreqSum = sum; }
+    }
+    // ── Swarm / Grain / Strings / Flute / Cello / Phase / Tanpura ────────────
+    // All proximity-per-pad, with a noise gate (no ghost notes from baseline
+    // wobble) and approach-velocity tracking: Strings turn it into dynamics,
+    // Phase Chimes & Tanpura fire on the full-touch edge.
+    else if (swmActive || grnActive || strActive || fluActive || celActive ||
+             pchActive || tanActive)
+    {
+        const float dtS = (float)UPDATE_MS / 1000.0f;
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        {
+            float f   = glideFreq[i];
+            float in  = (lastIntensity[i] < INTENSITY_GATE) ? 0.0f : lastIntensity[i];
+            float vel = (in - prevInt[i]) / dtS;             // intensity per second
+            bool  fullTouch = (in >= 0.97f && prevInt[i] < 0.97f);
+            if      (swmActive) { swarm.setFreq(i, f);     swarm.setForce(i, in); }
+            else if (grnActive) { grainHang.setFreq(i, f); grainHang.setForce(i, in); }
+            else if (strActive)
+            {
+                // Approach velocity → dynamics: dive in fast for a full-voiced
+                // accent, drift in slowly for a hushed swell.
+                if (vel > 0.0f) { float a = vel / 6.0f; if (a > 1.0f) a = 1.0f;
+                                  if (a > strDyn[i]) strDyn[i] = a; }
+                if (in <= 0.0f) strDyn[i] *= 0.985f;          // forget between notes
+                stringPad.setFreq(i, f);
+                stringPad.setForce(i, in * (0.35f + 0.65f * strDyn[i]));
+            }
+            else if (fluActive) { flutes.setFreq(i, f); flutes.setForce(i, in); }
+            else if (celActive) { cello.setFreq(i, f);  cello.setForce(i, in); }
+            else if (pchActive)
+            {
+                if (fullTouch) {                              // mallet strikes NOW;
+                    float a = vel / 8.0f;                     // approach speed sets
+                    if (a > 1.0f) a = 1.0f; if (a < 0.0f) a = 0.0f; // the loop tempo
+                    phaseChimes.trigger(i, 0.15f + 1.05f * (1.0f - a));
+                }
+                phaseChimes.setForce(i, in);                  // hold/release the layer
+            }
+            else // tanpura: pluck the string the moment the pad reaches full touch
+            {
+                if (fullTouch) {
+                    float a = vel / 8.0f;
+                    if (a > 1.0f) a = 1.0f; if (a < 0.15f) a = 0.15f;
+                    tanpura.pluck(f, a);
+                }
+            }
+        }
+    }
+    // ── Freeze: press hard to capture the sound; the layer fades after release ─
+    else if (frzActive)
+    {
+        if (!frzFrozen && maxI > FREEZE_TRIGGER)
+        {
+            freezer.freeze(true);
+            frzFrozen = true;
+        }
+        if (frzFrozen)
+        {
+            float tgt = (nHeld > 0) ? 1.0f : 0.0f;     // hold to sustain, release to fade
+            frzEnv += (tgt > frzEnv ? 0.15f : 0.012f) * (tgt - frzEnv);
+            fxMix.gain(2, FREEZE_LAYER * frzEnv);
+            if (frzEnv < 0.01f && nHeld == 0) { freezer.freeze(false); frzFrozen = false; }
+        }
+    }
+
+    // Gated intensities become last frame's reference for velocity/edge detection.
+    for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        prevInt[i] = (lastIntensity[i] < INTENSITY_GATE) ? 0.0f : lastIntensity[i];
 
     // ── Batch LED update ─────────────────────────────────────────────────────
     // Current wiring (see config.h SENSORS): the ELE9 LEDs (pads 3 & 9) are on
@@ -1269,8 +1492,14 @@ void loop()
             {
                 case GESTURE_RIGHT: loadScale((uint8_t)((activeScale + 1) % NUM_SCALE_SETS), true); break;
                 case GESTURE_LEFT:  loadScale((uint8_t)((activeScale + NUM_SCALE_SETS - 1) % NUM_SCALE_SETS), true); break;
-                case GESTURE_DOWN:  loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true); break;
-                case GESTURE_UP:    loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true); break;
+                case GESTURE_DOWN:  // ▼: timbre+ — or shorter Decay in Swarm/Strings
+                    if (activeMode == MODE_SWARM || activeMode == MODE_STRINGS) adjustDecay(false);
+                    else loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true);
+                    break;
+                case GESTURE_UP:    // ▲: timbre- — or longer Decay in Swarm/Strings
+                    if (activeMode == MODE_SWARM || activeMode == MODE_STRINGS) adjustDecay(true);
+                    else loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true);
+                    break;
                 case GESTURE_MODE_NEXT: loadMode((uint8_t)((activeMode + 1) % NUM_MODES)); break;
                 case GESTURE_MODE_PREV: loadMode((uint8_t)((activeMode + NUM_MODES - 1) % NUM_MODES)); break;
                 default: break;
@@ -1309,6 +1538,19 @@ void loop()
     // but one-strip-per-frame is the proven-good arrangement, so keep it).
     displayRenderStep();
 
+    // ── Tiny cpu/mem readout, bottom middle of the screen (1 Hz) ─────────────
+    {
+        static uint32_t lastStatsMs = 0;
+        static char     lastStats[16] = "";
+        if (now - lastStatsMs >= 1000)
+        {
+            lastStatsMs = now;
+            char sb[16];
+            snprintf(sb, sizeof(sb), "%d%% %d",
+                     (int)(AudioProcessorUsage() + 0.5f), AudioMemoryUsage());
+            if (strcmp(sb, lastStats) != 0) { strcpy(lastStats, sb); displayShowStats(sb); }
+        }
+    }
 
     // ── Teleplot readout (toggle with serial 't') ───────────────────────────
     // First the engine load (cpu %, mem blocks), then per pad: raw (MPR121

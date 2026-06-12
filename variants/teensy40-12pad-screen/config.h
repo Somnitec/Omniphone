@@ -253,7 +253,7 @@ namespace JI {
 // ── Scale sets (swipe LEFT/RIGHT to cycle) ───────────────────────────────────
 // What note each pad plays. Pitch only — no timbre. freqs[] is in SENSORS[]
 // order: idx11 is the 12th pad.
-static constexpr uint8_t NUM_SCALE_SETS = 9;
+static constexpr uint8_t NUM_SCALE_SETS = 11;
 
 static const ScaleSet SCALE_SETS[NUM_SCALE_SETS] = {
     // 0: Hangdrum / D Kurd — D minor, voiced as STACKED THIRDS so any 3 adjacent
@@ -315,6 +315,21 @@ static const ScaleSet SCALE_SETS[NUM_SCALE_SETS] = {
       { Note::C4, Note::D4, Note::E4, Note::Gb4, Note::Ab4, Note::Bb4,
       //  lower ring (6–11): the other whole-tone (semitone-shifted)
         Note::Db4, Note::Eb4, Note::F4, Note::G4, Note::A4, Note::B4 } },
+
+    // 9: Chords I IV V (D major) — chord FUNCTIONS side by side: pads 0–3 are
+    // the I chord (D), 4–7 the IV (G), 8–11 the V (A). Sweep a region with a
+    // flat hand for a full chord; walking around the circle is I → IV → V → I.
+    { "Chords I IV V",
+      { Note::D3, Note::Gb3, Note::A3, Note::D4,     // I:  D  F# A  D
+        Note::G3, Note::B3,  Note::D4, Note::G4,     // IV: G  B  D  G
+        Note::A3, Note::Db4, Note::E4, Note::A4 } }, // V:  A  C# E  A
+
+    // 10: Jazz ii V I (D major, 7th chords) — pads 0–3 = Dmaj7 (I), 4–7 = Em7
+    // (ii), 8–11 = A7 (V); circling gives the endless ii–V–I turnaround.
+    { "Jazz ii V I",
+      { Note::D3, Note::Gb3, Note::A3, Note::Db4,    // I:  Dmaj7
+        Note::E3, Note::G3,  Note::B3, Note::D4,     // ii: Em7
+        Note::A3, Note::Db4, Note::E4, Note::G4 } }, // V:  A7
 };
 
 // ── Timbre sets (swipe UP/DOWN to cycle) ─────────────────────────────────────
@@ -357,14 +372,28 @@ static const TimbreSet TIMBRE_SETS[NUM_TIMBRE_SETS] = {
 // version snaps the rungler to the active scale, "Raw" runs free.
 enum PlayMode : uint8_t {
     MODE_PROX = 0, MODE_ARP_SLOW, MODE_ARP_MED, MODE_ARP_FAST,
-    MODE_FM, MODE_FM_POLY, MODE_BENJOLIN, MODE_BENJOLIN_RAW, MODE_CRACKLE, MODE_HANG
+    MODE_FM, MODE_FM_POLY, MODE_BENJOLIN, MODE_BENJOLIN_RAW, MODE_CRACKLE, MODE_HANG,
+    // The "calming/beautiful" batch (each has its own engine header):
+    MODE_SWARM,      // additive chime swarm — brushing a magical mobile
+    MODE_GRAIN,      // granular hang-drum sample, proximity-bowed (samples/)
+    MODE_STRINGS,    // looped string-section sample, ensemble pads (samples/)
+    MODE_CATHEDRAL,  // normal voices into a huge reverb space
+    MODE_FREEZE,     // normal voices; press hard to freeze the sound in the air
+    MODE_TANPURA,    // jawari drone strings cycling the held notes
+    MODE_BOWLS,      // rubbed singing bowls with beating partials
+    MODE_FLUTE,      // breath-pressure waveguide wind
+    MODE_CELLO,      // stick-slip bowed-string waveguide
+    MODE_PHASE       // Reich-ish phasing mallet loops (generative)
 };
-static constexpr uint8_t NUM_MODES = 10;
+static constexpr uint8_t NUM_MODES = 20;
 static const char* const MODE_NAMES[NUM_MODES] =
     { "Proximity", "Arp Slow", "Arp Med", "Arp Fast",
-      "FM", "FM Poly", "Benjolin", "Benjolin Raw", "Cracklebox", "Hang Bow" };
+      "FM", "FM Poly", "Benjolin", "Benjolin Raw", "Cracklebox", "Hang Bow",
+      "Swarm", "Grain Hang", "Strings", "Cathedral", "Freeze",
+      "Tanpura", "Bowls", "Flute", "Cello", "Phase Chimes" };
 static constexpr float MODE_ARP_PERIOD_MS[NUM_MODES] =
-    { 0.0f, 360.0f, 180.0f, 90.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+    { 0.0f, 360.0f, 180.0f, 90.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
 static constexpr float ARP_HOLD_INTENSITY = 0.10f; // pad counts as "held" above this
 
 // ── FM modes ─────────────────────────────────────────────────────────────────
@@ -401,6 +430,30 @@ static constexpr float CRACKLE_COUPLE = 0.9f;  // max cross-coupling (× proximi
 // pads are sympathetic resonators; proximity bows them. This is just the bus level.
 static constexpr float HANG_LEVEL = 1.0f;
 
+// ── Engine-mode bus levels ───────────────────────────────────────────────────
+// One knob per new mode — the engines' voicing constants live in their headers
+// (swarm.h, grainsample.h, strings.h, bowls.h, tanpura.h, flute.h, cello.h,
+// phasechimes.h); these only set how loud each sits on the final bus.
+static constexpr float SWARM_LEVEL    = 0.85f;
+static constexpr float GRAIN_LEVEL    = 0.95f;
+static constexpr float STRINGS_LEVEL  = 0.85f;
+static constexpr float TANPURA_LEVEL  = 0.90f;
+static constexpr float BOWLS_LEVEL    = 1.00f;
+static constexpr float FLUTE_LEVEL    = 0.55f;
+static constexpr float CELLO_LEVEL    = 0.70f;
+static constexpr float PHASE_LEVEL    = 0.35f;
+// Cathedral: normal voices + a huge reverb. Freeze: normal voices + a frozen
+// spectral layer captured when you press hard (release lets it fade).
+static constexpr float CATHEDRAL_WET      = 0.55f; // reverb level on the bus
+static constexpr float CATHEDRAL_ROOMSIZE = 0.89f; // 0..1 — bigger = longer tail
+static constexpr float CATHEDRAL_DAMPING  = 0.45f; // 0..1 — higher = darker tail (also less hiss)
+static constexpr float FREEZE_LAYER       = 0.85f; // frozen-layer level on the bus
+static constexpr float FREEZE_TRIGGER     = 0.75f; // press intensity that captures
+
+// Engines ignore intensities below this — keeps MPR121 baseline wobble from
+// randomly striking ghost notes in the swarm/chime/pluck modes.
+static constexpr float INTENSITY_GATE = 0.06f;
+
 // ── Touch-screen press timing ────────────────────────────────────────────────
 static constexpr uint32_t MODE_PRESS_MIN_MS = 550;   // (unused — mode is on the ‹ › arrows now)
 static constexpr uint32_t LOCK_HOLD_MS      = 5000;  // hold this long → toggle lock/visualiser
@@ -415,7 +468,18 @@ static constexpr float VOICE_MAX_AMP      = 0.45f; // max DC level per voice (pr
 
 // Mixer gain structure
 static constexpr float STAGE_GAIN  = 0.25f; // per-channel gain in stage mixers
-static constexpr float MASTER_GAIN = 0.7f;  // per-channel gain in master mixer
+static constexpr float MASTER_GAIN = 0.7f;  // per-channel gain in master mixer (voice path only)
+
+// ONE global volume for the whole instrument — every mode, voices and engines
+// alike (a final amplifier just before the output). Raise above 1.0 with care:
+// many simultaneous voices can clip.
+static constexpr float MASTER_VOLUME = 1.0f;
+
+// Output polarity. 1 = balanced/differential (R = inverted L; for a true
+// balanced DI/line input — but it CANCELS TO SILENCE if L+R are summed to mono
+// or played on normal stereo gear). 0 = normal unbalanced stereo (same polarity
+// both channels) — use this with ordinary mixers/amps/speakers.
+#define OUTPUT_BALANCED 0
 
 // Amplitude envelope (DC ramp)
 static constexpr float AMP_RAMP_MS = 8.0f;  // matches UPDATE_MS — smooth ramp

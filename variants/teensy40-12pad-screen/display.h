@@ -48,20 +48,24 @@ enum DisplayGesture : uint8_t {
 #include "Touch_Driver.h"
 #include "GUI_Paint.h"
 
-// ── Layout: title / mode / scale (centred) / timbre ──────────────────────────
+// ── Layout: title(/param) / mode / scale (centred) / timbre / stats ──────────
 static constexpr uint16_t TITLE_T  = 10,  TITLE_H  = 26;
 static constexpr uint16_t MODE_T   = 54,  MODE_H   = 30;
 static constexpr uint16_t SCALE_T  = 92,  SCALE_H  = 52;  // centred on ~118 ≈ screen mid
-static constexpr uint16_t TIMBRE_T = 156, TIMBRE_H = 60;
-enum { LINE_TITLE = 0, LINE_MODE, LINE_SCALE, LINE_TIMBRE, LINE_COUNT };
+static constexpr uint16_t TIMBRE_T = 156, TIMBRE_H = 48;
+static constexpr uint16_t STATS_T  = 206, STATS_H  = 18;  // small cpu/mem readout, bottom middle
+enum { LINE_TITLE = 0, LINE_MODE, LINE_SCALE, LINE_TIMBRE, LINE_STATS, LINE_COUNT };
 
 static constexpr uint16_t GLOW_STRIP   = 30;            // rows streamed per render step
 static constexpr uint32_t SCREEN_SPI_HZ = 40000000;    // GC9A01 SPI clock (proven-safe alongside audio)
 
 namespace {
-static const uint16_t LINE_Y[LINE_COUNT] = { TITLE_T, MODE_T, SCALE_T, TIMBRE_T };
-static const uint16_t LINE_H[LINE_COUNT] = { TITLE_H, MODE_H, SCALE_H, TIMBRE_H };
-inline sFONT* lineFont(uint8_t i) { return (i == LINE_TITLE || i == LINE_SCALE) ? &Font20 : &Font16; }
+static const uint16_t LINE_Y[LINE_COUNT] = { TITLE_T, MODE_T, SCALE_T, TIMBRE_T, STATS_T };
+static const uint16_t LINE_H[LINE_COUNT] = { TITLE_H, MODE_H, SCALE_H, TIMBRE_H, STATS_H };
+inline sFONT* lineFont(uint8_t i) {
+    if (i == LINE_STATS) return &Font16;   // (the lib ships no Font12 definition)
+    return (i == LINE_TITLE || i == LINE_SCALE) ? &Font20 : &Font16;
+}
 
 // Tap targets, one box per arrow — sized to where presses actually land on this
 // round panel (left/right at the sides, up/down stacked in the centre-lower
@@ -76,7 +80,7 @@ static const TapBox TAP_BOXES[6] = {
     {  60, 194, 179, 239, GESTURE_DOWN,  YELLOW }, // ▼ timbre+
 };
 
-static char    g_text[LINE_COUNT][20] = { {0}, {0}, {0}, {0} };
+static char    g_text[LINE_COUNT][20] = { {0} };
 static uint8_t g_bgLevel = 0; // background grey 0 (black) … 255 (white)
 static bool    g_timbreUsed = true; // false → hide the timbre line + ▲▼ (mode ignores it)
 
@@ -281,6 +285,10 @@ inline void displayShowTimbre(const char* s)
 // Show/hide the timbre line + ▲▼ (call false for modes that ignore the timbre).
 inline void displaySetTimbreUsed(bool used) { if (used != g_timbreUsed) { g_timbreUsed = used; markDirty(); } }
 
+// Small cpu/mem readout at the bottom middle (call only when the text changes).
+inline void displayShowStats(const char* s)
+{ strncpy(g_text[LINE_STATS], s, sizeof(g_text[0]) - 1); g_text[LINE_STATS][sizeof(g_text[0]) - 1] = 0; markDirty(); }
+
 // Set the glow target from the average pad intensity (0..1). Cheap — just flags
 // a repaint; the work happens a strip at a time in displayRenderStep().
 inline void displaySetGlow(float avg)
@@ -448,6 +456,7 @@ inline void displayShowScale(const char*) {}
 inline void displayShowMode(const char*) {}
 inline void displayShowTimbre(const char*) {}
 inline void displaySetTimbreUsed(bool) {}
+inline void displayShowStats(const char*) {}
 inline void displaySetGlow(float) {}
 inline void displaySetLocked(bool) {}
 inline void displaySetPads(const float*) {}
