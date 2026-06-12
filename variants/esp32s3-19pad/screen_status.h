@@ -18,8 +18,11 @@ inline void drawNetStatus(TFT_eSPI& tft, bool force = false) {
     last = millis();
 
     bool up = (WiFi.status() == WL_CONNECTED);
-    uint16_t bg = up ? TFT_DARKGREEN : TFT_RED;
-    tft.fillRect(0, 0, tft.width(), 20, bg);
+    // In diagnostics the device is always pursuing WiFi (background connect +
+    // auto-reconnect), so "not connected" means "connecting", not "disconnected".
+    uint16_t bg = up ? TFT_DARKGREEN : TFT_ORANGE;
+    int16_t y = tft.height() - 20;          // bar along the bottom of the screen
+    tft.fillRect(0, y, tft.width(), 20, bg);
     tft.setTextDatum(TL_DATUM);
     tft.setTextColor(TFT_WHITE, bg);
     tft.setTextFont(2);
@@ -29,6 +32,6 @@ inline void drawNetStatus(TFT_eSPI& tft, bool force = false) {
         snprintf(line, sizeof(line), "%s  %d dBm  %s",
                  OTA_HOSTNAME, (int)WiFi.RSSI(), WiFi.localIP().toString().c_str());
     else
-        snprintf(line, sizeof(line), "WiFi disconnected  (%s)", OTA_HOSTNAME);
-    tft.drawString(line, 4, 2);
+        snprintf(line, sizeof(line), "WiFi connecting...  (%s)", OTA_HOSTNAME);
+    tft.drawString(line, 4, y + 2);
 }

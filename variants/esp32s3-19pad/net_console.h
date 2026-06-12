@@ -1,7 +1,6 @@
 #pragma once
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WiFiMulti.h>
 #include <WiFiUdp.h>
 #include <ESPmDNS.h>
 #include <ArduinoOTA.h>
@@ -28,81 +27,65 @@ class NetConsole : public Print {
 public:
     bool wifiUp = false;
 
+    // Kick off WiFi WITHOUT blocking — the connection finishes in the background
+    // (handle()), so the instrument boots/plays instantly instead of waiting up to
+    // ~15 s for the link. OTA + telnet come up once connected.
     void begin() {
-        WiFi.persistent(false);          // don't wear flash writing creds each boot
+        WiFi.persistent(false);
         WiFi.mode(WIFI_STA);
-        WiFi.setSleep(false);            // <<< disable WiFi modem sleep — the big one:
-                                         // modem sleep causes latency spikes / dropped
-                                         // packets → OTA stalling mid-transfer and the
-                                         // board going unreachable until a power cycle.
-        WiFi.setAutoReconnect(true);     // bring the link back if it drops
+        WiFi.setSleep(false);            // no modem sleep (OTA reliability)
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+        WiFi.setAutoReconnect(true);
         WiFi.setHostname(OTA_HOSTNAME);
-
-        // Multi-AP: join whichever known network is strongest/available.
-        _multi.addAP(WIFI_SSID, WIFI_PASSWORD);
-#if defined(WIFI_SSID2)
-        _multi.addAP(WIFI_SSID2, WIFI_PASSWORD2);
-#endif
-        Serial.print(F("# WiFi: connecting"));
-        uint32_t t0 = millis();
-        while (_multi.run() != WL_CONNECTED && millis() - t0 < 15000) {
-            Serial.print('.');
-            delay(100);
-        }
-        Serial.println();
-
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println(F("# WiFi: NOT connected — USB serial only. Set WIFI_SSID/"
-                             "WIFI_PASSWORD in config.h for OTA + remote monitor."));
-            return;
-        }
-        wifiUp = true;
-        Serial.print(F("# WiFi: connected, IP "));
-        Serial.print(WiFi.localIP());
-        Serial.printf("  RSSI %d dBm  heap %u\n", WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
-
-        ArduinoOTA.setHostname(OTA_HOSTNAME);
-        if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
-        ArduinoOTA
-            .onStart([]()  { Serial.println(F("# OTA: update starting")); })
-            .onEnd([]()    { Serial.println(F("\n# OTA: done")); })
-            .onProgress([](unsigned int p, unsigned int t) {
-                Serial.printf("\r# OTA: %u%%", t ? (p * 100u / t) : 0u);
-            })
-            .onError([](ota_error_t e) { Serial.printf("\n# OTA error %u\n", e); });
-        ArduinoOTA.begin();
-
-        _telnet.begin();
-        _telnet.setNoDelay(true);
-        Serial.printf("# OTA + remote serial ready as '%s.local'  "
-                      "(monitor: socket://%s.local:23)\n", OTA_HOSTNAME, OTA_HOSTNAME);
+        _started = true;
+        connectAP(0);
+        Serial.println(F("# WiFi: connecting in background…"));
     }
 
-    // Pump OTA and accept/maintain a single telnet client. Call every loop.
+    // Pump OTA + telnet; drive the background connect. Call every loop.
     void handle() {
-        if (!wifiUp) return;
+        if (!_started) return;
 
-        // WiFi watchdog: if the link dropped, kick a reconnect (non-blocking) so
-        // the board doesn't silently go unreachable until a power cycle.
-        static uint32_t lastCheck = 0;
-        if (millis() - lastCheck > 3000) {
-            lastCheck = millis();
-            if (WiFi.status() != WL_CONNECTED) {
-                Serial.println(F("# WiFi: link down — reconnecting…"));
-                _multi.run();   // re-pick the strongest available known AP
+        if (!wifiUp) {
+            if (WiFi.status() == WL_CONNECTED) {
+                finalizeConnect();
+            } else if (millis() - _apTryMs > 6000) {
+                connectAP(_apIdx + 1);       // give the other known AP a turn
             }
+            return;                          // OTA/telnet not up until connected
+        }
+
+        // Connected: watchdog (non-blocking) — if the link drops, reconnect.
+        static uint32_t lastCheck = 0;
+        if (millis() - lastCheck > 5000) {
+            lastCheck = millis();
+            if (WiFi.status() != WL_CONNECTED) { wifiUp = false; connectAP(_apIdx); return; }
         }
 
         ArduinoOTA.handle();
         WiFiClient incoming = _telnet.accept();
         if (incoming) {
             if (_client && _client.connected()) {
-                incoming.stop();                 // one remote monitor at a time
+                incoming.stop();
             } else {
                 _client = incoming;
-                _client.println(F("# Omniphone ESP32-S3 — remote serial connected"));
+                if (_histWrap) _client.write((const uint8_t*)_hist + _histLen, sizeof(_hist) - _histLen);
+                _client.write((const uint8_t*)_hist, _histLen);
+                _client.println(F("# --- remote serial connected (history above) ---"));
             }
         }
+    }
+
+    // Turn WiFi/OTA off at runtime (performance mode). begin() re-enables it; both
+    // are non-blocking, so no reboot is needed to toggle.
+    void disable() {
+        if (_otaInit) { ArduinoOTA.end(); _telnet.end(); }
+        if (_client) _client.stop();
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
+        wifiUp = false;
+        _started = false;
+        _otaInit = false;
     }
 
     // Input from the telnet client, so commands can be typed over WiFi too.
@@ -149,16 +132,62 @@ public:
     size_t write(uint8_t c) override {
         Serial.write(c);
         if (_client && _client.connected()) _client.write(c);
+        capture(c);
         return 1;
     }
     size_t write(const uint8_t* buf, size_t n) override {
         Serial.write(buf, n);
         if (_client && _client.connected()) _client.write(buf, n);
+        for (size_t i = 0; i < n; i++) capture(buf[i]);
         return n;
     }
 
+    // Last complete line written (no newline) — for showing on a screen.
+    const char* lastLine() const { return _lastLine; }
+
 private:
-    WiFiMulti  _multi;
+    // Start a (non-blocking) connection to known AP `idx` (alternates if a 2nd is
+    // defined). WiFi.begin() returns immediately; status is polled in handle().
+    void connectAP(uint8_t idx) {
+        const char* ssid = WIFI_SSID; const char* pass = WIFI_PASSWORD;
+#if defined(WIFI_SSID2)
+        _apIdx = idx & 1;
+        if (_apIdx) { ssid = WIFI_SSID2; pass = WIFI_PASSWORD2; }
+#else
+        _apIdx = 0;
+#endif
+        WiFi.begin(ssid, pass);
+        _apTryMs = millis();
+    }
+
+    void finalizeConnect() {
+        wifiUp = true;
+        Serial.print(F("# WiFi: connected, IP "));
+        Serial.print(WiFi.localIP());
+        Serial.printf("  RSSI %d dBm  heap %u\n", WiFi.RSSI(), (unsigned)ESP.getFreeHeap());
+        if (!_otaInit) {            // one-time OTA + telnet setup
+            ArduinoOTA.setHostname(OTA_HOSTNAME);
+            if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
+            ArduinoOTA
+                .onStart([]()  { Serial.println(F("# OTA: update starting")); })
+                .onEnd([]()    { Serial.println(F("\n# OTA: done")); })
+                .onProgress([](unsigned int p, unsigned int t) {
+                    Serial.printf("\r# OTA: %u%%", t ? (p * 100u / t) : 0u);
+                })
+                .onError([](ota_error_t e) { Serial.printf("\n# OTA error %u\n", e); });
+            ArduinoOTA.begin();
+            _telnet.begin();
+            _telnet.setNoDelay(true);
+            _otaInit = true;
+        }
+        Serial.printf("# OTA + remote serial ready ('%s.local', socket://%s.local:23)\n",
+                      OTA_HOSTNAME, OTA_HOSTNAME);
+    }
+
+    bool       _started = false;
+    bool       _otaInit = false;
+    uint8_t    _apIdx   = 0;
+    uint32_t   _apTryMs = 0;
     WiFiServer _telnet{23};
     WiFiClient _client;
 
@@ -168,6 +197,24 @@ private:
     bool       _tpOn = false;
     char       _tpBuf[512];
     uint16_t   _tpLen = 0;
+
+    // Output history (replayed to a new telnet client) + last line (for the screen).
+    char     _hist[1024];
+    uint16_t _histLen  = 0;
+    bool     _histWrap = false;
+    char     _line[96];
+    uint8_t  _lineLen  = 0;
+    char     _lastLine[96] = "";
+
+    void capture(uint8_t c) {
+        _hist[_histLen++] = (char)c;                 // ring buffer
+        if (_histLen >= sizeof(_hist)) { _histLen = 0; _histWrap = true; }
+        if (c == '\n' || c == '\r') {                // finalise a line
+            if (_lineLen) { _line[_lineLen] = '\0'; memcpy(_lastLine, _line, _lineLen + 1); _lineLen = 0; }
+        } else if (_lineLen < sizeof(_line) - 1) {
+            _line[_lineLen++] = (char)c;
+        }
+    }
 };
 
 inline NetConsole Console;
