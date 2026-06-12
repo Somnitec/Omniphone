@@ -28,8 +28,9 @@
 #include "screen_status.h"
 
 // ── Feature flags ─────────────────────────────────────────────────────────────
-#define SHOW_WIFI_BAR 1   // 0 = hide the WiFi diag bar at the bottom
-#define DRIVE_LEDS    1   // 0 = don't drive LEDs (if they disturb sensing)
+#define SHOW_WIFI_BAR   1 // 0 = hide the WiFi diag bar at the bottom
+#define DRIVE_LEDS      1 // 0 = don't drive LEDs (if they disturb sensing)
+#define STREAM_SENSORS  1 // 1 = stream per-pad raw delta to Teleplot (d0..d18)
 
 // Performance mode: a 5-second hold anywhere on the touch screen toggles it —
 // WiFi off + all diagnostics hidden (just the instrument). Persisted in NVS, so it
@@ -53,6 +54,16 @@ static constexpr uint8_t CST816_ADDR   = 0x15;   // touch ctrl, shares the I²C 
 // we don't use — touch is read over I²C — so it's free to borrow here).
 static constexpr uint8_t PIN_SAFEGUARD = 16;
 static constexpr bool    TOUCH_FLIP    = false;  // flip the arrow zones if mirrored
+
+// Teleplot streaming is a runtime toggle (the on-screen DIAG button, on the
+// CPU/MEM row) and always starts OFF: every UDP burst pulses the radio, which
+// couples audibly into the audio path — so it's opt-in while tuning only.
+// The button claims a long-axis slice (where the long axis is known-good);
+// the short axis only exempts the middle band where the selector text lives,
+// because its orientation is unverified (taps are logged to settle it).
+static bool streamOn = false;
+static constexpr int16_t  BTN_X = 200, BTN_W = 48;   // screen px along long axis
+static void drawDiagButton();
 static TFT_eSPI tft;
 
 // ── Audio engine ─────────────────────────────────────────────────────────────
@@ -60,7 +71,8 @@ static constexpr int      SAMPLE_RATE = 44100;
 static constexpr int      BLOCK       = 256;
 static constexpr uint16_t TABLE_SIZE  = 1024;
 static constexpr int16_t  VOICE_AMP   = 9000;   // per-voice peak
-static constexpr int      AMP_SLEW_SHIFT = 6;   // amp one-pole (larger = slower/smoother)
+static constexpr int      AMP_SLEW_SHIFT = 9;   // amp one-pole (~12 ms): ramps through
+                                                // the coarse proximity steps → no stepping
 // Soft limiter on the voice sum: a single voice stays ~linear/clean, while many
 // voices saturate smoothly (tanh) instead of hard-clipping into harsh distortion.
 static constexpr float    MIX_DRIVE   = 1.0f / 26000.0f;  // pre-saturation gain
@@ -75,26 +87,93 @@ static int32_t  ampF[NUM_SENSORS]    = {0};
 static volatile int32_t targetF[NUM_SENSORS] = {0};
 static volatile uint8_t audioLoadPct = 0;
 static bool i2sOk = false;
+static TaskHandle_t audioTaskHandle = nullptr;
+
+// OTA hooks: suspend the audio task during the flash write — flash operations stall
+// code/cache and contend with the upload (audio glitches AND can fail the upload).
+static void otaBefore() { if (audioTaskHandle) vTaskSuspend(audioTaskHandle); }
+static void otaAfter()  { if (audioTaskHandle) vTaskResume(audioTaskHandle); }
 
 // ── Sound sets (note layouts) and timbres (waveforms) ────────────────────────
-// Note layouts in hex-grid order (rows 3-4-5-4-3); pad 9 = the centre.
+// Laid out in the hex grid (rows 3-4-5-4-3); pad 9 = the CENTRE. Each pad is a
+// UNIQUE note. MIDI note names (C4 = 60); 's' = sharp (Cs = C#, As = A#/Bb).
 //   00 01 02 / 03 04 05 06 / 07 08 09 10 11 / 12 13 14 15 / 16 17 18
-struct SoundSet { const char* name; uint8_t midi[NUM_SENSORS]; };
+// (Arduino's binary.h defines B0/B1 = 0/1 — undef so we can use B-octave names.)
+#ifdef B0
+#undef B0
+#endif
+#ifdef B1
+#undef B1
+#endif
+// Note names + sets live INSIDE namespace nt, so bare names (A3, D4…) resolve to
+// the enum and don't clash with the core's analog-pin constants (A0–A5).
+namespace nt {
+enum : uint8_t {
+    C1=24,Cs1,D1,Ds1,E1,F1,Fs1,G1,Gs1,A1,As1,B1,
+    C2,Cs2,D2,Ds2,E2,F2,Fs2,G2,Gs2,A2,As2,B2,
+    C3,Cs3,D3,Ds3,E3,F3,Fs3,G3,Gs3,A3,As3,B3,
+    C4,Cs4,D4,Ds4,E4,F4,Fs4,G4,Gs4,A4,As4,B4,
+    C5,Cs5,D5,Ds5,E5,F5,Fs5,G5,Gs5,A5,As5,B5,
+    C6,Cs6,D6,Ds6,E6,F6,Fs6,G6,Gs6,A6,As6,B6,
+};
+
+static const uint8_t SET_ACCORDION[NUM_SENSORS] = {  // Wicki-Hayden isomorphic
+        D4, E4, Fs4,
+      G3, A3, B3, Cs4,
+    C3, D3, E3, Fs3, Gs3,
+      F2, G2, A2, B2,
+        As1, C2, D2,
+};
+static const uint8_t SET_CHROMATIC[NUM_SENSORS] = {  // chromatic, ascending
+        C3, Cs3, D3,
+      Ds3, E3, F3, Fs3,
+    G3, Gs3, A3, As3, B3,
+      C4, Cs4, D4, Ds4,
+        E4, F4, Fs4,
+};
+static const uint8_t SET_PENTATONIC[NUM_SENSORS] = { // C major pentatonic, wide
+        C2, D2, E2,
+      G2, A2, C3, D3,
+    E3, G3, A3, C4, D4,
+      E4, G4, A4, C5,
+        D5, E5, G5,
+};
+// Hangdrum — low "ding" in the CENTRE, pitch rising toward the OUTER ring.
+static const uint8_t SET_HANGDRUM[NUM_SENSORS] = {
+        A3, As3, C4,
+      D4, A2, C3, E4,
+    F4, D3, D2, E3, G4,
+      A4, F3, G3, As4,
+        C5, D5, E5,
+};
+// Triads — root in the CENTRE, stacked thirds expanding OUTWARD (inside→out), so
+// the centre + two outward neighbours spell a chord.
+static const uint8_t SET_TRIADS[NUM_SENSORS] = {
+        C4, D4, E4,
+      F4, E2, G2, G4,
+    A4, B2, C2, D3, B4,
+      C5, F3, A3, D5,
+        E5, G5, B5,
+};
+// Microtonal: true harmonics (float Hz) of C2 ≈ 65.41; centre = the fundamental.
+static const float SET_OVERTONES_HZ[NUM_SENSORS] = {
+        65.41f*2,  65.41f*3,  65.41f*4,
+      65.41f*5,  65.41f*6,  65.41f*7,  65.41f*8,
+    65.41f*9,  65.41f*10, 65.41f*1,  65.41f*11, 65.41f*12,
+      65.41f*13, 65.41f*14, 65.41f*15, 65.41f*16,
+        65.41f*17, 65.41f*18, 65.41f*19,
+};
+}  // namespace nt
+
+// A set is either MIDI-note based (midi) or microtonal float-Hz based (hz).
+struct SoundSet { const char* name; const uint8_t* midi; const float* hz; };
 static const SoundSet SOUND_SETS[] = {
-    // Accordion / Wicki-Hayden isomorphic layout (one octave lower)
-    { "Accordion",  { 62,64,66, 55,57,59,61, 48,50,52,54,56, 41,43,45,47, 34,36,38 } },
-    // Chromatic, ascending (one octave lower)
-    { "Chromatic",  { 48,49,50, 51,52,53,54, 55,56,57,58,59, 60,61,62,63, 64,65,66 } },
-    // C-major pentatonic, ascending (one octave lower)
-    { "Pentatonic", { 36,38,40, 43,45,48,50, 52,55,57,60,62, 64,67,69,72, 74,76,79 } },
-    // Overtones — every note is a harmonic of C2(36) at the centre, so all
-    // combinations fuse consonantly. Lower harmonics in/near the centre.
-    { "Overtones",  { 76,78,79, 67,70,72,74, 55,60,36,48,64, 67,70,72,80, 82,84,86 } },
-    // Hangdrum — central low "ding" (D2=38) ringed by a D-minor tone field.
-    { "Hangdrum",   { 60,62,65, 53,55,57,58, 48,50,38,45,46, 52,53,55,57, 60,62,65 } },
-    // Triads — stacked thirds ascending across the grid: any 3 in a row spell a
-    // triad, and it transposes low corner → high corner.
-    { "Triads",     { 24,28,31, 35,38,41,45, 48,52,55,59,62, 66,69,72,76, 79,83,86 } },
+    { "Accordion",  nt::SET_ACCORDION,  nullptr },
+    { "Chromatic",  nt::SET_CHROMATIC,  nullptr },
+    { "Pentatonic", nt::SET_PENTATONIC, nullptr },
+    { "Overtones",  nullptr,            nt::SET_OVERTONES_HZ },
+    { "Hangdrum",   nt::SET_HANGDRUM,   nullptr },
+    { "Triads",     nt::SET_TRIADS,     nullptr },
 };
 static constexpr uint8_t NUM_SOUND_SETS = sizeof(SOUND_SETS) / sizeof(SOUND_SETS[0]);
 
@@ -107,16 +186,56 @@ static constexpr uint8_t NUM_TIMBRES = sizeof(TIMBRES) / sizeof(TIMBRES[0]);
 static volatile uint8_t activeSet    = 0;
 static volatile uint8_t activeTimbre = 0;
 
-// ── Proximity tuning ──────────────────────────────────────────────────────────
-static constexpr float PROX_DEADBAND = 4.0f;
-static constexpr float PROX_MAX      = 25.0f;
-static constexpr float PROX_SMOOTH_K = 0.40f;
-static float proxSmooth[NUM_SENSORS] = {0};
+// ── Proximity tuning / calibration ────────────────────────────────────────────
+// The chip's own baseline registers are NOT used: their falling-tracking config
+// makes them effectively never come down (any downward signal drift became a
+// permanent positive delta = hanging notes / the boot swell), and they're
+// quantized to 4 counts. Instead a software baseline tracks the raw 10-bit
+// filtered value directly (touch pulls filtered DOWN, so delta = base − filt).
+// Touch vs interference can NOT be told apart by amplitude here (a real touch
+// reaches delta 150–700, and so do EM bursts) — only by DURATION:
+//   • EM bursts are short → median-of-3 kills single-scan spikes, and a voice
+//     only opens after CONFIRM_SCANS consecutive scans above the deadband
+//     (~20 ms onset gate — bursts shorter than that stay silent).
+//   • Touches are seconds → the baseline FREEZES while a pad is held, so held
+//     notes sustain at full level. Only after HOLD_MAX_SCANS (~8 s, longer than
+//     any musical hold) does it conclude "stuck offset" and re-zero — that is
+//     the self-heal path for drifting channels.
+//   • Idle (delta < deadband): normal drift tracking absorbs slow EM change.
+// For the first SEED_MS the baseline hard-follows (and pads stay muted): the
+// MPR121's filtered output is still settling right after init.
+static constexpr float PROX_DEADBAND  = 2.0f;   // delta below this = silent
+static constexpr float PROX_MAX       = 22.0f;  // delta at full volume
+static constexpr float PROX_ATTACK_K  = 0.50f;  // rising smoothing (fast attack)
+static constexpr float PROX_RELEASE_K = 0.10f;  // falling smoothing (calm release)
+static constexpr float SLOW_BASE_K    = 0.0067f; // idle drift tracking (200 Hz scan)
+static constexpr float HEAL_K         = 0.01f;   // re-zero after hold timeout
+static constexpr uint16_t HOLD_MAX_SCANS = 1600; // 8 s @ 200 Hz → stuck, heal
+// Onset gate: strong deltas (a strike) confirm fast; weak ones (the EM events
+// that caused soft phantom blips hover just above the deadband) must persist
+// ~60 ms — a slow soft approach by hand is much longer than that anyway.
+static constexpr uint8_t  CONFIRM_SCANS      = 3;    // strong onset (~15 ms)
+static constexpr uint8_t  CONFIRM_WEAK_SCANS = 12;   // weak onset  (~60 ms)
+static constexpr float    STRONG_DELTA       = 8.0f; // strong/weak boundary
+static constexpr uint32_t SEED_MS     = 1500;
+static float proxSmooth[NUM_SENSORS]  = {0};
+static float slowBase[NUM_SENSORS]    = {0};
+static float padDelta[NUM_SENSORS]    = {0};   // drift-corrected delta (for Teleplot)
+static uint16_t fPrev1[NUM_SENSORS]   = {0};   // median-of-3 history
+static uint16_t fPrev2[NUM_SENSORS]   = {0};
+static uint16_t holdScans[NUM_SENSORS] = {0};  // consecutive scans above deadband
+static uint32_t seedUntil = 0;                 // hard-seed window end (set in setup)
+
+static inline uint16_t median3(uint16_t a, uint16_t b, uint16_t c) {
+    uint16_t lo = min(a, b), hi = max(a, b);
+    return max(lo, min(hi, c));
+}
 
 // ── Audio task (32-bit stereo) ────────────────────────────────────────────────
 static void audioTask(void*) {
     static int32_t tx[BLOCK * 2];
     const uint32_t blockUs = (uint32_t)((uint64_t)BLOCK * 1000000ULL / SAMPLE_RATE);
+    int32_t lp = 0;   // one-pole output LPF state
     for (;;) {
         uint32_t t0 = micros();
         const int16_t* wt = WAVE[TIMBRES[activeTimbre].wave];
@@ -125,11 +244,21 @@ static void audioTask(void*) {
             for (uint8_t v = 0; v < NUM_SENSORS; v++) {
                 ampF[v] += (targetF[v] - ampF[v]) >> AMP_SLEW_SHIFT;   // Q16 slew
                 int32_t a = ampF[v];
-                if (a > 0) acc += ((int32_t)wt[phase[v] >> 22] * a) >> 16;
+                if (a > 0) {
+                    // Linear-interpolated table read — the bare lookup's step
+                    // between entries is broadband HF grit (same fix as Pico).
+                    uint32_t ph  = phase[v];
+                    uint16_t i0  = ph >> 22;
+                    int32_t  s0  = wt[i0];
+                    int32_t  s1  = wt[(i0 + 1) & (TABLE_SIZE - 1)];
+                    int32_t  fr  = (ph >> 14) & 0xFF;
+                    acc += ((s0 + (((s1 - s0) * fr) >> 8)) * a) >> 16;
+                }
                 phase[v] += phaseInc[v];
             }
             int32_t out = (int32_t)(tanhf((float)acc * MIX_DRIVE) * MIX_OUT); // soft limit
-            tx[2 * f] = tx[2 * f + 1] = out << 16;                // → top of 32-bit frame
+            lp += (out - lp) >> 1;            // ~5 kHz LPF: keep tone, kill HF hash
+            tx[2 * f] = tx[2 * f + 1] = lp << 16;             // → top of 32-bit frame
         }
         uint32_t genUs = micros() - t0;
         audioLoadPct = (uint8_t)(genUs >= blockUs ? 100 : (genUs * 100) / blockUs);
@@ -138,14 +267,17 @@ static void audioTask(void*) {
     }
 }
 
-static inline uint32_t midiToInc(uint8_t m) {
-    float hz = 440.0f * powf(2.0f, (m - 69) / 12.0f);
+static inline uint32_t hzToInc(float hz) {
     return (uint32_t)((double)hz * 4294967296.0 / SAMPLE_RATE);
+}
+static inline uint32_t midiToInc(uint8_t m) {
+    return hzToInc(440.0f * powf(2.0f, (m - 69) / 12.0f));
 }
 static void applySoundSet(uint8_t idx) {
     activeSet = idx;
+    const SoundSet& s = SOUND_SETS[idx];
     for (uint8_t v = 0; v < NUM_SENSORS; v++)
-        phaseInc[v] = midiToInc(SOUND_SETS[idx].midi[v]);
+        phaseInc[v] = s.hz ? hzToInc(s.hz[v]) : midiToInc(s.midi[v]);
 }
 
 static void audioBegin() {
@@ -182,7 +314,9 @@ static void audioBegin() {
     pins.data_in_num  = I2S_PIN_NO_CHANGE;
     i2s_set_pin(I2S_NUM_0, &pins);
 
-    xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 3, nullptr, 1);
+    // Priority well above loopTask(1) and anything WiFi adds to core 1, so the
+    // synth can only be paused by the DMA wait — never preempted into a glitch.
+    xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 18, &audioTaskHandle, 1);
 }
 
 // ── Sensing (MPR121) ──────────────────────────────────────────────────────────
@@ -216,29 +350,46 @@ static void sensorsBegin() {
 
 static void readSensors() {
     static uint8_t filt[NUM_BOARDS][24];
-    static uint8_t base[NUM_BOARDS][12];
     for (uint8_t b = 0; b < NUM_BOARDS; b++) {
         if (!boardOk[b] || SENSE_ELECTRODES[b] == 0) continue;
-        uint8_t n = SENSE_ELECTRODES[b];
-        boards[b].burstRead(MPR121Reg::FILT_0L, filt[b], (uint8_t)(2 * n));
-        boards[b].burstRead(MPR121Reg::BASE_0,  base[b], n);
+        boards[b].burstRead(MPR121Reg::FILT_0L, filt[b],
+                            (uint8_t)(2 * SENSE_ELECTRODES[b]));
     }
     uint8_t led[NUM_BOARDS][8];
     memset(led, 0, sizeof(led));
 
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
         const SenseMap& m = SENSE_PADS[i];
-        float delta = 0.0f;
+        float fm = 0.0f;
         if (boardOk[m.board] && m.electrode < SENSE_ELECTRODES[m.board]) {
             uint8_t e = m.electrode;
             uint16_t f = (uint16_t)filt[m.board][2 * e]
                        | ((uint16_t)(filt[m.board][2 * e + 1] & 0x03) << 8);
-            uint16_t bl = (uint16_t)base[m.board][e] << 2;
-            delta = (float)((int)bl - (int)f);
+            fm = (float)median3(f, fPrev1[i], fPrev2[i]);   // spike rejection
+            fPrev2[i] = fPrev1[i];
+            fPrev1[i] = f;
         }
-        float norm = (delta - PROX_DEADBAND) / (PROX_MAX - PROX_DEADBAND);
+        float c = slowBase[i] - fm;                    // touch pulls filtered DOWN
+        bool seeding = millis() < seedUntil;
+        float k;
+        if (seeding)                k = 1.0f;          // settling: hard-follow
+        else if (c < PROX_DEADBAND) k = SLOW_BASE_K;   // idle: track drift
+        else if (holdScans[i] > HOLD_MAX_SCANS) k = HEAL_K;  // stuck: re-zero
+        else                        k = 0.0f;          // held note: freeze
+        slowBase[i] += k * (fm - slowBase[i]);
+        if (!seeding && c >= PROX_DEADBAND) {
+            if (holdScans[i] < 0xFFFF) holdScans[i]++;
+        } else {
+            holdScans[i] = 0;
+        }
+        if (seeding || c < 0.0f) c = 0.0f;             // mute during settling
+        padDelta[i] = c;
+        float norm = (c - PROX_DEADBAND) / (PROX_MAX - PROX_DEADBAND);
         if (norm < 0.0f) norm = 0.0f; else if (norm > 1.0f) norm = 1.0f;
-        proxSmooth[i] += (norm - proxSmooth[i]) * PROX_SMOOTH_K;
+        if (holdScans[i] < (c >= STRONG_DELTA ? CONFIRM_SCANS : CONFIRM_WEAK_SCANS))
+            norm = 0.0f;                               // onset gate: EM bursts
+        proxSmooth[i] += (norm - proxSmooth[i]) *
+                         (norm > proxSmooth[i] ? PROX_ATTACK_K : PROX_RELEASE_K);
         targetF[i] = (int32_t)(proxSmooth[i] * 65536.0f);   // Q16
 
 #if DRIVE_LEDS
@@ -258,8 +409,17 @@ static void readSensors() {
 #endif
     }
 #if DRIVE_LEDS
-    for (uint8_t b = 0; b < NUM_BOARDS; b++)
-        if (boardOk[b]) boards[b].setLEDs8(led[b]);
+    // Only touch the bus when a value actually changed — at 200 Hz the constant
+    // writes are needless traffic (and audible coupling into the audio path).
+    static uint8_t lastLed[NUM_BOARDS][8];
+    static bool ledInit = false;
+    for (uint8_t b = 0; b < NUM_BOARDS; b++) {
+        if (!boardOk[b]) continue;
+        if (ledInit && memcmp(led[b], lastLed[b], 8) == 0) continue;
+        boards[b].setLEDs8(led[b]);
+        memcpy(lastLed[b], led[b], 8);
+    }
+    ledInit = true;
 #endif
 }
 
@@ -305,21 +465,34 @@ static void pollTouch() {
     bool ok = touchRead6(d);
     bool touched = ok && (d[1] & 0x0F) > 0;
     uint16_t y = ((uint16_t)(d[4] & 0x0F) << 8) | d[5];   // long axis 0..319
+    uint16_t x = ((uint16_t)(d[2] & 0x0F) << 8) | d[3];   // short axis 0..169
 
     static bool     was = false;
     static uint32_t downMs = 0;
     static uint8_t  downZone = 0;
     static bool     held = false;
+    static bool     downBtn = false;
+    static uint16_t downX = 0, downY = 0;
 
     if (touched && !was) {                       // finger down
         downMs = millis(); held = false;
+        downX = x; downY = y;
         uint8_t z = y / (320 / 4); if (z > 3) z = 3;
         downZone = TOUCH_FLIP ? (3 - z) : z;
+        // DIAG button: its long-axis slice (with margin), any short-axis
+        // position except the middle band (selector text area).
+        downBtn = (y >= BTN_X - 8 && y <= BTN_X + BTN_W + 8) && (x < 70 || x > 100);
     } else if (touched && !held && millis() - downMs >= HOLD_MS) {
         held = true;                             // 5-s hold reached
-        togglePerfMode();                        // (reboots)
+        togglePerfMode();                        // live toggle, no reboot
     } else if (!touched && was) {                // finger up
-        if (!held && millis() - downMs < 800) {  // short tap → select
+        Console.printf("# tap long=%u short=%u zone=%u btn=%d\n",
+                       downY, downX, downZone, (int)downBtn);
+        if (!held && millis() - downMs < 800 && downBtn) {
+            streamOn = !streamOn;                // DIAG tap → toggle Teleplot
+            Console.printf("# diagnostics streaming %s\n", streamOn ? "ON" : "OFF");
+            if (!perfMode) drawDiagButton();     // instant visual feedback
+        } else if (!held && millis() - downMs < 800) {  // short tap → select
             switch (downZone) {
                 case 0: applySoundSet((activeSet + NUM_SOUND_SETS - 1) % NUM_SOUND_SETS); break;
                 case 1: applySoundSet((activeSet + 1) % NUM_SOUND_SETS); break;
@@ -377,6 +550,38 @@ static void drawRow(int idx, const char* s) {
     tft.drawString(s, 6, y);
 }
 
+// Teleplot on/off button, on the CPU/MEM row right after the text. Redrawn by
+// drawStats (whose drawRow(1) wipes that row) and on toggle for instant feedback.
+static void drawDiagButton() {
+    const int16_t h = 18;
+    int16_t y = statsBase() - 2 * h;             // CPU/MEM row (drawStats idx 1)
+    uint16_t bg = streamOn ? TFT_DARKGREEN : TFT_LIGHTGREY;
+    tft.fillRoundRect(BTN_X, y, BTN_W, h, 4, bg);
+    tft.setTextFont(2);
+    tft.setTextDatum(TC_DATUM);
+    tft.setTextColor(streamOn ? TFT_WHITE : TFT_DARKGREY, bg);
+    tft.drawString("DIAG", BTN_X + BTN_W / 2, y + 1);
+    tft.setTextDatum(TL_DATUM);
+}
+
+#if STREAM_SENSORS
+// Stream per-pad corrected delta to Teleplot (d0..d18). One UDP packet per frame
+// to TELEPLOT_HOST (secrets.h); falls back to USB-serial/telnet echo if unset.
+static void streamSensors() {
+    if (!streamOn) return;              // opt-in via the on-screen DIAG button
+    static uint32_t last = 0;
+    if (millis() - last < 50) return;   // ~20 Hz
+    last = millis();
+    Console.teleBegin();
+    char nm[8];
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        snprintf(nm, sizeof(nm), "d%u", i);
+        Console.tele(nm, padDelta[i], 1);   // software baseline → sub-count resolution
+    }
+    Console.teleEnd();
+}
+#endif
+
 static void drawStats() {
     static uint32_t last = 0;
     if (millis() - last < 300) return;
@@ -385,7 +590,18 @@ static void drawStats() {
     drawRow(0, Console.lastLine());
     snprintf(line, sizeof(line), "CPU %u%%  MEM %uKB",
              audioLoadPct, (unsigned)(ESP.getFreeHeap() / 1024));   drawRow(1, line);
-    snprintf(line, sizeof(line), "BAT %.2f V", readBattery());      drawRow(2, line);
+    // Battery: above ~4.30 V means external/USB power; otherwise show a LiPo
+    // state-of-charge estimate (sigmoid fit) + the voltage.
+    float v = readBattery();
+    if (v > 4.30f) {
+        snprintf(line, sizeof(line), "USB power  %.2fV", v);
+    } else {
+        float pct = 123.0f - 123.0f / powf(1.0f + powf(v / 3.7f, 80.0f), 0.165f);
+        if (pct < 0) pct = 0; else if (pct > 100) pct = 100;
+        snprintf(line, sizeof(line), "BAT %d%%  %.2fV", (int)(pct + 0.5f), v);
+    }
+    drawRow(2, line);
+    drawDiagButton();   // drawRow(0) wiped its row — repaint last
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -408,10 +624,17 @@ void setup() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(I2C_CLOCK);
     sensorsBegin();
+    seedUntil = millis() + SEED_MS;          // baseline hard-follows while MPR121 settles
     touchBegin();
     audioBegin();
 
-    if (!perfMode) Console.begin();          // performance mode = no WiFi/OTA
+    Console.onOta(otaBefore, otaAfter);      // mute audio during OTA flash writes
+    if (!perfMode) {
+        Console.begin();                     // performance mode = no WiFi/OTA
+#if STREAM_SENSORS
+        if (strlen(TELEPLOT_HOST) > 0) Console.teleplotHost(TELEPLOT_HOST);
+#endif
+    }
     else { WiFi.mode(WIFI_OFF); Serial.println(F("# performance mode (WiFi off)")); }
 
     drawSelectors();
@@ -424,10 +647,13 @@ void loop() {
         Console.handle();
         if (wifiBarShown()) drawNetStatus(tft);
         drawStats();
+#if STREAM_SENSORS
+        streamSensors();
+#endif
     }
     if (dirty) { drawSelectors(); dirty = false; }
 
     static uint32_t lastSense = 0, lastTouch = 0;
-    if (millis() - lastSense >= 15) { lastSense = millis(); readSensors(); }
+    if (millis() - lastSense >= 5) { lastSense = millis(); readSensors(); }
     if (millis() - lastTouch >= 30) { lastTouch = millis(); pollTouch(); }
 }

@@ -23,9 +23,17 @@
 // Everything is non-fatal when headless: if WiFi never joins, output still goes
 // to USB Serial and wifiUp stays false (callers gate the web server / OTA on it).
 // ─────────────────────────────────────────────────────────────────────────────
+// OTA hooks — the app sets these (via onOta) to e.g. suspend the audio task during
+// a flash write (flash ops stall code execution and contend with the upload).
+inline void (*g_otaBefore)() = nullptr;
+inline void (*g_otaAfter)()  = nullptr;
+
 class NetConsole : public Print {
 public:
     bool wifiUp = false;
+
+    // Register callbacks run at OTA start / end (or error).
+    void onOta(void (*before)(), void (*after)()) { g_otaBefore = before; g_otaAfter = after; }
 
     // Kick off WiFi WITHOUT blocking — the connection finishes in the background
     // (handle()), so the instrument boots/plays instantly instead of waiting up to
@@ -109,24 +117,38 @@ public:
         return true;
     }
 
-    // One Teleplot frame: teleBegin(), one tele() per series, teleEnd(). Each
-    // value goes to USB serial + telnet (with the ">" serial prefix) immediately,
-    // and is batched into a single UDP packet flushed by teleEnd().
-    void teleBegin() { _tpLen = 0; }
+    // One Teleplot frame: teleBegin(), one tele() per series, teleEnd().
+    // When a UDP host is configured, values go ONLY over UDP — echoing every
+    // value to USB serial + telnet too means hundreds of tiny blocking writes
+    // per second (the telnet ones stall the whole loop on a weak link). Frames
+    // are batched TP_BATCH-deep into one UDP packet: every radio TX burst is a
+    // current spike that couples into the audio path, so fewer, bigger packets
+    // = less crackle for the same data. Without a UDP host, the ">"-prefixed
+    // serial/telnet echo is the fallback so Teleplot-over-serial still works.
+    static constexpr uint8_t TP_BATCH = 4;
+    void teleBegin() {}
     void tele(const char* name, double value, uint8_t decimals = 3) {
         char line[40];
         int n = snprintf(line, sizeof(line), "%s:%.*f\n", name, decimals, value);
         if (n <= 0) return;
+        if (_tpOn) {
+            if ((size_t)(_tpLen + n) < sizeof(_tpBuf)) { memcpy(_tpBuf + _tpLen, line, n); _tpLen += n; }
+            return;
+        }
         Serial.write('>'); Serial.write((const uint8_t*)line, n);
         if (_client && _client.connected()) { _client.write('>'); _client.write((const uint8_t*)line, n); }
-        if (_tpOn && (size_t)(_tpLen + n) < sizeof(_tpBuf)) { memcpy(_tpBuf + _tpLen, line, n); _tpLen += n; }
     }
     void teleEnd() {
-        if (_tpOn && wifiUp && _tpLen) {
+        if (!_tpOn) return;
+        if (!wifiUp) { _tpLen = 0; _tpFrames = 0; return; }
+        if (++_tpFrames < TP_BATCH && _tpLen < sizeof(_tpBuf) - 256) return;
+        if (_tpLen) {
             _udp.beginPacket(_tpHost, _tpPort);
             _udp.write((const uint8_t*)_tpBuf, _tpLen);
             _udp.endPacket();
         }
+        _tpLen = 0;
+        _tpFrames = 0;
     }
 
     size_t write(uint8_t c) override {
@@ -169,12 +191,12 @@ private:
             ArduinoOTA.setHostname(OTA_HOSTNAME);
             if (strlen(OTA_PASSWORD) > 0) ArduinoOTA.setPassword(OTA_PASSWORD);
             ArduinoOTA
-                .onStart([]()  { Serial.println(F("# OTA: update starting")); })
-                .onEnd([]()    { Serial.println(F("\n# OTA: done")); })
+                .onStart([]()  { Serial.println(F("# OTA: update starting")); if (g_otaBefore) g_otaBefore(); })
+                .onEnd([]()    { Serial.println(F("\n# OTA: done")); if (g_otaAfter) g_otaAfter(); })
                 .onProgress([](unsigned int p, unsigned int t) {
                     Serial.printf("\r# OTA: %u%%", t ? (p * 100u / t) : 0u);
                 })
-                .onError([](ota_error_t e) { Serial.printf("\n# OTA error %u\n", e); });
+                .onError([](ota_error_t e) { Serial.printf("\n# OTA error %u\n", e); if (g_otaAfter) g_otaAfter(); });
             ArduinoOTA.begin();
             _telnet.begin();
             _telnet.setNoDelay(true);
@@ -195,8 +217,9 @@ private:
     IPAddress  _tpHost;
     uint16_t   _tpPort = TELEPLOT_PORT;
     bool       _tpOn = false;
-    char       _tpBuf[512];
+    char       _tpBuf[1024];     // holds TP_BATCH frames of ~19 series each
     uint16_t   _tpLen = 0;
+    uint8_t    _tpFrames = 0;
 
     // Output history (replayed to a new telnet client) + last line (for the screen).
     char     _hist[1024];
