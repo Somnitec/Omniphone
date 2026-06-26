@@ -32,7 +32,7 @@
 enum DisplayGesture : uint8_t {
     GESTURE_NONE = 0, GESTURE_UP, GESTURE_DOWN, GESTURE_LEFT, GESTURE_RIGHT,
     GESTURE_TAP,        // a single tap (tapX/tapY out-params are set)
-    GESTURE_LONGPRESS,  // a long press → cycle play mode
+    GESTURE_LONGPRESS,  // a long press → back to the atlas picker (harmonic mode)
     GESTURE_MODE_PREV,  // ‹ on the mode line → previous play mode
     GESTURE_MODE_NEXT   // › on the mode line → next play mode
 };
@@ -88,6 +88,30 @@ static bool    g_timbreUsed = true; // false → hide the timbre line + ▲▼ (
 static bool  g_locked = false;
 static float g_pad[NUM_SENSORS]      = { 0 }; // per-pad intensity (0..1)
 static float g_padAngle[NUM_SENSORS] = { 0 }; // each pad's wedge centre angle
+
+// ── Harmonic Journey mode ────────────────────────────────────────────────────
+// A picker of four "atlases" (see config.h HARMONIC_JOURNEYS), then an
+// interactive network of chord nodes for the chosen atlas. Tap a node to retune
+// the pads; the bottom strip shows the move's emotional label. Node positions
+// are computed per-journey: node 0 at the centre (home) with the rest on a ring,
+// or all nodes on a ring. Concept: William R Thomas / atlas protocols (2025).
+static bool    g_harmonicMode  = false;
+static bool    g_picking       = false; // true → show the atlas picker, not a map
+static uint8_t g_harmonicChord = 0;     // currently selected node (0 … nNodes-1)
+
+static uint8_t g_hjIdx   = 0;           // active journey index
+static uint8_t g_hNodes  = 7;           // node count for the active journey
+static bool    g_hCenter = true;        // node 0 centred (home) vs. all-on-ring
+static int16_t g_hnodeX[HARMONIC_MAX_NODES] = { 0 };
+static int16_t g_hnodeY[HARMONIC_MAX_NODES] = { 0 };
+
+static constexpr int16_t HNODE_R  = 20; // node circle radius (px)
+static constexpr int16_t HTOUCH_R = 26; // tap hit-test radius (a touch wider)
+static constexpr int16_t HTOP_BAND = 36; // tap above this y in a map → back to picker
+
+// Picker row geometry (4 atlas names stacked under a title).
+static constexpr int16_t HPICK_Y0 = 78;  // centre-y of the first row
+static constexpr int16_t HPICK_DY = 40;  // row spacing
 
 // Incremental-repaint state. The screen is painted in strips, in an INSIDE-OUT
 // order (centre strip first, then outward) so a refresh radiates from the middle
@@ -157,6 +181,125 @@ inline bool debugBoxEdge(uint16_t x, uint16_t y, UWORD& c)
 }
 #endif
 
+// Text centered at an arbitrary pixel point (used by the harmonic node labels).
+inline bool glyphPixelAt(uint16_t x, uint16_t y, int16_t cx, int16_t cy,
+                         const char* s, sFONT* f)
+{
+    uint16_t len = (uint16_t)strlen(s);
+    if (!len) return false;
+    int16_t tw = (int16_t)((uint16_t)len * f->Width);
+    int16_t x0 = cx - tw / 2;
+    int16_t y0 = cy - (int16_t)f->Height / 2;
+    if ((int16_t)x < x0 || (int16_t)x >= x0 + tw)                  return false;
+    if ((int16_t)y < y0 || (int16_t)y >= y0 + (int16_t)f->Height)  return false;
+    uint16_t col = (uint16_t)((int16_t)x - x0) % f->Width;
+    uint16_t bpr = f->Width / 8 + (f->Width % 8 ? 1 : 0);
+    const uint8_t* gp = &f->table[
+        (s[((int16_t)x - x0) / f->Width] - ' ') * f->Height * bpr
+        + (uint16_t)((int16_t)y - y0) * bpr + col / 8];
+    return (*gp & (0x80 >> (col % 8))) != 0;
+}
+
+// Distance from pixel (x,y) to line segment (ax,ay)→(bx,by), returns true if ≤ tol.
+inline bool nearSeg(int16_t x, int16_t y,
+                    int16_t ax, int16_t ay, int16_t bx, int16_t by, float tol)
+{
+    float dx=(float)(bx-ax), dy=(float)(by-ay), l2=dx*dx+dy*dy;
+    if (l2 < 1.0f) return false;
+    float t = ((float)(x-ax)*dx + (float)(y-ay)*dy) / l2;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    float px=(float)ax+t*dx-(float)x, py=(float)ay+t*dy-(float)y;
+    return px*px+py*py <= tol*tol;
+}
+
+// Is the edge a→b part of the active journey's network? Center-first journeys
+// draw spokes from node 0 to every ring node plus the ring; ring journeys draw
+// only the ring. (Generated from g_hCenter — no per-journey edge table.)
+inline bool harmonicEdge(uint8_t a, uint8_t b)
+{
+    uint8_t start = g_hCenter ? 1 : 0;       // first ring node index
+    uint8_t ringN = (uint8_t)(g_hNodes - start);
+    if (g_hCenter && (a == 0 || b == 0))     // spoke to the centre
+        return true;
+    if (a < start || b < start) return false;
+    // Adjacent on the ring (consecutive, with wrap)?
+    uint8_t ia = (uint8_t)(a - start), ib = (uint8_t)(b - start);
+    uint8_t d = (uint8_t)((ia + ringN - ib) % ringN);
+    return (d == 1 || d == ringN - 1);
+}
+
+// Atlas picker: a title plus the four journey names stacked vertically; the
+// active journey is shown bright, the others dim.
+inline UWORD harmonicPickerPixel(uint16_t x, uint16_t y)
+{
+    int16_t dx0=(int16_t)x-120, dy0=(int16_t)y-120;
+    if ((int32_t)dx0*dx0+(int32_t)dy0*dy0 > 119*119) return 0; // outside round face
+
+    if (glyphPixelAt(x, y, 120, 40, "JOURNEY", &Font16)) return grey565(120);
+    for (uint8_t i = 0; i < NUM_HARMONIC_JOURNEYS; i++) {
+        int16_t cy = (int16_t)(HPICK_Y0 + i * HPICK_DY);
+        if (glyphPixelAt(x, y, 120, cy, HARMONIC_JOURNEYS[i].name, &Font16))
+            return (i == g_hjIdx) ? WHITE : grey565(90);
+    }
+    return grey565(8);
+}
+
+// Harmonic Journey pixel: the active atlas's chord nodes in a star/ring network
+// on a dark background; selected node highlighted (bright fill, black text).
+// Journey title at top (tap to return to the picker), move label at the bottom.
+// Inspired by the tonal map diagram from William R Thomas / atlas protocols.
+inline UWORD harmonicPixel(uint16_t x, uint16_t y)
+{
+    if (g_picking) return harmonicPickerPixel(x, y);
+
+    int16_t dx0=(int16_t)x-120, dy0=(int16_t)y-120;
+    if ((int32_t)dx0*dx0+(int32_t)dy0*dy0 > 119*119) return 0; // outside round face
+
+    const HarmonicJourney &J = HARMONIC_JOURNEYS[g_hjIdx];
+
+    // Nodes (highest priority)
+    for (uint8_t n = 0; n < g_hNodes; n++) {
+        int16_t nx=(int16_t)x-g_hnodeX[n], ny=(int16_t)y-g_hnodeY[n];
+        int32_t r2=(int32_t)nx*nx+(int32_t)ny*ny;
+        if (r2 <= (int32_t)HNODE_R*HNODE_R) {
+            bool sel = (n == g_harmonicChord);
+            if (r2 >= (int32_t)(HNODE_R-2)*(HNODE_R-2))
+                return sel ? WHITE : grey565(110);   // ring border
+            if (glyphPixelAt(x, y, g_hnodeX[n], g_hnodeY[n], J.chords[n].name, &Font16))
+                return sel ? BLACK : WHITE;           // text (inverted on selected)
+            return sel ? grey565(200) : grey565(22); // fill
+        }
+    }
+
+    // Connection lines (dim grey network)
+    for (uint8_t a = 0; a < g_hNodes; a++)
+        for (uint8_t b = (uint8_t)(a+1); b < g_hNodes; b++)
+            if (harmonicEdge(a, b) &&
+                nearSeg((int16_t)x,(int16_t)y, g_hnodeX[a],g_hnodeY[a],
+                        g_hnodeX[b],g_hnodeY[b], 1.2f))
+                return grey565(50);
+
+    // Journey title at top (long-press anywhere → back to the atlas picker)
+    if (glyphPixelAt(x, y, 120, 16, J.name, &Font16)) return grey565(110);
+
+    // Current TIMBRE at the bottom, flanked by ‹ › arrows so it's clear a
+    // left/right swipe changes it. The emotional move-labels live only in the
+    // config.h comments now (they're no longer drawn here).
+    {
+        const int16_t ty = 222, ar = 6;
+        const int16_t lax = 64, rax = 176;          // arrow centres
+        int16_t dl = (int16_t)x - lax, dr = (int16_t)x - rax, dy = (int16_t)y - ty;
+        int16_t ay = dy < 0 ? (int16_t)-dy : dy;
+        if (dl >= -ar && dl <= ar && ay * 2 <= (dl + ar)) return grey565(150); // ‹
+        if (dr >= -ar && dr <= ar && ay * 2 <= (ar - dr)) return grey565(150); // ›
+        if (g_text[LINE_TIMBRE][0] &&
+            glyphPixelAt(x, y, 120, ty, g_text[LINE_TIMBRE], &Font16))
+            return grey565(170);
+    }
+
+    return grey565(8); // near-black background
+}
+
 // Compose one pixel: white glyph/arrow > (debug box) > grey background.
 inline UWORD composePixel(uint16_t x, uint16_t y, int8_t li)
 {
@@ -223,6 +366,86 @@ inline void startStripDMA(uint16_t y0, uint16_t h)
 }
 } // namespace
 
+// Mark the screen for a fresh incremental repaint (from the centre out).
+namespace { inline void markDirty() { g_drawn = false; g_sweepStep = 0; } }
+
+// Enter or leave the Harmonic Journey screen (the third long-press state).
+// Entering clears the locked-visualiser flag; leaving marks the screen dirty
+// so the normal text UI repaints.
+inline void displaySetHarmonicMode(bool on)
+{
+    g_harmonicMode = on;
+    if (on) g_locked = false;
+    markDirty();
+}
+
+// Show/hide the atlas picker (vs. the chord map) within Harmonic Journey.
+inline void displaySetHarmonicPicking(bool on) { g_picking = on; markDirty(); }
+
+// Select the active journey (atlas) and compute its node layout. Node 0 sits at
+// the centre (home) for centre-first journeys, with the rest evenly spaced on a
+// ring starting at the top; ring journeys put every node on the ring.
+inline void displaySetHarmonicJourney(uint8_t j)
+{
+    if (j >= NUM_HARMONIC_JOURNEYS) return;
+    const HarmonicJourney &J = HARMONIC_JOURNEYS[j];
+    g_hjIdx   = j;
+    g_hNodes  = J.nNodes;
+    g_hCenter = J.centerFirst;
+
+    const float R  = 72.0f; // pulled in so ring nodes clear the title/label bands
+    const int16_t cx = 120, cy = 120;
+    uint8_t start = g_hCenter ? 1 : 0;
+    uint8_t ringN = (uint8_t)(g_hNodes - start);
+    if (g_hCenter) { g_hnodeX[0] = cx; g_hnodeY[0] = cy; }
+    // Offset the ring by half a slice so a gap (not a node) sits at the very top
+    // and bottom — that's where the journey title and move-label are drawn.
+    float a0 = -(float)M_PI/2.0f + (float)M_PI / (float)ringN;
+    for (uint8_t k = 0; k < ringN; k++) {
+        float a = a0 + (float)k * 2.0f*(float)M_PI / (float)ringN;
+        g_hnodeX[start+k] = (int16_t)(cx + R * cosf(a) + 0.5f);
+        g_hnodeY[start+k] = (int16_t)(cy + R * sinf(a) + 0.5f);
+    }
+    markDirty();
+}
+
+// Update the selected chord node (the bottom label shows the live timbre, not a
+// per-chord message, so nothing else is needed here).
+inline void displaySetHarmonicChord(uint8_t chord)
+{
+    g_harmonicChord = (chord < g_hNodes) ? chord : 0;
+    markDirty();
+}
+
+// Hit-test a tap against the active journey's chord nodes.
+// Returns the node index, or 0xFF if no node was hit.
+inline uint8_t displayTapToHarmonicChord(uint16_t x, uint16_t y)
+{
+    for (uint8_t n = 0; n < g_hNodes; n++) {
+        int16_t nx=(int16_t)x-g_hnodeX[n], ny=(int16_t)y-g_hnodeY[n];
+        if ((int32_t)nx*nx+(int32_t)ny*ny <= (int32_t)HTOUCH_R*HTOUCH_R) return n;
+    }
+    return 0xFF;
+}
+
+// Hit-test a tap against the atlas picker rows. Returns the journey index, or
+// 0xFF if the tap missed every row.
+inline uint8_t displayTapToHarmonicJourney(uint16_t x, uint16_t y)
+{
+    (void)x;
+    for (uint8_t i = 0; i < NUM_HARMONIC_JOURNEYS; i++) {
+        int16_t cy = (int16_t)(HPICK_Y0 + i * HPICK_DY);
+        if ((int16_t)y >= cy - HPICK_DY/2 && (int16_t)y < cy + HPICK_DY/2) return i;
+    }
+    return 0xFF;
+}
+
+// True if a tap landed in the title band atop a chord map (→ back to picker).
+inline bool displayTapIsHarmonicTitle(uint16_t x, uint16_t y)
+{
+    (void)x; return (int16_t)y < HTOP_BAND;
+}
+
 inline void displayInit()
 {
     Touch_1IN28_XY XY;
@@ -262,9 +485,6 @@ inline void displayInit()
         if (mid - d >= 0)        g_stripOrder[k++] = (uint8_t)(mid - d);
     }
 }
-
-// Mark the screen for a fresh incremental repaint (from the centre out).
-namespace { inline void markDirty() { g_drawn = false; g_sweepStep = 0; } }
 
 inline void displayBeginCanvas()
 {
@@ -343,7 +563,9 @@ inline bool displayRenderStep()
 #else
             uint16_t lx = x;
 #endif
-            UWORD c = g_locked ? lockPixel(lx, ly) : composePixel(lx, ly, li);
+            UWORD c = g_locked       ? lockPixel(lx, ly)      :
+                      g_harmonicMode ? harmonicPixel(lx, ly)  :
+                                       composePixel(lx, ly, li);
             g_strip[idx++] = (uint8_t)(c >> 8);
             g_strip[idx++] = (uint8_t)(c & 0xFF);
         }
@@ -464,5 +686,12 @@ inline bool displayRenderStep() { return false; }
 inline DisplayGesture displayTapToGesture(uint16_t, uint16_t) { return GESTURE_NONE; }
 inline DisplayGesture displayPollGesture(uint16_t&, uint16_t&) { return GESTURE_NONE; }
 inline bool displayPollTouch(uint16_t&, uint16_t&) { return false; }
+inline void displaySetHarmonicMode(bool) {}
+inline void displaySetHarmonicPicking(bool) {}
+inline void displaySetHarmonicJourney(uint8_t) {}
+inline void displaySetHarmonicChord(uint8_t) {}
+inline uint8_t displayTapToHarmonicChord(uint16_t, uint16_t) { return 0xFF; }
+inline uint8_t displayTapToHarmonicJourney(uint16_t, uint16_t) { return 0xFF; }
+inline bool displayTapIsHarmonicTitle(uint16_t, uint16_t) { return false; }
 
 #endif // ENABLE_SCREEN

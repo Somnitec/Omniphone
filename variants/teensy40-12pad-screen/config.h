@@ -634,5 +634,210 @@ static constexpr uint8_t  MPE_MEMBER_BASE_CH      = 2;   // pad 0 → ch 2, pad 
 static constexpr uint32_t MPE_PRESSURE_THROTTLE_MS = 20; // ≤50 Hz per pad
 static constexpr uint8_t  MPE_PRESSURE_MIN_DELTA  = 2;   // skip if change < this (0–127)
 
+// ── Harmonic Journey screen mode ─────────────────────────────────────────────
+// An interactive tonal map displayed on the round screen. The long-press
+// screen-state cycle includes this mode:
+//   normal → harmonic journey → locked visualiser → normal (repeat).
+//
+// Entering Harmonic Journey first shows a PICKER of four "atlases", each a
+// different theory of harmonic motion. Choosing one opens its network of chord
+// nodes — tap a node to retune all 12 pads to that chord (with glide) and read
+// the emotional/functional label for the move. The active play mode keeps
+// running. Tap the journey title at the top to return to the picker.
+//
+//   1 Diatonic  — the seven diatonic chords of C major / A minor.
+//   2 Flamenco  — Spanish / flamenco Phrygian-dominant motion (Andalusian
+//                 cadence, the ♭II "Spanish" colour).
+//   3 Jazz      — chromatic jazz devices: ii–V–I, tritone substitution,
+//                 secondary dominants, modal mixture, Coltrane changes,
+//                 augmented / whole-tone motion.
+//   4 Cinematic — Neo-Riemannian chromatic mediants: a hexatonic P/L cycle of
+//                 major & minor triads (the "magic / awe" sound).
+//
+// The conceptual framework for atlas 1 (and the whole idea of labelling every
+// harmonic move with an emotion) is from:
+//   "Tonal Map of Chord Sequences: Harmonic Analysis and Practical
+//    Applications" — William R Thomas, atlas protocols, 2025-03-01.
+//   Inspired by a tonal map diagram by @purpasteur. Atlases 2–4 extend that
+//   premise into the modal-interchange, jazz-substitution and Neo-Riemannian
+//   territories Thomas discusses as the natural next layers of the map.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct HarmonicChord {
+    const char* name;    // short node label shown on screen (≤4 chars)
+    const char* feeling; // emotional quality / device — shown when no transition
+                         // matrix is supplied for this journey
+    float freqs[12];     // pad 0-5 = upper ring, 6-11 = lower ring
+};
+
+static constexpr uint8_t NUM_HARMONIC_CHORDS = 7;     // atlas 1 (diatonic) node count
+static constexpr uint8_t HARMONIC_MAX_NODES  = 8;     // largest atlas (jazz)
+static const float H_B5 = 987.77f; // B5 (not in Note:: namespace — B4 * 2)
+
+static const HarmonicChord HARMONIC_CHORDS[NUM_HARMONIC_CHORDS] = {
+    // 0: I — C major   "Pure positive" — the tonic home
+    { "C",  "Pure positive",
+      { Note::C4, Note::E4, Note::G4, Note::C5, Note::E5, Note::G5,
+        Note::C3, Note::E3, Note::G3, Note::C4, Note::E4, Note::G4 } },
+
+    // 1: ii — D minor  "Hardship, faltering" — subdominant tension
+    { "Dm", "Hardship",
+      { Note::D4, Note::F4, Note::A4, Note::D5, Note::F5, Note::A5,
+        Note::D3, Note::F3, Note::A3, Note::D4, Note::F4, Note::A4 } },
+
+    // 2: iii — E minor  "Mystery, complexity" — mediant
+    { "Em", "Mystery",
+      { Note::E4, Note::G4, Note::B4, Note::E5, Note::G5,     H_B5,
+        Note::E3, Note::G3, Note::B3, Note::E4, Note::G4, Note::B4 } },
+
+    // 3: IV — F major  "Exploration, warmth" — subdominant
+    { "F",  "Warmth",
+      { Note::F4, Note::A4, Note::C5, Note::F5, Note::A5, Note::C6,
+        Note::F3, Note::A3, Note::C4, Note::F4, Note::A4, Note::C5 } },
+
+    // 4: V — G major  "Tension, drama, alarm" — dominant
+    { "G",  "Tension",
+      { Note::G4, Note::B4, Note::D5, Note::G5,     H_B5, Note::D6,
+        Note::G3, Note::B3, Note::D4, Note::G4, Note::B4, Note::D5 } },
+
+    // 5: vi — A minor  "Melancholy, pure negative" — relative minor
+    { "Am", "Melancholy",
+      { Note::A3, Note::C4, Note::E4, Note::A4, Note::C5, Note::E5,
+        Note::A2, Note::C3, Note::E3, Note::A3, Note::C4, Note::E4 } },
+
+    // 6: vii° — B diminished  "Alarm, destabilization" — leading-tone chord
+    // ("Bo" is used as a screen-safe approximation of B°)
+    { "Bo", "Alarm",
+      { Note::B3, Note::D4, Note::F4, Note::B4, Note::D5, Note::F5,
+        Note::B2, Note::D3, Note::F3, Note::B3, Note::D4, Note::F4 } },
+};
+
+// Emotional transition labels for each chord → chord move [from][to].
+// Derived from William R Thomas's analysis of the tonal map transition
+// annotations: each edge in the network carries an emotional descriptor
+// that reflects the harmonic function and voice-leading character of the move.
+static const char* const HARMONIC_TRANSITIONS[7][7] = {
+    // from I (C major)
+    { "Home",        "Unease",      "Opening up",  "Exploration", "Rising",       "Darkening",   "Into dark"    },
+    // from ii (Dm)
+    { "Lifting",     "Stillness",   "Lingering",   "Gathering",   "Building",     "Deepening",   "Destabilize"  },
+    // from iii (Em)
+    { "Hope rises",  "Faltering",   "Stillness",   "Magic lift",  "Expectation",  "Kindred",     "Uncertainty"  },
+    // from IV (F)
+    { "Soft return", "Darker",      "Meditation",  "Stillness",   "Drama",        "Consolation", "Destabilize"  },
+    // from V (G)
+    { "Resolution",  "Setback",     "Surprise",    "Retreat",     "Stillness",    "Bittersweet", "Into chaos"   },
+    // from vi (Am)
+    { "Redemption",  "Grief",       "Soul bond",   "Support",     "Setback",      "Stillness",   "Descent"      },
+    // from vii° (Bdim)
+    { "Release",     "Unresolved",  "Unstable",    "Relief",      "More tension", "Dark rest",   "Stillness"    },
+};
+
+// ── Atlas 2: Flamenco / Spanish (E Phrygian dominant) ────────────────────────
+// Built around the Andalusian cadence (Am–G–F–E) and the Phrygian-dominant
+// tonic E (with its raised G#). Node 0 = E sits at the centre as the cadential
+// home; the ♭II (F) is the iconic "Spanish" colour. Triads voiced oct3/oct4.
+static const HarmonicChord FLAMENCO_CHORDS[7] = {
+    { "E",  "Cante home",                              // Phrygian-dominant tonic (E G# B)
+      { Note::E4, Note::Ab4, Note::B4, Note::E4, Note::Ab4, Note::B4,
+        Note::E3, Note::Ab3, Note::B3, Note::E3, Note::Ab3, Note::B3 } },
+    { "F",  "Spanish bII",                             // the flat-two colour (F A C)
+      { Note::F4, Note::A4, Note::C4, Note::F4, Note::A4, Note::C4,
+        Note::F3, Note::A3, Note::C3, Note::F3, Note::A3, Note::C3 } },
+    { "G",  "Lift",                                    // (G B D)
+      { Note::G4, Note::B4, Note::D4, Note::G4, Note::B4, Note::D4,
+        Note::G3, Note::B3, Note::D3, Note::G3, Note::B3, Note::D3 } },
+    { "Am", "Lament",                                  // iv (A C E)
+      { Note::A4, Note::C4, Note::E4, Note::A4, Note::C4, Note::E4,
+        Note::A3, Note::C3, Note::E3, Note::A3, Note::C3, Note::E3 } },
+    { "Dm", "Deepening",                               // (D F A)
+      { Note::D4, Note::F4, Note::A4, Note::D4, Note::F4, Note::A4,
+        Note::D3, Note::F3, Note::A3, Note::D3, Note::F3, Note::A3 } },
+    { "C",  "Brightening",                             // (C E G)
+      { Note::C4, Note::E4, Note::G4, Note::C4, Note::E4, Note::G4,
+        Note::C3, Note::E3, Note::G3, Note::C3, Note::E3, Note::G3 } },
+    { "B7", "Tension",                                 // dominant pull (B D# F# A)
+      { Note::B4, Note::Eb4, Note::Gb4, Note::A4, Note::B4, Note::Eb4,
+        Note::B3, Note::Eb3, Note::Gb3, Note::A3, Note::B3, Note::Eb3 } },
+};
+
+// ── Atlas 3: Jazz (chromatic devices, motion through keys) ───────────────────
+// Eight 7th-chords; node 0 = Cmaj7 at the centre. Each outer node is a classic
+// way jazz leaves the key: tritone sub, secondary dominant, modal mixture,
+// Coltrane (major-third) change, augmented / whole-tone. The feeling string
+// names the DEVICE (no per-pair matrix — the move itself is the point).
+static const HarmonicChord JAZZ_CHORDS[8] = {
+    { "CM7","Tonic rest",                              // Imaj7 (C E G B)
+      { Note::C4, Note::E4, Note::G4, Note::B4, Note::C4, Note::E4,
+        Note::C3, Note::E3, Note::G3, Note::B3, Note::C3, Note::E3 } },
+    { "Dm7","ii — set out",                            // (D F A C)
+      { Note::D4, Note::F4, Note::A4, Note::C4, Note::D4, Note::F4,
+        Note::D3, Note::F3, Note::A3, Note::C3, Note::D3, Note::F3 } },
+    { "G7", "V — drive",                               // dominant (G B D F)
+      { Note::G4, Note::B4, Note::D4, Note::F4, Note::G4, Note::B4,
+        Note::G3, Note::B3, Note::D3, Note::F3, Note::G3, Note::B3 } },
+    { "Db7","Tritone sub",                             // bII7 for G7 (Db F Ab B)
+      { Note::Db4, Note::F4, Note::Ab4, Note::B4, Note::Db4, Note::F4,
+        Note::Db3, Note::F3, Note::Ab3, Note::B3, Note::Db3, Note::F3 } },
+    { "A7", "Secondary V",                             // V7/ii (A C# E G)
+      { Note::A4, Note::Db4, Note::E4, Note::G4, Note::A4, Note::Db4,
+        Note::A3, Note::Db3, Note::E3, Note::G3, Note::A3, Note::Db3 } },
+    { "AbM","Modal mix",                               // bVI borrowed (Ab C Eb G)
+      { Note::Ab4, Note::C4, Note::Eb4, Note::G4, Note::Ab4, Note::C4,
+        Note::Ab3, Note::C3, Note::Eb3, Note::G3, Note::Ab3, Note::C3 } },
+    { "EbM","Coltrane",                                // bIII major-third change (Eb G Bb D)
+      { Note::Eb4, Note::G4, Note::Bb4, Note::D4, Note::Eb4, Note::G4,
+        Note::Eb3, Note::G3, Note::Bb3, Note::D3, Note::Eb3, Note::G3 } },
+    { "F#+","Whole-tone",                              // augmented / side-slip (F# A# D)
+      { Note::Gb4, Note::Bb4, Note::D4, Note::Gb4, Note::Bb4, Note::D4,
+        Note::Gb3, Note::Bb3, Note::D3, Note::Gb3, Note::Bb3, Note::D3 } },
+};
+
+// ── Atlas 4: Cinematic (Neo-Riemannian hexatonic cycle) ──────────────────────
+// Six triads on a ring (no centre): C, Cm, Ab, Abm, E, Em. Each step to a
+// neighbour is a single-semitone voice-leading move (P = parallel major/minor,
+// L = leading-tone exchange) — Cohn's hexatonic cycle, the chromatic-mediant
+// "magic / awe" sound the article ties to Neo-Riemannian transformations.
+static const HarmonicChord CINEMATIC_CHORDS[6] = {
+    { "C",  "Radiance",                               // C major (C E G)
+      { Note::C4, Note::E4, Note::G4, Note::C4, Note::E4, Note::G4,
+        Note::C3, Note::E3, Note::G3, Note::C3, Note::E3, Note::G3 } },
+    { "Cm", "Shadow",                                 // P: C minor (C Eb G)
+      { Note::C4, Note::Eb4, Note::G4, Note::C4, Note::Eb4, Note::G4,
+        Note::C3, Note::Eb3, Note::G3, Note::C3, Note::Eb3, Note::G3 } },
+    { "Ab", "Wonder",                                 // L: Ab major (Ab C Eb)
+      { Note::Ab4, Note::C4, Note::Eb4, Note::Ab4, Note::C4, Note::Eb4,
+        Note::Ab3, Note::C3, Note::Eb3, Note::Ab3, Note::C3, Note::Eb3 } },
+    { "Abm","Mystery",                                // P: Ab minor (Ab Cb=B Eb)
+      { Note::Ab4, Note::B4, Note::Eb4, Note::Ab4, Note::B4, Note::Eb4,
+        Note::Ab3, Note::B3, Note::Eb3, Note::Ab3, Note::B3, Note::Eb3 } },
+    { "E",  "Awe",                                    // L: E major (E G# B)
+      { Note::E4, Note::Ab4, Note::B4, Note::E4, Note::Ab4, Note::B4,
+        Note::E3, Note::Ab3, Note::B3, Note::E3, Note::Ab3, Note::B3 } },
+    { "Em", "Reverie",                                // P: E minor (E G B); ring closes L→C
+      { Note::E4, Note::G4, Note::B4, Note::E4, Note::G4, Note::B4,
+        Note::E3, Note::G3, Note::B3, Note::E3, Note::G3, Note::B3 } },
+};
+
+// ── Journey table ────────────────────────────────────────────────────────────
+// transitions: flattened [from*nNodes + to] move-labels, or nullptr to fall
+// back to each chord's `feeling`. centerFirst: node 0 sits at the screen centre
+// with the rest on a ring (a "home + satellites" map); false = a plain ring.
+struct HarmonicJourney {
+    const char*          name;        // shown in the picker and atop the map
+    uint8_t              nNodes;
+    bool                 centerFirst; // node 0 centred (home) vs. all on a ring
+    const HarmonicChord* chords;
+    const char* const*   transitions; // nullptr → use chord.feeling
+};
+
+static constexpr uint8_t NUM_HARMONIC_JOURNEYS = 4;
+static const HarmonicJourney HARMONIC_JOURNEYS[NUM_HARMONIC_JOURNEYS] = {
+    { "Diatonic",  7, true,  HARMONIC_CHORDS,  &HARMONIC_TRANSITIONS[0][0] },
+    { "Flamenco",  7, true,  FLAMENCO_CHORDS,  nullptr },
+    { "Jazz",      8, true,  JAZZ_CHORDS,      nullptr },
+    { "Cinematic", 6, false, CINEMATIC_CHORDS, nullptr },
+};
+
 // Update timing
 static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz; the burst reads fill most of this at 100 kHz I2C

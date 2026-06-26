@@ -238,8 +238,23 @@ static float    lastIntensity[NUM_SENSORS] = { 0.0f }; // prev-frame intensity �
 static uint32_t holdStartMs[NUM_SENSORS]   = { 0 };    // when each pad became held (0 = released)
                                                        // → press order for FM carrier / Benjolin
 
-// Screen lock/visualiser state, and the Teleplot per-pad readout (serial 't').
-static bool     lockMode    = false;
+// Screen state: 0 = normal, 1 = harmonic journey, 2 = locked visualiser.
+// Cycles on each 5-second hold: normal → harmonic → locked → normal.
+static uint8_t  screenState = 0;
+
+// Harmonic Journey: override the pad pitches with the selected chord's tones.
+// harmonicOverride is true once a chord has been chosen; loadHarmonicChord()
+// sets harmonicFreqs[] and starts a glide, and the loop reads harmonicFreqs[]
+// as the glide target. activeJourney selects which atlas (see HARMONIC_JOURNEYS);
+// harmonicPicking is true while the atlas picker is showing (no chord chosen yet).
+static uint8_t  activeJourney       = 0;
+static uint8_t  activeHarmonicChord = 0;
+static float    harmonicFreqs[NUM_SENSORS] = { 0.0f };
+static bool     harmonicOverride    = false;
+static bool     harmonicPicking     = false;
+// Harmonic journey always plays in Proximity; this remembers the play mode in
+// effect before entering so it can be restored on the way out.
+static uint8_t  modeBeforeHarmonic  = MODE_PROX;
 static bool     teleplotOn  = false;
 static uint16_t tpFilt[NUM_SENSORS]  = { 0 }; // last MPR121 filtered reading per pad
 static float    tpDelta[NUM_SENSORS] = { 0 }; // last baseline−filtered delta per pad
@@ -260,8 +275,10 @@ static constexpr int     EEPROM_ADDR_MAGIC  = 0;
 static constexpr int     EEPROM_ADDR_SCALE  = 1;
 static constexpr int     EEPROM_ADDR_TIMBRE = 2;
 static constexpr int     EEPROM_ADDR_MODE   = 3;
-static constexpr int     EEPROM_ADDR_LOCK   = 4;
-static constexpr uint8_t EEPROM_MAGIC       = 0xA9; // bumped: added mode byte
+static constexpr int     EEPROM_ADDR_SCREEN  = 4; // 0=normal, 1=harmonic, 2=locked
+static constexpr int     EEPROM_ADDR_HARM    = 5; // last selected harmonic chord
+static constexpr int     EEPROM_ADDR_JOURNEY = 6; // last selected harmonic atlas
+static constexpr uint8_t EEPROM_MAGIC        = 0xAC; // bumped: added atlas picker
 
 static uint8_t loadStoredScale(uint8_t fallback)
 {
@@ -303,16 +320,43 @@ static void storeMode(uint8_t index)
     EEPROM.update(EEPROM_ADDR_MODE, index);
 }
 
-static bool loadStoredLock()
+static uint8_t loadStoredScreen(uint8_t fallback)
 {
-    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return false;
-    return EEPROM.read(EEPROM_ADDR_LOCK) == 1;
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_SCREEN);
+    return (v < 3) ? v : fallback;
 }
 
-static void storeLock(bool on)
+static void storeScreen(uint8_t s)
 {
     EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
-    EEPROM.update(EEPROM_ADDR_LOCK, on ? 1 : 0);
+    EEPROM.update(EEPROM_ADDR_SCREEN, s);
+}
+
+static uint8_t loadStoredHarmChord(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_HARM);
+    return (v < HARMONIC_MAX_NODES) ? v : fallback;
+}
+
+static void storeHarmChord(uint8_t c)
+{
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_HARM, c);
+}
+
+static uint8_t loadStoredJourney(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_JOURNEY);
+    return (v < NUM_HARMONIC_JOURNEYS) ? v : fallback;
+}
+
+static void storeJourney(uint8_t j)
+{
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_JOURNEY, j);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -527,6 +571,42 @@ static void loadMode(uint8_t index)
     displayShowMode(MODE_NAMES[index]);
     Serial.print(F("# Mode: "));
     Serial.println(MODE_NAMES[index]);
+}
+
+// Harmonic Journey — retune all 12 pads to the selected chord of the active
+// atlas with a smooth glide. The active play mode keeps running; only pitches
+// shift. The screen's bottom label shows the live timbre (changeable with a
+// left/right swipe); the emotional character of each move is documented in the
+// config.h comments / HARMONIC_TRANSITIONS data rather than drawn on screen.
+static void loadHarmonicChord(uint8_t chord)
+{
+    const HarmonicJourney &J = HARMONIC_JOURNEYS[activeJourney];
+    if (chord >= J.nNodes) return;
+
+    activeHarmonicChord = chord;
+    storeHarmChord(chord);
+
+    glideStartMs = millis();
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) {
+        glideStart[i]    = glideFreq[i];
+        harmonicFreqs[i] = J.chords[chord].freqs[i];
+    }
+    harmonicOverride = true;
+
+    displaySetHarmonicChord(chord);
+    Serial.print(F("# Harmonic: ")); Serial.print(J.name);
+    Serial.print(' ');               Serial.println(J.chords[chord].name);
+}
+
+// Select the active atlas (journey) and lay out its node network. Clamps the
+// remembered chord to the new atlas's node count.
+static void setActiveJourney(uint8_t j)
+{
+    if (j >= NUM_HARMONIC_JOURNEYS) return;
+    activeJourney = j;
+    storeJourney(j);
+    if (activeHarmonicChord >= HARMONIC_JOURNEYS[j].nNodes) activeHarmonicChord = 0;
+    displaySetHarmonicJourney(j);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1013,8 +1093,28 @@ void setup()
     loadScale(startupScale, false);      // snaps glideFreq[] to the scale's notes
     loadTimbre(startupTimbre, false);    // full voice init using those freqs
     loadMode(startupMode);               // restore the saved play mode
-    lockMode = loadStoredLock();         // restore the locked-screen state
-    displaySetLocked(lockMode);
+
+    // Restore the screen state (normal / harmonic journey / locked) and atlas.
+    screenState         = loadStoredScreen(0);
+    activeJourney       = loadStoredJourney(0);
+    activeHarmonicChord = loadStoredHarmChord(0);
+    setActiveJourney(activeJourney); // clamp chord + lay out the node network
+    displaySetLocked(screenState == 2);
+    displaySetHarmonicMode(screenState == 1);
+    if (screenState == 1) {
+        // Resume straight into the remembered atlas's map (skip the picker) with
+        // the last-selected chord active. Harmonic journey always plays in
+        // Proximity; remember the restored mode for when the user leaves.
+        modeBeforeHarmonic = activeMode;
+        if (activeMode != MODE_PROX) loadMode(MODE_PROX);
+        harmonicPicking = false;
+        displaySetHarmonicPicking(false);
+        const HarmonicJourney &J = HARMONIC_JOURNEYS[activeJourney];
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+            harmonicFreqs[i] = J.chords[activeHarmonicChord].freqs[i];
+        harmonicOverride = true;
+        displaySetHarmonicChord(activeHarmonicChord);
+    }
 
     // ── MPE Configuration Message ────────────────────────────────────────────
     // RPN 6 on the master channel sets up MPE Zone 1: 12 member channels
@@ -1058,6 +1158,39 @@ void loop()
             Serial.print(F("# Teleplot readout ")); Serial.println(teleplotOn ? F("ON") : F("OFF")); }
     }
 
+    // ── High-rate pitch glide (decoupled from the 8 ms sensor cadence) ───────
+    // The portamento + LFO pitch update runs ~1 kHz (once per millis() tick) so
+    // large retunes — e.g. a whole-chord change in Harmonic Journey — glide
+    // smoothly instead of stepping in audible 8 ms jumps. The sensor + voice
+    // logic below still runs every UPDATE_MS; this only maintains glideFreq[]
+    // and the oscillator pitch, which the slower block then reads.
+    static uint32_t lastPitchMs = 0;
+    if (now != lastPitchMs)
+    {
+        float dtP = (lastPitchMs == 0) ? (UPDATE_MS / 1000.0f)
+                                       : ((float)(now - lastPitchMs) / 1000.0f);
+        lastPitchMs = now;
+
+        float gT = (SET_GLIDE_MS > 0.0f)
+                 ? ((float)(now - glideStartMs) / SET_GLIDE_MS) : 1.0f;
+        if (gT > 1.0f) gT = 1.0f;
+
+        const ScaleSet &scP = SCALE_SETS[activeScale];
+        for (uint8_t i = 0; i < NUM_SENSORS; i++)
+        {
+            if (SENSORS[i].electrode == NO_PIN) continue;
+            float tgt = harmonicOverride ? harmonicFreqs[i] : scP.freqs[i];
+            glideFreq[i] = (gT >= 1.0f) ? tgt
+                         : glideStart[i] * powf(tgt / glideStart[i], gT);
+
+            lfoPhase[i] += lfoRate[i] * dtP;
+            if (lfoPhase[i] >= 1.0f) lfoPhase[i] -= 1.0f;
+
+            float freq = glideFreq[i] * (1.0f + LFO_AMOUNT * sinf(2.0f * (float)M_PI * lfoPhase[i]));
+            setVoiceFrequency(voices[i], freq);
+        }
+    }
+
     // ── Rate-limited sensor update ───────────────────────────────────────────
     if (now - lastUpdateMs < UPDATE_MS)
         return;
@@ -1086,14 +1219,9 @@ void loop()
     static uint8_t ledBri[NUM_BOARDS][8];
     memset(ledBri, 0, sizeof(ledBri));
 
-    const ScaleSet &scaleSet = SCALE_SETS[activeScale];
-
     // ── Per-frame interpolation progress (shared by all voices) ──────────────
-    // Pitch glide: fixed-time, 0→1 over SET_GLIDE_MS (applied log per voice).
-    float glideT = (SET_GLIDE_MS > 0.0f)
-                 ? ((float)(now - glideStartMs) / SET_GLIDE_MS) : 1.0f;
-    if (glideT > 1.0f) glideT = 1.0f;
-
+    // (Pitch glide + LFO now run in the high-rate tick above; only the timbre
+    // morph is interpolated here, at the 8 ms voice cadence.)
     // Timbre morph: fixed-time linear, 0→1 over TIMBRE_MORPH_MS.
     float morphT = (TIMBRE_MORPH_MS > 0.0f)
                  ? ((float)(now - timbreMorphStartMs) / TIMBRE_MORPH_MS) : 1.0f;
@@ -1238,22 +1366,10 @@ void loop()
         if (intensity > ARP_HOLD_INTENSITY) { if (holdStartMs[i] == 0) holdStartMs[i] = now; }
         else                                holdStartMs[i] = 0;
 
-        // ── Scale portamento ─────────────────────────────────────────────────
-        // Fixed-time log sweep from glideStart[i] to the new note (constant
-        // cents/sec, finishes at glideT==1). Steady state: glideT==1 → target.
-        float tgt = scaleSet.freqs[i];
-        glideFreq[i] = (glideT >= 1.0f) ? tgt
-                     : glideStart[i] * powf(tgt / glideStart[i], glideT);
-
         // ── Timbre morph — apply the live sub/resonance to this voice ────────
+        // (Pitch — portamento + LFO — is maintained in the high-rate tick above
+        // so big retunes glide smoothly; here we only morph the timbre.)
         setVoiceMorph(voices[i], curSub, curQ);
-
-        // ── LFO pitch drift ──────────────────────────────────────────────────
-        lfoPhase[i] += lfoRate[i] * (UPDATE_MS / 1000.0f);
-        if (lfoPhase[i] >= 1.0f) lfoPhase[i] -= 1.0f;
-
-        float freq = glideFreq[i] * (1.0f + LFO_AMOUNT * sinf(2.0f * (float)M_PI * lfoPhase[i]));
-        setVoiceFrequency(voices[i], freq);
 
         // FM Poly: each voice self-FMs, depth ∝ its proximity. Off otherwise.
         if (fmPoly) setVoiceFM(voices[i], FM_POLY_DEPTH, intensity * FM_POLY_AMT);
@@ -1484,10 +1600,13 @@ void loop()
         lastGestureMs = now;
         uint16_t tapX = 0, tapY = 0;
         DisplayGesture g = displayPollGesture(tapX, tapY); // NONE when screen off
-        if (g == GESTURE_TAP) g = displayTapToGesture(tapX, tapY);
+        bool wasTap = (g == GESTURE_TAP);
 
-        if (!lockMode) // swipes/arrows only do something on the normal screen
+        if (screenState == 0) // normal screen: swipes/arrows change scale/timbre/mode
         {
+            // A tap maps to whichever arrow box it landed in (harmonic mode
+            // instead consumes the raw tap to pick atlases / chord nodes).
+            if (wasTap) g = displayTapToGesture(tapX, tapY);
             switch (g)
             {
                 case GESTURE_RIGHT: loadScale((uint8_t)((activeScale + 1) % NUM_SCALE_SETS), true); break;
@@ -1505,6 +1624,43 @@ void loop()
                 default: break;
             }
         }
+        else if (screenState == 1) // harmonic journey
+        {
+            // Long-press while on a chord map → back to the atlas picker. (The
+            // 5 s screen-state hold still cycles to the locked visualiser.)
+            if (g == GESTURE_LONGPRESS && !harmonicPicking)
+            {
+                harmonicPicking = true;
+                displaySetHarmonicPicking(true);
+            }
+            // Swipe left/right cycles the TIMBRE (the scale is overridden by the
+            // chord nodes here, so left/right is free to do this instead).
+            else if (g == GESTURE_RIGHT)
+                loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true);
+            else if (g == GESTURE_LEFT)
+                loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true);
+            else if (wasTap)
+            {
+                if (harmonicPicking)
+                {
+                    // Picker: tap an atlas name to open its chord map.
+                    uint8_t j = displayTapToHarmonicJourney(tapX, tapY);
+                    if (j != 0xFF)
+                    {
+                        setActiveJourney(j);
+                        harmonicPicking = false;
+                        displaySetHarmonicPicking(false);
+                        loadHarmonicChord(activeHarmonicChord); // apply pitches + label
+                    }
+                }
+                else
+                {
+                    // Map: tap a chord node to retune the pads.
+                    uint8_t chord = displayTapToHarmonicChord(tapX, tapY);
+                    if (chord != 0xFF) loadHarmonicChord(chord);
+                }
+            }
+        }
 
         // Lock hold: holdAccum is cumulative down-time, tolerating gaps up to
         // 600 ms (touch reads drop out at the round edges) so an edge dropout
@@ -1519,10 +1675,31 @@ void loop()
             lastTouchMs = now;
             if (!pressActed && holdAccum >= LOCK_HOLD_MS)
             {
-                lockMode = !lockMode;
-                displaySetLocked(lockMode);
-                storeLock(lockMode); // remember across power-off
-                Serial.print(F("# screen ")); Serial.println(lockMode ? F("LOCKED") : F("unlocked"));
+                // Cycle: normal (0) → harmonic journey (1) → locked (2) → normal
+                screenState = (uint8_t)((screenState + 1) % 3);
+                bool inHarm = (screenState == 1);
+                bool inLock = (screenState == 2);
+                if (inHarm) {
+                    // Entering harmonic mode always opens the atlas picker first;
+                    // pitches stay on the current scale until an atlas is chosen.
+                    // Harmonic journey always plays in Proximity — remember the
+                    // current mode and switch, restoring it again on exit.
+                    modeBeforeHarmonic = activeMode;
+                    if (activeMode != MODE_PROX) loadMode(MODE_PROX);
+                    harmonicPicking = true;
+                    setActiveJourney(activeJourney);   // lay out the (remembered) atlas
+                    displaySetHarmonicPicking(true);
+                    displaySetHarmonicMode(true);
+                } else {
+                    displaySetHarmonicMode(false);
+                    harmonicPicking  = false;
+                    harmonicOverride = false; // back to scale when leaving harmonic
+                    if (activeMode != modeBeforeHarmonic) loadMode(modeBeforeHarmonic);
+                }
+                displaySetLocked(inLock);
+                storeScreen(screenState);
+                static const char* const sNames[] = { "normal", "harmonic", "locked" };
+                Serial.print(F("# screen ")); Serial.println(sNames[screenState]);
                 pressActed = true;
             }
         }
