@@ -5,11 +5,14 @@
 // ALL screen code lives here. When ENABLE_SCREEN == 0 every function is an
 // empty inline no-op, so callers never need their own #if guard.
 //
-// PARALLEL / NON-BLOCKING: the screen is repainted one horizontal strip at a
-// time. Each strip is rendered into a RAM buffer (cheap CPU) and streamed to the
-// LCD by SPI DMA — a background transfer — so the loop returns immediately to
-// the audio and LEDs and never blocks on the screen. The SPI bus is dedicated to
-// the LCD (audio = I2S, LEDs/touch = I2C), so the DMA never competes with them.
+// PARALLEL / NON-BLOCKING + ATOMIC FRAMES: the frame is rendered into an
+// off-screen framebuffer one horizontal band at a time (so no single loop pass
+// blocks the pads/audio), all bands drawn from ONE per-frame snapshot of the UI
+// state. Only when the frame is complete is it streamed to the LCD in a single
+// background SPI-DMA transfer — the panel flips at once instead of updating in
+// visible strips. Two framebuffers: render into one while the other streams.
+// The SPI bus is dedicated to the LCD (audio = I2S, LEDs/touch = I2C), so the
+// DMA never competes with them.
 //
 // Look: white-on-black; the background glows from black toward white as the
 // average pad intensity rises (all pads maxed → white). Arrows and (debug) tap
@@ -56,8 +59,14 @@ static constexpr uint16_t TIMBRE_T = 156, TIMBRE_H = 48;
 static constexpr uint16_t STATS_T  = 206, STATS_H  = 18;  // small cpu/mem readout, bottom middle
 enum { LINE_TITLE = 0, LINE_MODE, LINE_SCALE, LINE_TIMBRE, LINE_STATS, LINE_COUNT };
 
-static constexpr uint16_t GLOW_STRIP   = 30;            // rows streamed per render step
-static constexpr uint32_t SCREEN_SPI_HZ = 40000000;    // GC9A01 SPI clock (proven-safe alongside audio)
+static constexpr uint16_t BAND_ROWS    = 20;           // rows rendered per render step (bounds CPU per pass)
+static constexpr uint32_t SCREEN_SPI_HZ = 40000000;    // GC9A01 SPI clock. DO NOT OVERCLOCK: 60 MHz
+                                                       // permanently froze the I2S/SAI1 audio output within
+                                                       // ~1.5 s of the first full-frame DMA flips (audio update
+                                                       // ISR never fires again; loop/sensors/screen keep
+                                                       // running). Verified by RMS-tap bisection 2026-07-03:
+                                                       // 60 MHz → dead, 40 MHz → stable. 40 MHz is the
+                                                       // proven-safe-alongside-audio value.
 
 namespace {
 static const uint16_t LINE_Y[LINE_COUNT] = { TITLE_T, MODE_T, SCALE_T, TIMBRE_T, STATS_T };
@@ -114,21 +123,28 @@ static constexpr int16_t HNODE_R  = 20; // node circle radius (px)
 static constexpr int16_t HTOUCH_R = 30;
 static constexpr int16_t HTOP_BAND = 36; // tap above this y in a map → back to picker
 
-// Picker row geometry (4 atlas names stacked under a title).
-static constexpr int16_t HPICK_Y0 = 78;  // centre-y of the first row
-static constexpr int16_t HPICK_DY = 40;  // row spacing
+// Picker row geometry (5 atlas names stacked under a title).
+static constexpr int16_t HPICK_Y0 = 70;  // centre-y of the first row
+static constexpr int16_t HPICK_DY = 32;  // row spacing
 
-// Incremental-repaint state. The screen is painted in strips, in an INSIDE-OUT
-// order (centre strip first, then outward) so a refresh radiates from the middle
-// rather than rolling top-to-bottom — smoother, especially in lock mode.
-static uint8_t  g_stripOrder[16] = { 0 }; // strip indices, centre-out
-static uint8_t  g_nStrips    = 0;     // number of strips (set in displayInit)
-static uint8_t  g_sweepStep  = 0;     // index into g_stripOrder for the next strip
-static uint8_t  g_sweepLevel = 0;     // bg level captured at the top of this sweep
-static bool     g_drawn      = true;  // whole screen matches the target → idle
+// Atomic-frame repaint state. Bands render top-to-bottom into the off-screen
+// buffer; nothing reaches the panel until the whole frame is done, so the order
+// no longer shows. Double-buffered: render into g_fb[g_fbRender] while the
+// other buffer streams out by DMA.
+static constexpr uint8_t  N_BANDS  = (uint8_t)((LCD_HEIGHT + BAND_ROWS - 1) / BAND_ROWS);
+static constexpr uint32_t FB_BYTES = (uint32_t)LCD_WIDTH * LCD_HEIGHT * 2;
+DMAMEM static uint8_t g_fb[2][FB_BYTES]; // OCRAM so the SPI DMA can reach it
+static uint8_t  g_fbRender = 0;      // buffer being rendered into
+static uint8_t  g_band     = 0;      // next band to render (0 = idle / frame start)
+static bool     g_drawn    = true;   // screen content matches the target → idle
 
-// DMA transfer state (the strip buffer lives in OCRAM so DMA can reach it).
-DMAMEM static uint8_t g_strip[LCD_WIDTH * GLOW_STRIP * 2];
+// Per-frame snapshot of everything the pixel composers read, taken once at the
+// top of each frame so every band comes from the same instant — no intra-frame
+// shear (that shear is what used to read as "blocks").
+static uint8_t g_snapLevel = 0;
+static float   g_snapPad[NUM_SENSORS] = { 0 };
+static char    g_snapText[LINE_COUNT][20] = { {0} };
+
 static EventResponder g_spiEvent;
 static volatile bool  g_dmaBusy = false;
 
@@ -217,6 +233,250 @@ inline bool nearSeg(int16_t x, int16_t y,
     return px*px+py*py <= tol*tol;
 }
 
+inline void markDirty(); // defined below (after the pixel composers)
+
+// ── Tonal Map (the dynamic-graph journey, index JOURNEY_TONAL_MAP) ───────────
+// The current chord sits at the centre; its legal moves (see tonalmap.h) form
+// an option ring, and each option's own moves show as a dim labelled preview
+// fan further out. Tapping an option re-centres the map: shared nodes glide to
+// their new spots, new ones fade in, dropped ones fade out in place.
+static constexpr uint8_t  TM_MAX_VIS = 48;    // layout targets (≤21) + fade-outs
+static constexpr uint32_t TM_ANIM_MS = 400;   // relayout glide time
+static constexpr float    TM_R1      = 64.0f; // option ring radius
+static constexpr float    TM_R2      = 97.0f; // preview fan radius
+static constexpr float    TM_CR      = 22.0f; // centre node circle radius
+static constexpr float    TM_OR      = 17.0f; // option node circle radius
+
+struct TMVisNode {
+    uint8_t node;          // tonal map node id (0…47)
+    float x0, y0, s0, b0;  // animation start: position, circle radius, brightness
+    float x1, y1, s1, b1;  // animation target
+    float cx, cy, cs, cb;  // current (interpolated) values — what gets drawn
+};
+static TMVisNode g_tmVis[TM_MAX_VIS];
+static uint8_t   g_tmNVis  = 0;  // total entries (targets first, then fade-outs)
+static uint8_t   g_tmNKeep = 0;  // target entries that survive after the anim
+
+struct TMVisEdge { uint8_t a, b; bool dotted; bool dim; };
+static TMVisEdge g_tmEdge[TM_MAX_VIS];
+static uint8_t   g_tmNEdge = 0;
+
+static uint32_t  g_tmAnimStart  = 0; // millis() when the glide began; 0 = idle
+static uint8_t   g_tmCenterNode = 0;
+static uint8_t   g_tmOptNode[TONAL_MAX_MOVES];  // option-ring tap targets
+static int16_t   g_tmOptX[TONAL_MAX_MOVES], g_tmOptY[TONAL_MAX_MOVES];
+static uint8_t   g_tmNOpt = 0;
+
+// Per-type node colour (major pink / minor blue / dom7 amber / aug green, as
+// on the source diagram), scaled by brightness b (0…1).
+inline UWORD tmColor(uint8_t type, float b)
+{
+    static const float RGB[4][3] = {
+        { 1.00f, 0.35f, 0.55f },  // TM_MAJ  — pink
+        { 0.35f, 0.65f, 1.00f },  // TM_MIN  — blue
+        { 1.00f, 0.80f, 0.20f },  // TM_DOM7 — amber
+        { 0.40f, 1.00f, 0.45f },  // TM_AUG  — green
+    };
+    if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+    uint8_t r  = (uint8_t)(RGB[type][0] * b * 255.0f);
+    uint8_t g  = (uint8_t)(RGB[type][1] * b * 255.0f);
+    uint8_t bl = (uint8_t)(RGB[type][2] * b * 255.0f);
+    return (UWORD)(((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3));
+}
+
+// nearSeg with a bounding-box early-out plus the hit's parameter t and the
+// segment length — needed to dash dotted edges and clip them at the nodes.
+inline bool nearSegT(uint16_t x, uint16_t y, float ax, float ay,
+                     float bx, float by, float tol, float& tOut, float& lenOut)
+{
+    float lo = (ax < bx ? ax : bx) - tol, hi = (ax > bx ? ax : bx) + tol;
+    if ((float)x < lo || (float)x > hi) return false;
+    lo = (ay < by ? ay : by) - tol; hi = (ay > by ? ay : by) + tol;
+    if ((float)y < lo || (float)y > hi) return false;
+    float dx = bx - ax, dy = by - ay, l2 = dx * dx + dy * dy;
+    if (l2 < 1.0f) return false;
+    float t = (((float)x - ax) * dx + ((float)y - ay) * dy) / l2;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    float px = ax + t * dx - (float)x, py = ay + t * dy - (float)y;
+    if (px * px + py * py > tol * tol) return false;
+    tOut = t; lenOut = sqrtf(l2);
+    return true;
+}
+
+// Re-centre the map on `node` and (optionally) start the relayout glide.
+inline void tmLayout(uint8_t node, bool animate)
+{
+    // Snapshot the outgoing visual set at its current interpolated state.
+    static TMVisNode old[TM_MAX_VIS];
+    uint8_t nOld = g_tmNVis;
+    memcpy(old, g_tmVis, sizeof(TMVisNode) * nOld);
+    bool used[TM_MAX_VIS] = { false };
+
+    g_tmCenterNode = node;
+    g_tmNVis = 0; g_tmNEdge = 0; g_tmNOpt = 0;
+
+    // Add a target node: glide from its old spot if it was already visible,
+    // otherwise fade in at its destination.
+    auto place = [&](uint8_t id, float x, float y, float s, float b) -> uint8_t {
+        TMVisNode &v = g_tmVis[g_tmNVis];
+        v.node = id; v.x1 = x; v.y1 = y; v.s1 = s; v.b1 = b;
+        v.x0 = x; v.y0 = y; v.s0 = s * 0.4f; v.b0 = 0.0f;
+        for (uint8_t i = 0; i < nOld; i++)
+            if (!used[i] && old[i].node == id) {
+                used[i] = true;
+                v.x0 = old[i].cx; v.y0 = old[i].cy;
+                v.s0 = old[i].cs; v.b0 = old[i].cb;
+                break;
+            }
+        v.cx = v.x0; v.cy = v.y0; v.cs = v.s0; v.cb = v.b0;
+        return g_tmNVis++;
+    };
+
+    const float cx = 120.0f, cy = 120.0f;
+    uint8_t centreIdx = place(node, cx, cy, TM_CR, 1.0f);
+
+    TonalMove mv[TONAL_MAX_MOVES];
+    uint8_t n = tonalMapMoves(node, mv);
+    for (uint8_t i = 0; i < n; i++) {
+        float a  = -(float)M_PI / 2.0f + (float)i * 2.0f * (float)M_PI / (float)n;
+        float ox = cx + TM_R1 * cosf(a), oy = cy + TM_R1 * sinf(a);
+        uint8_t oi = place(mv[i].node, ox, oy, TM_OR, 1.0f);
+        g_tmEdge[g_tmNEdge++] = { centreIdx, oi, mv[i].dotted, false };
+        g_tmOptNode[g_tmNOpt] = mv[i].node;
+        g_tmOptX[g_tmNOpt]    = (int16_t)(ox + 0.5f);
+        g_tmOptY[g_tmNOpt]    = (int16_t)(oy + 0.5f);
+        g_tmNOpt++;
+
+        // Preview fan: the option's own moves, dim, spread around its angle.
+        // The move pointing straight back at the new centre is skipped.
+        TonalMove cm[TONAL_MAX_MOVES];
+        uint8_t m = tonalMapMoves(mv[i].node, cm), total = 0, shown = 0;
+        for (uint8_t j = 0; j < m; j++) if (cm[j].node != node) total++;
+        for (uint8_t j = 0; j < m; j++) {
+            if (cm[j].node == node) continue;
+            float ca = a + ((float)shown - (float)(total - 1) / 2.0f) * 0.42f;
+            uint8_t ci = place(cm[j].node, cx + TM_R2 * cosf(ca),
+                               cy + TM_R2 * sinf(ca), 0.0f, 0.45f);
+            g_tmEdge[g_tmNEdge++] = { oi, ci, cm[j].dotted, true };
+            shown++;
+        }
+    }
+    g_tmNKeep = g_tmNVis;
+
+    if (animate) {
+        // Nodes that vanished from the layout fade out where they are.
+        for (uint8_t i = 0; i < nOld && g_tmNVis < TM_MAX_VIS; i++) {
+            if (used[i] || old[i].cb <= 0.02f) continue;
+            TMVisNode &v = g_tmVis[g_tmNVis++];
+            v.node = old[i].node;
+            v.x0 = v.x1 = v.cx = old[i].cx;
+            v.y0 = v.y1 = v.cy = old[i].cy;
+            v.s0 = v.cs = old[i].cs; v.s1 = old[i].cs * 0.4f;
+            v.b0 = v.cb = old[i].cb; v.b1 = 0.0f;
+        }
+        g_tmAnimStart = millis();
+    } else {
+        for (uint8_t i = 0; i < g_tmNVis; i++) {
+            TMVisNode &v = g_tmVis[i];
+            v.x0 = v.cx = v.x1; v.y0 = v.cy = v.y1;
+            v.s0 = v.cs = v.s1; v.b0 = v.cb = v.b1;
+        }
+        g_tmAnimStart = 0;
+    }
+    markDirty();
+}
+
+// Advance the relayout glide (called at the top of each render step). Keeps
+// the screen repainting until the glide lands, then drops the faded nodes.
+inline void tmAnimTick()
+{
+    if (g_tmAnimStart == 0) return;
+    float t = (float)(millis() - g_tmAnimStart) / (float)TM_ANIM_MS;
+    if (t >= 1.0f) {
+        for (uint8_t i = 0; i < g_tmNKeep; i++) {
+            TMVisNode &v = g_tmVis[i];
+            v.cx = v.x1; v.cy = v.y1; v.cs = v.s1; v.cb = v.b1;
+        }
+        g_tmNVis = g_tmNKeep;  // fade-outs live at the tail — safe to drop
+        g_tmAnimStart = 0;
+    } else {
+        float e = t * t * (3.0f - 2.0f * t); // smoothstep ease
+        for (uint8_t i = 0; i < g_tmNVis; i++) {
+            TMVisNode &v = g_tmVis[i];
+            v.cx = v.x0 + (v.x1 - v.x0) * e;
+            v.cy = v.y0 + (v.y1 - v.y0) * e;
+            v.cs = v.s0 + (v.s1 - v.s0) * e;
+            v.cb = v.b0 + (v.b1 - v.b0) * e;
+        }
+    }
+    markDirty();
+}
+
+// Tonal Map pixel: coloured chord circles + solid/dotted spokes + dim preview
+// labels. Draw order (priority): circled nodes › title › preview labels ›
+// edges › timbre strip › background.
+inline UWORD tonalMapPixel(uint16_t x, uint16_t y)
+{
+    // Circled nodes (centre + option ring).
+    for (uint8_t i = 0; i < g_tmNVis; i++) {
+        const TMVisNode &v = g_tmVis[i];
+        if (v.cs < 6.0f || v.cb <= 0.02f) continue;
+        float dx = (float)x - v.cx, dy = (float)y - v.cy;
+        if (dx < -v.cs || dx > v.cs || dy < -v.cs || dy > v.cs) continue;
+        float r2 = dx * dx + dy * dy;
+        if (r2 > v.cs * v.cs) continue;
+        uint8_t ty  = tmType(v.node);
+        bool    ctr = (v.s1 >= TM_CR - 0.5f);      // this node is (becoming) the centre
+        if (r2 >= (v.cs - 2.0f) * (v.cs - 2.0f)) return tmColor(ty, v.cb);
+        if (glyphPixelAt(x, y, (int16_t)v.cx, (int16_t)v.cy,
+                         TONAL_NAMES[v.node], &Font16))
+            return ctr ? BLACK : grey565((uint8_t)(230.0f * v.cb));
+        return ctr ? tmColor(ty, 0.72f * v.cb) : tmColor(ty, 0.13f * v.cb);
+    }
+
+    // Title (tap the top band / long-press → back to the atlas picker).
+    if (glyphPixelAt(x, y, 120, 16, "TONAL MAP", &Font16)) return grey565(110);
+
+    // Preview labels (circle-less nodes) — dim, in their type colour.
+    for (uint8_t i = 0; i < g_tmNVis; i++) {
+        const TMVisNode &v = g_tmVis[i];
+        if (v.cs >= 6.0f || v.cb <= 0.02f) continue;
+        if (glyphPixelAt(x, y, (int16_t)v.cx, (int16_t)v.cy,
+                         TONAL_NAMES[v.node], &Font16))
+            return tmColor(tmType(v.node), 0.85f * v.cb);
+    }
+
+    // Edges (clipped at the node circles/labels; dotted = 4 px dashes).
+    for (uint8_t i = 0; i < g_tmNEdge; i++) {
+        const TMVisEdge &E = g_tmEdge[i];
+        const TMVisNode &A = g_tmVis[E.a], &B = g_tmVis[E.b];
+        float t, len;
+        if (!nearSegT(x, y, A.cx, A.cy, B.cx, B.cy, 1.2f, t, len)) continue;
+        float d  = t * len;
+        float bs = (B.cs > 9.0f) ? B.cs : 9.0f;  // labels get a 9 px clear zone
+        if (d < A.cs + 3.0f || len - d < bs + 3.0f) continue;
+        if (E.dotted && (((int)d / 4) & 1)) continue;
+        float b = (A.cb < B.cb ? A.cb : B.cb) * (E.dim ? 0.5f : 1.0f);
+        return grey565((uint8_t)(80.0f * b));
+    }
+
+    // Current TIMBRE at the bottom, flanked by ‹ › swipe hints (same as the
+    // fixed-atlas maps).
+    {
+        const int16_t ty = 222, ar = 6;
+        const int16_t lax = 64, rax = 176;
+        int16_t dl = (int16_t)x - lax, dr = (int16_t)x - rax, dy = (int16_t)y - ty;
+        int16_t ay = dy < 0 ? (int16_t)-dy : dy;
+        if (dl >= -ar && dl <= ar && ay * 2 <= (dl + ar)) return grey565(150); // ‹
+        if (dr >= -ar && dr <= ar && ay * 2 <= (ar - dr)) return grey565(150); // ›
+        if (g_snapText[LINE_TIMBRE][0] &&
+            glyphPixelAt(x, y, 120, ty, g_snapText[LINE_TIMBRE], &Font16))
+            return grey565(170);
+    }
+
+    return grey565(8);
+}
+
 // Is the edge a→b part of the active journey's network? Center-first journeys
 // draw spokes from node 0 to every ring node plus the ring; ring journeys draw
 // only the ring. (Generated from g_hCenter — no per-journey edge table.)
@@ -259,6 +519,8 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
 
     int16_t dx0=(int16_t)x-120, dy0=(int16_t)y-120;
     if ((int32_t)dx0*dx0+(int32_t)dy0*dy0 > 119*119) return 0; // outside round face
+
+    if (g_hjIdx == JOURNEY_TONAL_MAP) return tonalMapPixel(x, y);
 
     const HarmonicJourney &J = HARMONIC_JOURNEYS[g_hjIdx];
 
@@ -309,8 +571,8 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
         int16_t ay = dy < 0 ? (int16_t)-dy : dy;
         if (dl >= -ar && dl <= ar && ay * 2 <= (dl + ar)) return grey565(150); // ‹
         if (dr >= -ar && dr <= ar && ay * 2 <= (ar - dr)) return grey565(150); // ›
-        if (g_text[LINE_TIMBRE][0] &&
-            glyphPixelAt(x, y, 120, ty, g_text[LINE_TIMBRE], &Font16))
+        if (g_snapText[LINE_TIMBRE][0] &&
+            glyphPixelAt(x, y, 120, ty, g_snapText[LINE_TIMBRE], &Font16))
             return grey565(170);
     }
 
@@ -321,12 +583,12 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
 inline UWORD composePixel(uint16_t x, uint16_t y, int8_t li)
 {
     if (li == LINE_TIMBRE && !g_timbreUsed) li = -1; // mode ignores timbre → hide its line
-    if (li >= 0 && glyphPixel(x, y, LINE_Y[li], LINE_H[li], g_text[li], lineFont(li))) return WHITE;
+    if (li >= 0 && glyphPixel(x, y, LINE_Y[li], LINE_H[li], g_snapText[li], lineFont(li))) return WHITE;
     if (inArrows(x, y)) return WHITE;
 #if SCREEN_TOUCH_DEBUG
     UWORD bc; if (debugBoxEdge(x, y, bc)) return bc;
 #endif
-    return grey565(g_bgLevel);
+    return grey565(g_snapLevel);
 }
 
 // Lock-mode pixel: a dim base from the overall glow plus a soft ("fuzzy") wedge
@@ -340,16 +602,16 @@ inline UWORD lockPixel(uint16_t x, uint16_t y)
     if (r2 > 119.0f * 119.0f) return 0;            // outside the round face
 
     float ang  = atan2f(dy, dx);
-    float v    = (float)g_bgLevel / 255.0f * 0.45f; // dim base from overall touch
+    float v    = (float)g_snapLevel / 255.0f * 0.45f; // dim base from overall touch
     const float half = (float)(M_PI / 6.0) * 1.5f;  // wedge half-width (~1.5 slices → fuzzy)
     for (uint8_t p = 0; p < NUM_SENSORS; p++)
     {
-        if (g_pad[p] <= 0.001f) continue;
+        if (g_snapPad[p] <= 0.001f) continue;
         float d = ang - g_padAngle[p];
         while (d >  (float)M_PI) d -= 2.0f * (float)M_PI;
         while (d < -(float)M_PI) d += 2.0f * (float)M_PI;
         if (d < 0) d = -d;
-        if (d < half) { float w = 1.0f - d / half; v += g_pad[p] * w * w; }
+        if (d < half) { float w = 1.0f - d / half; v += g_snapPad[p] * w * w; }
     }
     if (v > 1.0f) v = 1.0f;
 
@@ -360,31 +622,34 @@ inline UWORD lockPixel(uint16_t x, uint16_t y)
 }
 
 // SPI-DMA completion (runs from the transfer ISR): release CS + bus.
-inline void onStripDone(EventResponderRef)
+inline void onFrameDone(EventResponderRef)
 {
     DEV_Digital_Write(DEV_CS_PIN, 1);
     SPI.endTransaction();
     g_dmaBusy = false;
 }
 
-// Set the LCD address window, then kick the background DMA stream of g_strip.
-inline void startStripDMA(uint16_t y0, uint16_t h)
+// Set the LCD window to the full screen, then kick ONE background DMA stream of
+// the completed framebuffer. The SPI library auto-chunks transfers > 32 KB in
+// its ISR and flushes the cache for OCRAM buffers; the EventResponder fires
+// only after the LAST chunk, so CS stays low for the whole frame.
+inline void startFrameDMA(uint8_t fbNum)
 {
     SPI.beginTransaction(SPISettings(SCREEN_SPI_HZ, MSBFIRST, SPI_MODE3));
     DEV_Digital_Write(DEV_CS_PIN, 0);
     auto cmd  = [&](uint8_t c){ DEV_Digital_Write(DEV_DC_PIN, 0); SPI.transfer(c); };
     auto data = [&](uint8_t d){ DEV_Digital_Write(DEV_DC_PIN, 1); SPI.transfer(d); };
-    cmd(0x2A); data(0); data(0);            data(0); data(LCD_WIDTH - 1);          // columns
-    cmd(0x2B); data(0); data((uint8_t)y0);  data(0); data((uint8_t)(y0 + h - 1));  // rows
-    cmd(0x2C);                                                                     // write to RAM
+    cmd(0x2A); data(0); data(0); data(0); data(LCD_WIDTH  - 1);  // columns
+    cmd(0x2B); data(0); data(0); data(0); data(LCD_HEIGHT - 1);  // rows
+    cmd(0x2C);                                                   // write to RAM
     DEV_Digital_Write(DEV_DC_PIN, 1);
     g_dmaBusy = true;
-    SPI.transfer(g_strip, nullptr, (size_t)h * LCD_WIDTH * 2, g_spiEvent); // async DMA; CS up in callback
+    SPI.transfer(g_fb[fbNum], nullptr, FB_BYTES, g_spiEvent); // async DMA; CS up in callback
 }
 } // namespace
 
-// Mark the screen for a fresh incremental repaint (from the centre out).
-namespace { inline void markDirty() { g_drawn = false; g_sweepStep = 0; } }
+// Mark the screen for a fresh repaint (picked up at the next frame start).
+namespace { inline void markDirty() { g_drawn = false; } }
 
 // Enter or leave the Harmonic Journey screen (the third long-press state).
 // Entering clears the locked-visualiser flag; leaving marks the screen dirty
@@ -410,6 +675,9 @@ inline void displaySetHarmonicJourney(uint8_t j)
     g_hNodes  = J.nNodes;
     g_hCenter = J.centerFirst;
 
+    // The dynamic Tonal Map lays itself out (displaySetTonalMapCenter).
+    if (J.nNodes == 0) { markDirty(); return; }
+
     const float R  = 72.0f; // pulled in so ring nodes clear the title/label bands
     const int16_t cx = 120, cy = 120;
     uint8_t start = g_hCenter ? 1 : 0;
@@ -432,6 +700,25 @@ inline void displaySetHarmonicChord(uint8_t chord)
 {
     g_harmonicChord = (chord < g_hNodes) ? chord : 0;
     markDirty();
+}
+
+// Tonal Map: re-centre the graph on a node (0…47). animate=false snaps the
+// layout into place (used at boot / when opening the map from the picker).
+inline void displaySetTonalMapCenter(uint8_t node, bool animate)
+{
+    if (node < TONAL_NODES) tmLayout(node, animate);
+}
+
+// Hit-test a tap against the Tonal Map's option ring. Returns the tapped
+// node id (0…47), or 0xFF if the tap missed every option.
+inline uint8_t displayTapToTonalMapNode(uint16_t x, uint16_t y)
+{
+    for (uint8_t i = 0; i < g_tmNOpt; i++) {
+        int16_t dx = (int16_t)x - g_tmOptX[i], dy = (int16_t)y - g_tmOptY[i];
+        if ((int32_t)dx*dx + (int32_t)dy*dy <= (int32_t)HTOUCH_R*HTOUCH_R)
+            return g_tmOptNode[i];
+    }
+    return 0xFF;
 }
 
 // Hit-test a tap against the active journey's chord nodes.
@@ -472,7 +759,7 @@ inline void displayInit()
     analogWriteFrequency(DEV_BL_PIN, 60000); // push backlight PWM out of the audio band
     LCD_Init();
     LCD_SetBacklight(200);
-    g_spiEvent.attachImmediate(&onStripDone); // SPI-DMA done → drop CS
+    g_spiEvent.attachImmediate(&onFrameDone); // SPI-DMA done → drop CS
 
     if (Touch_1IN28_init(XY.mode)) Serial.println(F("Touchscreen OK"));
     else                           Serial.println(F("Touchscreen not found"));
@@ -493,14 +780,6 @@ inline void displayInit()
         g_padAngle[p] = PIE_BASE + PIE_DIR * (float)slot * (float)(2.0 * M_PI / NUM_SENSORS);
     }
 
-    // Inside-out strip order: centre strip first, then alternately outward.
-    g_nStrips = (uint8_t)((LCD_HEIGHT + GLOW_STRIP - 1) / GLOW_STRIP);
-    int mid = (g_nStrips - 1) / 2, k = 0;
-    g_stripOrder[k++] = (uint8_t)mid;
-    for (int d = 1; d < g_nStrips && k < g_nStrips; d++) {
-        if (mid + d < g_nStrips) g_stripOrder[k++] = (uint8_t)(mid + d);
-        if (mid - d >= 0)        g_stripOrder[k++] = (uint8_t)(mid - d);
-    }
 }
 
 inline void displayBeginCanvas()
@@ -545,56 +824,78 @@ inline void displaySetPads(const float* p)
     for (uint8_t i = 0; i < NUM_SENSORS; i++) g_pad[i] = p[i];
 }
 
-// Advance the repaint by ONE strip. Renders to RAM and kicks a DMA stream, then
-// returns immediately (the transfer finishes in the background). Call once per
-// frame. Returns true while more work remains.
+// Advance the repaint. Renders ONE band of the frame into the off-screen
+// framebuffer and returns immediately; when the last band is done the whole
+// frame is flipped to the panel in a single background DMA. Call at least once
+// per sensor frame — extra calls in loop idle time render extra bands and just
+// raise the frame rate. Returns true while more work remains.
 inline bool displayRenderStep()
 {
-    if (g_dmaBusy) return true;             // a strip is still streaming
-    if (g_drawn && !g_locked) return false; // up to date (locked mode never idles)
-
-    if (g_sweepStep == 0) g_sweepLevel = g_bgLevel;
-    uint16_t y0 = (uint16_t)(g_stripOrder[g_sweepStep] * GLOW_STRIP); // inside-out
-    uint16_t h  = GLOW_STRIP;
-    if (y0 + h > LCD_HEIGHT) h = (uint16_t)(LCD_HEIGHT - y0);
-
-    // Render the strip into the byte buffer (big-endian 16-bit colour for SPI).
-    // SCREEN_FLIP renders the panel rotated 180°: panel pixel (x,y) shows the
-    // logical content at (W-1-x, H-1-y), so a screen mounted upside down reads
-    // upright. lx/ly are the logical (content) coordinates used everywhere.
-    uint32_t idx = 0;
-    for (uint16_t y = y0; y < y0 + h; y++)
+    if (g_band == 0)  // idle, or about to start a new frame
     {
-#if SCREEN_FLIP
-        uint16_t ly = (uint16_t)(LCD_HEIGHT - 1 - y);
-#else
-        uint16_t ly = y;
-#endif
-        int8_t li = -1;
-        for (uint8_t k = 0; k < LINE_COUNT; k++)
-            if (ly >= LINE_Y[k] && ly < LINE_Y[k] + LINE_H[k]) { li = (int8_t)k; break; }
-        for (uint16_t x = 0; x < LCD_WIDTH; x++)
+        // Tonal Map relayout glide: advance it once PER FRAME (never between
+        // bands) so every band sees the same animation state. While gliding it
+        // marks dirty, which keeps the frames coming until the glide lands.
+        if (g_harmonicMode && !g_picking && g_hjIdx == JOURNEY_TONAL_MAP)
+            tmAnimTick();
+
+        if (g_drawn && !g_locked) return g_dmaBusy; // up to date (locked never idles)
+
+        // Frame start: snapshot everything the pixel composers read, so the
+        // whole frame comes from this one instant. Changes that land during
+        // the render mark dirty again and are picked up by the NEXT frame.
+        memcpy(g_snapText, g_text, sizeof(g_snapText));
+        memcpy(g_snapPad,  g_pad,  sizeof(g_snapPad));
+        g_snapLevel = g_bgLevel;
+        g_drawn = true;
+    }
+
+    if (g_band < N_BANDS)
+    {
+        uint16_t y0 = (uint16_t)(g_band * BAND_ROWS);
+        uint16_t h  = BAND_ROWS;
+        if (y0 + h > LCD_HEIGHT) h = (uint16_t)(LCD_HEIGHT - y0);
+
+        // Render the band into the framebuffer (big-endian 16-bit for SPI).
+        // SCREEN_FLIP renders the panel rotated 180°: panel pixel (x,y) shows
+        // the logical content at (W-1-x, H-1-y), so a screen mounted upside
+        // down reads upright. lx/ly are the logical (content) coordinates.
+        uint8_t* dst = &g_fb[g_fbRender][(uint32_t)y0 * LCD_WIDTH * 2];
+        uint32_t idx = 0;
+        for (uint16_t y = y0; y < y0 + h; y++)
         {
 #if SCREEN_FLIP
-            uint16_t lx = (uint16_t)(LCD_WIDTH - 1 - x);
+            uint16_t ly = (uint16_t)(LCD_HEIGHT - 1 - y);
 #else
-            uint16_t lx = x;
+            uint16_t ly = y;
 #endif
-            UWORD c = g_locked       ? lockPixel(lx, ly)      :
-                      g_harmonicMode ? harmonicPixel(lx, ly)  :
-                                       composePixel(lx, ly, li);
-            g_strip[idx++] = (uint8_t)(c >> 8);
-            g_strip[idx++] = (uint8_t)(c & 0xFF);
+            int8_t li = -1;
+            for (uint8_t k = 0; k < LINE_COUNT; k++)
+                if (ly >= LINE_Y[k] && ly < LINE_Y[k] + LINE_H[k]) { li = (int8_t)k; break; }
+            for (uint16_t x = 0; x < LCD_WIDTH; x++)
+            {
+#if SCREEN_FLIP
+                uint16_t lx = (uint16_t)(LCD_WIDTH - 1 - x);
+#else
+                uint16_t lx = x;
+#endif
+                UWORD c = g_locked       ? lockPixel(lx, ly)      :
+                          g_harmonicMode ? harmonicPixel(lx, ly)  :
+                                           composePixel(lx, ly, li);
+                dst[idx++] = (uint8_t)(c >> 8);
+                dst[idx++] = (uint8_t)(c & 0xFF);
+            }
         }
+        if (++g_band < N_BANDS) return true;
     }
 
-    startStripDMA(y0, h);
-    if (++g_sweepStep >= g_nStrips)
-    {
-        g_sweepStep = 0;
-        if (!g_locked && g_bgLevel == g_sweepLevel) g_drawn = true; // steady → done
-    }
-    return true;
+    // Frame complete → flip it to the panel as soon as the previous transfer
+    // has finished (with two buffers that's usually immediately).
+    if (g_dmaBusy) return true;
+    startFrameDMA(g_fbRender);
+    g_fbRender ^= 1;
+    g_band = 0;
+    return !g_drawn || g_locked;
 }
 
 // Map a tap position to a control: which arrow box (if any) it landed in.
@@ -651,37 +952,84 @@ inline void touchMap(uint16_t rx, uint16_t ry, uint16_t& dx, uint16_t& dy)
 
 inline DisplayGesture displayPollGesture(uint16_t& tapX, uint16_t& tapY)
 {
+    // Swipe plausibility check: the CST816S's internal swipe threshold is tiny,
+    // so a slightly rough PRESS (finger rolls a few px) gets reported as a
+    // swipe — surprise timbre changes. We track the finger's total travel for
+    // the current press ourselves and defer any chip-reported swipe until the
+    // finger lifts: travel ≥ SWIPE_MIN_PX → real swipe; less → it was a press,
+    // reclassified as a TAP at the press-start position (so a rough tap on an
+    // arrow box still does what the user meant). Costs one 30 ms poll of
+    // latency on real swipes — imperceptible for scale/timbre changes.
+    static bool           pressActive  = false;
+    static uint16_t       startX = 0, startY = 0;
+    static DisplayGesture pendingSwipe = GESTURE_NONE;
+
     // Track the finger position WHILE it's down, so a tap (which the CST816S
     // only reports on release, when the coordinate registers are stale) can use
     // the last good down-position instead.
-    { uint16_t rx, ry; if (readTouchRaw(rx, ry)) { g_downX = rx; g_downY = ry; g_haveDown = true; } }
+    bool fingerDown = false;
+    { uint16_t rx, ry;
+      if (readTouchRaw(rx, ry)) {
+          fingerDown = true;
+          if (!pressActive) { pressActive = true; startX = rx; startY = ry; }
+          g_downX = rx; g_downY = ry; g_haveDown = true;
+      } }
 
     static uint8_t shown = 0;
     uint8_t raw = DEV_I2C_Read_Byte(touchAddress, GESTUREID);
     bool isEvent = (raw == UP || raw == Down || raw == LEFT || raw == RIGHT
                  || raw == CLICK || raw == LONG_PRESS);
-    if (!isEvent)     { shown = 0; return GESTURE_NONE; }
-    if (raw == shown) return GESTURE_NONE;
-    shown = raw;
-    switch (raw) {
-        case UP:    return GESTURE_UP;
-        case Down:  return GESTURE_DOWN;
-        case LEFT:  return GESTURE_LEFT;
-        case RIGHT: return GESTURE_RIGHT;
-        case LONG_PRESS: return GESTURE_LONGPRESS;
-        case CLICK: {
-            if (!g_haveDown) return GESTURE_NONE;
-            touchMap(g_downX, g_downY, tapX, tapY);
-            g_haveDown = false;
+    if (!isEvent) shown = 0;
+
+    // Latch a newly reported gesture (deduped via `shown`, like before).
+    // Swipes aren't returned here — they park in pendingSwipe until the finger
+    // lifts, so the travel check below can rule on them.
+    if (isEvent && raw != shown) {
+        shown = raw;
+        switch (raw) {
+            case UP:    pendingSwipe = GESTURE_UP;    break;
+            case Down:  pendingSwipe = GESTURE_DOWN;  break;
+            case LEFT:  pendingSwipe = GESTURE_LEFT;  break;
+            case RIGHT: pendingSwipe = GESTURE_RIGHT; break;
+            case LONG_PRESS:
+                pendingSwipe = GESTURE_NONE;
+                pressActive  = false;
+                return GESTURE_LONGPRESS;
+            case CLICK: {
+                pendingSwipe = GESTURE_NONE;
+                pressActive  = false;
+                if (!g_haveDown) return GESTURE_NONE;
+                touchMap(g_downX, g_downY, tapX, tapY);
+                g_haveDown = false;
 #if SCREEN_TOUCH_DEBUG
-            Serial.print(F("# TAP raw=")); Serial.print(g_downX); Serial.print(',');
-            Serial.print(g_downY);         Serial.print(F("  disp="));
-            Serial.print(tapX); Serial.print(','); Serial.println(tapY);
+                Serial.print(F("# TAP raw=")); Serial.print(g_downX); Serial.print(',');
+                Serial.print(g_downY);         Serial.print(F("  disp="));
+                Serial.print(tapX); Serial.print(','); Serial.println(tapY);
 #endif
-            return GESTURE_TAP;
+                return GESTURE_TAP;
+            }
+            default: break;
         }
-        default: return GESTURE_NONE;
     }
+
+    // Finger up with a parked swipe → resolve it against the actual travel of
+    // the press that produced it (g_downX/Y = last position seen while down).
+    if (!fingerDown && pendingSwipe != GESTURE_NONE) {
+        DisplayGesture g = pendingSwipe;
+        pendingSwipe = GESTURE_NONE;
+        pressActive  = false;
+        int16_t dx = (int16_t)g_downX - (int16_t)startX;
+        int16_t dy = (int16_t)g_downY - (int16_t)startY;
+        if ((int32_t)dx * dx + (int32_t)dy * dy >=
+            (int32_t)SWIPE_MIN_PX * SWIPE_MIN_PX)
+            return g;                          // genuine swipe
+        touchMap(startX, startY, tapX, tapY);  // rough press → act as a tap
+        g_haveDown = false;
+        return GESTURE_TAP;
+    }
+    if (!fingerDown) pressActive = false;
+
+    return GESTURE_NONE;
 }
 
 // Raw finger position (debug): true + raw x/y while a finger is down.
@@ -725,5 +1073,7 @@ inline void displaySetHarmonicChord(uint8_t) {}
 inline uint8_t displayTapToHarmonicChord(uint16_t, uint16_t) { return 0xFF; }
 inline uint8_t displayTapToHarmonicJourney(uint16_t, uint16_t) { return 0xFF; }
 inline bool displayTapIsHarmonicTitle(uint16_t, uint16_t) { return false; }
+inline void displaySetTonalMapCenter(uint8_t, bool) {}
+inline uint8_t displayTapToTonalMapNode(uint16_t, uint16_t) { return 0xFF; }
 
 #endif // ENABLE_SCREEN

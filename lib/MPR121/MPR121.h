@@ -95,8 +95,17 @@ public:
 
     // Staged init pieces — used together to read filtered data BEFORE
     // committing the baseline (e.g. to detect a pad held at boot).
+    //   ffi : first-filter iterations, 0–3 → 6/10/18/34 samples averaged per
+    //         measurement. Higher = lower noise floor at the same output rate
+    //         (slightly longer per-electrode measure time). Default 0 = 6,
+    //         the chip's reset value — existing variants are unaffected.
+    //   esi : electrode sample interval, 0–7 → 2^esi ms. The second filter
+    //         (the filtered-data register callers read) updates every
+    //         SFI×ESI = 4×2^esi ms, so esi=1 (default, 2 ms) → new data every
+    //         8 ms and esi=0 (1 ms) → every 4 ms — halving both attack and
+    //         release latency at the chip level. Existing variants keep 1.
     bool beginConfig   (uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
-                        uint8_t cdc, uint8_t cdt);
+                        uint8_t cdc, uint8_t cdt, uint8_t ffi = 0, uint8_t esi = 1);
     void startScanning (uint8_t numElectrodes, uint8_t baselineMode = 0b10);
     void lockBaseline  (uint8_t numElectrodes);
 
@@ -105,7 +114,9 @@ public:
     // AFTER beginConfig and BEFORE the Stop→Run transition that should run it
     // (e.g. immediately before lockBaseline). Auto-config then binary-searches
     // CDC/CDT for each electrode on that transition. Nothing should be touching.
-    void autoConfig(float vdd = 3.3f);
+    // ffi MUST match the value passed to beginConfig (the chip requires the
+    // ACCR0 and CDC_CFG FFI fields to agree).
+    void autoConfig(float vdd = 3.3f, uint8_t ffi = 0);
 
     // Out-of-range bitmask after auto-config: bit i set if ELEi could not be
     // tuned within limits (e.g. a disconnected/abnormal electrode).

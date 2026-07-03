@@ -250,6 +250,7 @@ static bool     rawDumpOn   = false;       // serial 'r': stream raw 10-bit filt
 // harmonicPicking is true while the atlas picker is showing (no chord chosen yet).
 static uint8_t  activeJourney       = 0;
 static uint8_t  activeHarmonicChord = 0;
+static uint8_t  activeTonalNode     = 0;   // Tonal Map centre chord (0…47; 0 = C)
 static float    harmonicFreqs[NUM_SENSORS] = { 0.0f };
 static bool     harmonicOverride    = false;
 static bool     harmonicPicking     = false;
@@ -279,7 +280,8 @@ static constexpr int     EEPROM_ADDR_MODE   = 3;
 static constexpr int     EEPROM_ADDR_SCREEN  = 4; // 0=normal, 1=harmonic, 2=locked
 static constexpr int     EEPROM_ADDR_HARM    = 5; // last selected harmonic chord
 static constexpr int     EEPROM_ADDR_JOURNEY = 6; // last selected harmonic atlas
-static constexpr uint8_t EEPROM_MAGIC        = 0xAC; // bumped: added atlas picker
+static constexpr int     EEPROM_ADDR_TONAL   = 7; // last Tonal Map centre chord
+static constexpr uint8_t EEPROM_MAGIC        = 0xAD; // bumped: added Tonal Map slot
 
 static uint8_t loadStoredScale(uint8_t fallback)
 {
@@ -358,6 +360,19 @@ static void storeJourney(uint8_t j)
 {
     EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
     EEPROM.update(EEPROM_ADDR_JOURNEY, j);
+}
+
+static uint8_t loadStoredTonalNode(uint8_t fallback)
+{
+    if (EEPROM.read(EEPROM_ADDR_MAGIC) != EEPROM_MAGIC) return fallback;
+    uint8_t v = EEPROM.read(EEPROM_ADDR_TONAL);
+    return (v < TONAL_NODES) ? v : fallback;
+}
+
+static void storeTonalNode(uint8_t n)
+{
+    EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.update(EEPROM_ADDR_TONAL, n);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -599,6 +614,25 @@ static void loadHarmonicChord(uint8_t chord)
     Serial.print(' ');               Serial.println(J.chords[chord].name);
 }
 
+// Tonal Map — glide all 12 pads to a chord of the 48-node graph (tonalmap.h)
+// and re-centre the on-screen map on it (the display animates the relayout).
+static void loadTonalMapNode(uint8_t node, bool animate)
+{
+    if (node >= TONAL_NODES) return;
+
+    activeTonalNode = node;
+    storeTonalNode(node);
+
+    glideStartMs = millis();
+    for (uint8_t i = 0; i < NUM_SENSORS; i++) glideStart[i] = glideFreq[i];
+    tonalMapFreqs(node, harmonicFreqs);
+    harmonicOverride = true;
+
+    displaySetTonalMapCenter(node, animate);
+    Serial.print(F("# Harmonic: Tonal Map "));
+    Serial.println(TONAL_NAMES[node]);
+}
+
 // Select the active atlas (journey) and lay out its node network. Clamps the
 // remembered chord to the new atlas's node count.
 static void setActiveJourney(uint8_t j)
@@ -738,7 +772,7 @@ static void recalibrateBaselines()
         uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
         uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
         int16_t raw = (int16_t)base - (int16_t)filt;
-        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+        seedSensorState(sensorState[i], (float)raw); // unclamped — seeds envRef
         Serial.print(' '); Serial.print(i); Serial.print(':'); Serial.print(raw);
     }
     Serial.println();
@@ -867,7 +901,7 @@ void setup()
     // ── MPR121 boards (staged init so we can read pads BEFORE baseline lock) ─
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
     {
-        if (!boards[b].beginConfig(SENSE_ELECTRODES[b], 40, 20, SENSOR_CDC, SENSOR_CDT))
+        if (!boards[b].beginConfig(SENSE_ELECTRODES[b], 40, 20, SENSOR_CDC, SENSOR_CDT, SENSOR_FFI, SENSOR_ESI))
         {
             Serial.print(F("ERROR: MPR121 board "));
             Serial.print(b);
@@ -1020,7 +1054,15 @@ void setup()
     proxCfg.proxReleaseDelta  = PROX_RELEASE_DELTA;
     proxCfg.smoothAlpha       = PROX_SMOOTH_ALPHA;
     proxCfg.smoothAlphaRise   = PROX_SMOOTH_RISE;
+    proxCfg.smoothFallRef     = PROX_SMOOTH_FALL_REF;
     proxCfg.fastJumpRef       = PROX_FAST_JUMP_REF;
+    proxCfg.fastAlphaRise     = PROX_ATTACK_ALPHA;
+    proxCfg.fallJumpRef       = PROX_FALL_JUMP_REF;
+    proxCfg.baseIdleAlpha     = PROX_BASE_IDLE_ALPHA;
+    proxCfg.healAlpha         = PROX_HEAL_ALPHA;
+    proxCfg.holdMaxFrames     = PROX_HOLD_MAX_FRAMES;
+    proxCfg.lowHoldBand       = PROX_LOW_HOLD_BAND;
+    proxCfg.lowHoldFrames     = PROX_LOW_HOLD_FRAMES;
 
     // ── Teensy-GPIO LEDs ─────────────────────────────────────────────────────
     // LEDs offloaded from the MPR121's faulty ELE9/ELE10 drivers (pads 3,4,9,10)
@@ -1089,7 +1131,7 @@ void setup()
     // touching now — the hold/settle sequence above guarantees that.
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
     {
-        if (SENSOR_AUTOCONFIG) boards[b].autoConfig(SENSOR_VDD);
+        if (SENSOR_AUTOCONFIG) boards[b].autoConfig(SENSOR_VDD, SENSOR_FFI);
         boards[b].lockBaseline(SENSE_ELECTRODES[b]);
     }
     fixOutlierBaselines();
@@ -1111,7 +1153,7 @@ void setup()
         uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
         uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
         int16_t raw = (int16_t)base - (int16_t)filt;
-        seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+        seedSensorState(sensorState[i], (float)raw); // unclamped — seeds envRef
     }
 
     // ── Load chosen scale + timbre (scale may be overridden by a held pad) ───
@@ -1124,6 +1166,7 @@ void setup()
     screenState         = loadStoredScreen(0);
     activeJourney       = loadStoredJourney(0);
     activeHarmonicChord = loadStoredHarmChord(0);
+    activeTonalNode     = loadStoredTonalNode(0);
     setActiveJourney(activeJourney); // clamp chord + lay out the node network
     displaySetLocked(screenState == 2);
     displaySetHarmonicMode(screenState == 1);
@@ -1135,11 +1178,17 @@ void setup()
         if (activeMode != MODE_PROX) loadMode(MODE_PROX);
         harmonicPicking = false;
         displaySetHarmonicPicking(false);
-        const HarmonicJourney &J = HARMONIC_JOURNEYS[activeJourney];
-        for (uint8_t i = 0; i < NUM_SENSORS; i++)
-            harmonicFreqs[i] = J.chords[activeHarmonicChord].freqs[i];
-        harmonicOverride = true;
-        displaySetHarmonicChord(activeHarmonicChord);
+        if (activeJourney == JOURNEY_TONAL_MAP) {
+            tonalMapFreqs(activeTonalNode, harmonicFreqs);
+            harmonicOverride = true;
+            displaySetTonalMapCenter(activeTonalNode, false);
+        } else {
+            const HarmonicJourney &J = HARMONIC_JOURNEYS[activeJourney];
+            for (uint8_t i = 0; i < NUM_SENSORS; i++)
+                harmonicFreqs[i] = J.chords[activeHarmonicChord].freqs[i];
+            harmonicOverride = true;
+            displaySetHarmonicChord(activeHarmonicChord);
+        }
     }
 
     // ── MPE Configuration Message ────────────────────────────────────────────
@@ -1222,16 +1271,27 @@ void loop()
 
     // ── Rate-limited sensor update ───────────────────────────────────────────
     if (now - lastUpdateMs < UPDATE_MS)
+    {
+        // Idle time before the next sensor frame → render extra screen bands
+        // into the off-screen framebuffer. Gated so a band (≤~2.5 ms worst
+        // case) always finishes well before the sensor frame is due: the pads'
+        // 8 ms cadence is untouched, the screen just completes frames sooner.
+        if (UPDATE_MS - (now - lastUpdateMs) >= 5)
+            displayRenderStep();
         return;
+    }
     lastUpdateMs = now;
 
     // ── Burst-read all boards ────────────────────────────────────────────────
     // Sized for the MPR121 max (12 electrodes); each board only reads its own
     // SENSE_ELECTRODES[b] count — filtered is 2 bytes/electrode, baseline 1.
+    // The chip's touch-status register is deliberately NOT read: nothing uses
+    // it (contact detection is the jump detector in proximity_engine.h), and
+    // dropping those 2 transactions/frame buys back real bus time — measured
+    // total for the reads below is ~3.8 ms of the 6 ms frame at 100 kHz.
     struct BoardData {
         uint8_t  filt[24];
         uint8_t  base[12];
-        uint16_t touch;
     };
     static BoardData bd[NUM_BOARDS];
 
@@ -1240,7 +1300,6 @@ void loop()
         uint8_t n = SENSE_ELECTRODES[b];
         boards[b].burstRead(MPR121Reg::FILT_0L, bd[b].filt, (uint8_t)(n * 2));
         boards[b].burstRead(MPR121Reg::BASE_0,  bd[b].base, n);
-        bd[b].touch = boards[b].touchStatus();
     }
 
     // ── Per-sensor update ────────────────────────────────────────────────────
@@ -1323,15 +1382,33 @@ void loop()
                           | ((uint16_t)(b.filt[2 * e + 1] & 0x03) << 8);
         uint16_t baseline = (uint16_t)b.base[e] << 2;
 
-        float rawDelta = (float)((int16_t)baseline - (int16_t)filtered);
-        if (rawDelta < 0.0f) rawDelta = 0.0f;
+        // Optional median-of-3 (SENSOR_MEDIAN3 in config.h — bench data showed
+        // it costs a full frame of onset latency and FFI≥1 already leaves zero
+        // single-sample spikes, so it ships OFF; the machinery stays for A/B).
+        uint16_t fMed = filtered;
+        if (SENSOR_MEDIAN3) {
+            static uint16_t fPrev1[NUM_SENSORS] = { 0 }, fPrev2[NUM_SENSORS] = { 0 };
+            if (fPrev1[i] == 0 && fPrev2[i] == 0) fPrev1[i] = fPrev2[i] = filtered; // first-frame seed
+            uint16_t lo = min(filtered, fPrev1[i]), hi = max(filtered, fPrev1[i]);
+            fMed = max(lo, min(hi, fPrev2[i]));
+            fPrev2[i] = fPrev1[i];
+            fPrev1[i] = filtered;
+        }
 
-        tpFilt[i]  = filtered; // for the Teleplot readout
-        tpDelta[i] = rawDelta;
+        // UNCLAMPED delta — negative values carry real information (the 8-bit
+        // baseline register can sit up to 3 counts below the true idle level);
+        // the engine's envRef absorbs the offset. See proximity_engine.h.
+        float rawDelta = (float)((int16_t)baseline - (int16_t)fMed);
+
+        tpFilt[i] = fMed; // for the Teleplot readout
 
         float intensity;
         bool  isTouch;
         updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
+
+        // Teleplot shows the drift-corrected delta the engine actually runs on.
+        float effDelta = rawDelta - sensorState[i].envRef;
+        tpDelta[i] = effDelta < 0.0f ? 0.0f : effDelta;
 
         if (intensity > IDLE_INTENSITY || bellHeld[i]) anyActive = true;
 
@@ -1690,8 +1767,18 @@ void loop()
                         setActiveJourney(j);
                         harmonicPicking = false;
                         displaySetHarmonicPicking(false);
-                        loadHarmonicChord(activeHarmonicChord); // apply pitches + label
+                        if (j == JOURNEY_TONAL_MAP)
+                            loadTonalMapNode(activeTonalNode, false); // snap layout
+                        else
+                            loadHarmonicChord(activeHarmonicChord); // apply pitches + label
                     }
+                }
+                else if (activeJourney == JOURNEY_TONAL_MAP)
+                {
+                    // Tonal Map: touch an option to glide there — that chord
+                    // slides to the centre and its own options fan out.
+                    uint8_t node = displayTapToTonalMapNode(fx, fy);
+                    if (node != 0xFF) loadTonalMapNode(node, true);
                 }
                 else
                 {
@@ -1750,10 +1837,10 @@ void loop()
         }
     }
 
-    // Advance the screen by ONE strip per sensor frame (inside-out order). Gappy
-    // DMA — leaves the memory bus free between strips so the audio I2S DMA never
-    // starves (continuous streaming was a non-issue once I2C was the real culprit,
-    // but one-strip-per-frame is the proven-good arrangement, so keep it).
+    // Advance the screen by one band per sensor frame (plus extra bands in the
+    // loop's idle time, gated above). The completed frame flips to the panel in
+    // a single background DMA — atomic on screen, and the audio I2S DMA was
+    // never bothered by the SPI stream (I2C was the real culprit back when).
     displayRenderStep();
 
     // ── Tiny cpu/mem readout, bottom middle of the screen (1 Hz) ─────────────

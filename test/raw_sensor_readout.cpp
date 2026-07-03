@@ -1,6 +1,6 @@
 
-#include "config.h"
-#include "proximity_engine.h"
+#include "../variants/teensy40-11pad/config.h"
+#include "../variants/teensy40-11pad/proximity_engine.h"
 #include <MPR121.h>
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -38,13 +38,14 @@ void MPR121::burstRead(uint8_t reg, uint8_t* buf, uint8_t n) {
 // you want to read raw filtered data with the baseline frozen (CL=00) before
 // committing the final baseline lock via lockBaseline().
 bool MPR121::beginConfig(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
-                         uint8_t cdc, uint8_t cdt) {
+                         uint8_t cdc, uint8_t cdt, uint8_t ffi, uint8_t esi) {
     write(SRST, 0x63);
     delay(50);
     write(ECR, 0x00);
 
-    write(CDC_CFG, (uint8_t)(cdc & 0x3F));
-    write(CDT_CFG, (uint8_t)(((cdt & 0x07) << 5) | 0b001));
+    write(CDC_CFG, (uint8_t)(((ffi & 0x03) << 6) | (cdc & 0x3F)));
+    // CDT[7:5] | SFI[4:3]=00 (4 samples, the minimum) | ESI[2:0].
+    write(CDT_CFG, (uint8_t)(((cdt & 0x07) << 5) | (esi & 0x07)));
 
     for (uint8_t i = 0; i < numElectrodes; i++) {
         write(TOUCH_TH0 + 2 * i, touchTh);
@@ -79,7 +80,7 @@ void MPR121::lockBaseline(uint8_t numElectrodes) {
 // each electrode on the next Stop→Run transition so each charges to ≈TL. Limits
 // are derived from Vdd per the datasheet (USL/LSL/TL at 0x7D/0x7E/0x7F):
 //   USL = (Vdd-0.7)/Vdd * 256 · TL = 0.9·USL · LSL = 0.65·USL.
-void MPR121::autoConfig(float vdd) {
+void MPR121::autoConfig(float vdd, uint8_t ffi) {
     float uslf = ((vdd - 0.7f) / vdd) * 256.0f;
     uint8_t usl = (uint8_t)(uslf + 0.5f);
     uint8_t tl  = (uint8_t)(uslf * 0.9f + 0.5f);
@@ -88,9 +89,10 @@ void MPR121::autoConfig(float vdd) {
     write(AC_LSL, lsl);
     write(AC_TL,  tl);
     write(ACCR1,  0x00);
-    // ACCR0: FFI=00 (must match the FFI in 0x5C), RETRY=00, BVA=10 (reload
-    // baseline after config), ARE=1 (auto-reconfig), ACE=1 (auto-config enable).
-    write(ACCR0,  0x0B);
+    // ACCR0: FFI (MUST match the FFI in 0x5C — pass the same value given to
+    // beginConfig), RETRY=00, BVA=10 (reload baseline after config), ARE=1
+    // (auto-reconfig), ACE=1 (auto-config enable).
+    write(ACCR0,  (uint8_t)(((ffi & 0x03) << 6) | 0x0B));
 }
 
 uint16_t MPR121::autoConfigOOR() {

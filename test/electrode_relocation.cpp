@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPR121.h>
-#include "config.h" // NUM_BOARDS, BOARD_ADDRESSES
+#include "../variants/teensy40-11pad/config.h" // NUM_BOARDS, BOARD_ADDRESSES
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LED PWM walk  —  every LED-capable pin, open-drain + hardware PWM

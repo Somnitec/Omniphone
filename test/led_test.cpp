@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPR121.h>
-#include "config.h" // NUM_BOARDS, BOARD_ADDRESSES
+#include "../variants/teensy40-11pad/config.h" // NUM_BOARDS, BOARD_ADDRESSES
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LED Test  —  isolate the "ELE9/ELE10 won't light alone, work together" fault

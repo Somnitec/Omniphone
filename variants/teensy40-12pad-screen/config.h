@@ -66,6 +66,31 @@ static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 7, 6 };
 static constexpr uint8_t SENSOR_CDC = 14; // 0–63 (try 10 to A/B; both 1 line)
 static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-free LEDs)
 
+// First-filter iterations: 0–3 → 6/10/18/34 samples averaged per measurement.
+// More averaging = lower idle-noise floor at the SAME output rate, which is
+// what lets the deadband sit lower = more proximity reach. Bench-measured
+// (sensor_characterization FFI sweep, 2 s per value): FFI=0 → idle wobble up
+// to 2 counts (std 0.25); FFI≥1 → dead flat, zero deviation over 2298 samples.
+// 1 (=10 samples) is the sweet spot; higher showed no further gain.
+static constexpr uint8_t SENSOR_FFI = 1;
+
+// Electrode sample interval: 2^ESI ms. The chip's filtered output updates
+// every SFI×ESI = 4×2^ESI ms, so ESI=1 (2 ms) → new data every 8 ms, ESI=0
+// (1 ms) → every 4 ms. Bench capture showed the release tail is mostly this
+// chip-side filter (~6 output frames to settle), so halving the cadence
+// halves both attack and release lag at the source. REVERT TO 1 IF the
+// MPR121-driven LEDs (pads 0,1,2,5,7,8,11) visibly flicker — the old comment
+// claimed ESI=2 ms mattered for that, never verified with data.
+static constexpr uint8_t SENSOR_ESI = 0;
+
+// Median-of-3 spike filter on the raw reads. Bench-measured COST: exactly one
+// frame of onset latency on every tap (raw delta hit 211 while the median
+// still reported 10; it caught up the following frame). Bench-measured
+// BENEFIT at FFI≥1: none — zero single-sample spikes in 2298-sample scans
+// (the chip's first filter already averages 10 samples). OFF by default;
+// set to 1 if phantom touches/blips reappear in the full instrument.
+static constexpr uint8_t SENSOR_MEDIAN3 = 0;
+
 // Sensor supply voltage — used to compute the auto-configuration charge limits
 // (USL/LSL/TL per the MPR121 datasheet). The Teensy 4.0 powers the MPR121
 // boards at 3.3 V.
@@ -474,6 +499,12 @@ static constexpr float INTENSITY_GATE = 0.06f;
 // ── Touch-screen press timing ────────────────────────────────────────────────
 static constexpr uint32_t MODE_PRESS_MIN_MS = 550;   // (unused — mode is on the ‹ › arrows now)
 static constexpr uint32_t LOCK_HOLD_MS      = 5000;  // hold this long → toggle lock/visualiser
+// Minimum finger travel (display px, 240 px panel) for a chip-reported swipe to
+// count as a swipe. The CST816S's internal threshold is a few px, so a rough
+// press used to fire timbre/scale changes; below this travel the touch is
+// reclassified as a tap at the press position. Raise if it still mis-swipes,
+// lower if deliberate swipes get eaten.
+static constexpr int32_t SWIPE_MIN_PX = 45;
 
 // ── Synth parameters ─────────────────────────────────────────────────────────
 // Voice architecture
@@ -499,7 +530,7 @@ static constexpr float MASTER_VOLUME = 1.0f;
 #define OUTPUT_BALANCED 0
 
 // Amplitude envelope (DC ramp)
-static constexpr float AMP_RAMP_MS = 8.0f;  // matches UPDATE_MS — smooth ramp
+static constexpr float AMP_RAMP_MS = 6.0f;  // matches UPDATE_MS — smooth ramp
 
 // Sound-set change: portamento. On a live scale switch the sustained pitches
 // glide to the new notes over EXACTLY this long, then stop — a fixed-time log
@@ -581,26 +612,35 @@ static constexpr float    TOUCH_JUMP_THRESHOLD = 250.0f; // metal contact jumps 
 static constexpr float    TOUCH_RELEASE_RATIO  = 0.5f;
 static constexpr uint32_t TOUCH_COOLDOWN_MS    = 10;
 // Consecutive frames the jump must stay over-threshold before a touch fires.
-// 2 rejects single-sample electrical glitches (the idle "blip") at the cost of
-// one extra 8 ms frame of latency. 1 = original instant behaviour.
-static constexpr uint8_t  TOUCH_CONFIRM_FRAMES = 2;
-// Same idea for the proximity intensity: hold at 0 until the fast EMA has
-// stayed above PROX_DEADBAND for this many frames → kills the brief 0.05-ish
-// monitor blips. ~8 ms of added onset latency per extra frame.
-static constexpr uint8_t  PROX_CONFIRM_FRAMES  = 2;
+// Back to 1 (instant): single-sample electrical glitches are now killed by the
+// median-of-3 filter on the raw reads, so the extra 8 ms confirm frame that
+// used to reject them is pure latency.
+static constexpr uint8_t  TOUCH_CONFIRM_FRAMES = 1;
+// Proximity onset gate: hold intensity at 0 until the fast EMA has stayed above
+// PROX_DEADBAND this many frames. This is the WEAK-onset path only — a strong
+// approach (one-frame jump > PROX_FAST_JUMP_REF) snaps the gate open instantly,
+// so real playing feels immediate. Weak signals hovering just above the
+// deadband (EM events, marginal drift) must persist ~24 ms, which is what buys
+// back the lower deadband below without phantom notes. A genuinely slow hand
+// swell doesn't notice 24 ms at its very first frame. (History 6→4→3; hardware
+// at 4 was phantom-free. If soft phantom blips reappear, go back up before
+// touching anything else.)
+static constexpr uint8_t  PROX_CONFIRM_FRAMES  = 3;
 
 // ── Proximity → volume mapping (intensity = (fast−deadband)/(proxMax−deadband))
 // From the CDC=16 capture: idle noise ≈ 1, ~1 cm ≈ 5, on plastic ≈ 22. So the
 // playable swell lives between a light near-touch and resting on the shell;
 // deadband sits just above idle noise, proxMax ≈ firm-plastic so the sound is
 // full by the time you rest on it (metal contact then adds the bell).
-static constexpr float PROX_DEADBAND = 8.0f;  // ↑ from 4: observed idle baseline noise
-                                              // swings ±6–7 counts (per # RECAL raw
-                                              // logs), which crossed a deadband of 4
-                                              // and phantom-triggered pads. 8 sits
-                                              // above that noise floor. Cost: a hand
-                                              // ~1 cm out (≈5) no longer registers —
-                                              // this is now strictly a near-touch range.
+static constexpr float PROX_DEADBAND = 4.0f;  // ↓ 8→6→5→4. Bench measurement finally
+                                              // sized the real noise floor: idle wobble
+                                              // is ±1 count (std 0.06), dead flat at
+                                              // FFI≥1 — the ±6–7 that once forced 8
+                                              // was environmental, not the sensor. 4
+                                              // stays 4× above bench noise, and the
+                                              // weak-onset confirm still gates what the
+                                              // full instrument's screen/audio add. If
+                                              // phantoms appear, step back to 5.
 static constexpr float PROX_MAX      = 18.0f;
 
 // ── Edge de-strobe (smooth response at the far/quiet end) ─────────────────────
@@ -616,12 +656,59 @@ static constexpr float PROX_RELEASE_DELTA = 1.5f; // gate-close hysteresis (coun
 // Asymmetric 1-pole on intensity: instant on the way UP (snappy attack) but
 // smoothed on the way DOWN — the strobe was dropouts (downward dips), so only
 // the fall needs damping. 1.0 = no smoothing in that direction.
-static constexpr float PROX_SMOOTH_RISE  = 1.0f;  // attack (1.0 = instant)
-static constexpr float PROX_SMOOTH_ALPHA = 0.35f; // release/dropout damping
+static constexpr float PROX_SMOOTH_RISE  = 0.6f;  // attack smoothing. Was 1.0 (instant),
+                                                  // but the usable delta range is only
+                                                  // ~12 integer counts, so instant rise
+                                                  // passed the 10-bit quantization
+                                                  // straight to the amplitude = audible
+                                                  // volume STEPPING on swells. 0.6
+                                                  // reaches ~94% in 3 frames (24 ms) —
+                                                  // still a snappy attack, steps blurred.
+static constexpr float PROX_SMOOTH_ALPHA = 0.35f; // release damping for SMALL dips only
+// Drop-adaptive release: an intensity drop of this size in one frame unlocks a
+// full-speed fall. A real hand-lift collapses in 2–3 frames (~20 ms) instead of
+// dragging through the 0.35 smoothing (~80 ms tail); edge jitter (small dips)
+// still gets the full damping, so the anti-strobe fix is preserved.
+static constexpr float PROX_SMOOTH_FALL_REF = 0.5f;
 // Velocity-adaptive attack: a one-frame jump of this many counts gives full,
-// instant tracking (and snaps the gate open); smaller/slower changes keep the
-// gentle smoothing. Lower = more things feel "fast". (idle noise ≈ 1, 1 cm ≈ 5.)
-static constexpr float PROX_FAST_JUMP_REF = 5.0f;
+// instant tracking (and snaps the gate open, skipping PROX_CONFIRM_FRAMES);
+// smaller/slower changes keep the gentle smoothing. Lower = more approaches
+// feel "fast". (idle noise ≈ 1, 1 cm ≈ 5.)
+static constexpr float PROX_FAST_JUMP_REF = 3.0f; // ↓ from 4 — more taps snap instantly
+// Base rise-tracking speed when the jump is small (slow approaches). Higher =
+// faster swells at the cost of slightly more noise reaching the volume (the
+// PROX_SMOOTH_RISE stage now handles the smoothing).
+static constexpr float PROX_ATTACK_ALPHA = 0.75f; // 0.5→0.65→0.75 ("still a bit slow"
+                                                  // on hardware at 0.65, idle clean)
+// Same idea on release: a one-frame FALL of this many counts tracks the lift
+// at full speed (fast fade), small dips keep the slow fall EMA (no strobe).
+static constexpr float PROX_FALL_JUMP_REF = 8.0f;
+
+// ── Software environmental baseline (self-heal, ported from esp32s3-19pad) ───
+// The chip's falling baseline filter is nearly frozen, so an object placed near
+// a pad — or rotating the instrument so ground coupling shifts — used to leave
+// a permanent positive delta: a pad droning forever, which also blocked the
+// idle recal (the stuck pad kept anyActive true → deadlock). A per-pad software
+// zero now sits on top of the chip baseline:
+//   • idle  → tracks slow EM/temperature/rotation drift (~2.7 s time constant)
+//   • held  → frozen, so sustained notes never fade
+//   • stuck → after PROX_HOLD_MAX_FRAMES (~8 s, longer than any musical hold)
+//             the pad is re-zeroed over ~1 s and goes silent; it regains full
+//             sensitivity a couple of seconds after whatever caused it moves.
+static constexpr float    PROX_BASE_IDLE_ALPHA = 0.004f;
+static constexpr float    PROX_HEAL_ALPHA      = 0.02f;
+static constexpr uint16_t PROX_HOLD_MAX_FRAMES = 1333; // 8 s @ 167 Hz (6 ms) frames
+// Low-residual fast heal. Observed on hardware: with many notes pressed, the
+// RELEASED pads' LEDs hang at a dim value — coupling from the still-down
+// fingers/body leaves a small delta parked just above the deadband, and the
+// 8 s stuck timeout is way too slow for that. A pad sitting INSIDE the low
+// band (deadband … deadband+PROX_LOW_HOLD_BAND ≈ intensity < ~0.25) for
+// PROX_LOW_HOLD_FRAMES straight is treated as residual and healed (~0.5 s
+// fade). Real playing exits the band in either direction and resets the
+// counter. Cost: an intentional ultra-quiet hover held statically for >2 s
+// fades out — push slightly closer and it re-opens instantly.
+static constexpr float    PROX_LOW_HOLD_BAND   = 3.0f;
+static constexpr uint16_t PROX_LOW_HOLD_FRAMES = 333; // ≈2 s @ 167 Hz (6 ms frames)
 
 // ── Idle baseline recalibration ──────────────────────────────────────────────
 // Recal fires when EVERY pad's intensity is below IDLE_INTENSITY for
@@ -841,25 +928,40 @@ static const HarmonicChord CINEMATIC_CHORDS[6] = {
         Note::E3, Note::G3, Note::B3, Note::E3, Note::G3, Note::B3 } },
 };
 
+// ── Atlas 5: Tonal Map (navigable 48-chord graph) ────────────────────────────
+// Unlike the fixed atlases above, this journey is a dynamic graph: the current
+// chord sits at the centre and its legal moves radiate outward, re-centring on
+// each tap. Nodes, edge rules and voicings live in tonalmap.h; the journey
+// entry below is a sentinel (nNodes = 0) that display.h and main.cpp detect.
+#include "tonalmap.h"
+
 // ── Journey table ────────────────────────────────────────────────────────────
 // transitions: flattened [from*nNodes + to] move-labels, or nullptr to fall
 // back to each chord's `feeling`. centerFirst: node 0 sits at the screen centre
 // with the rest on a ring (a "home + satellites" map); false = a plain ring.
 struct HarmonicJourney {
     const char*          name;        // shown in the picker and atop the map
-    uint8_t              nNodes;
+    uint8_t              nNodes;      // 0 = dynamic Tonal Map (see tonalmap.h)
     bool                 centerFirst; // node 0 centred (home) vs. all on a ring
     const HarmonicChord* chords;
     const char* const*   transitions; // nullptr → use chord.feeling
 };
 
-static constexpr uint8_t NUM_HARMONIC_JOURNEYS = 4;
+static constexpr uint8_t NUM_HARMONIC_JOURNEYS = 5;
+static constexpr uint8_t JOURNEY_TONAL_MAP     = 4; // index of the dynamic map
 static const HarmonicJourney HARMONIC_JOURNEYS[NUM_HARMONIC_JOURNEYS] = {
     { "Diatonic",  7, true,  HARMONIC_CHORDS,  &HARMONIC_TRANSITIONS[0][0] },
     { "Flamenco",  7, true,  FLAMENCO_CHORDS,  nullptr },
     { "Jazz",      8, true,  JAZZ_CHORDS,      nullptr },
     { "Cinematic", 6, false, CINEMATIC_CHORDS, nullptr },
+    { "Tonal Map", 0, false, nullptr,          nullptr },
 };
 
-// Update timing
-static constexpr uint32_t UPDATE_MS = 8; // ~125 Hz; the burst reads fill most of this at 100 kHz I2C
+// Update timing. Bench-measured (sensor_characterization `u`): the production
+// burst reads take 4.71 ms/frame at 100 kHz I2C — that was 59% of the old 8 ms
+// budget. Dropping the unused touch-status read (−2 transactions) and moving
+// the chip to ESI=1 ms (fresh data every 4 ms) makes a 6 ms frame both
+// feasible and worthwhile: ~167 Hz sensing, ~25% less scan-quantization lag.
+// Don't go below ~6 without shrinking the reads further (e.g. caching the
+// baseline registers) — the bus physically can't do the full read set faster.
+static constexpr uint32_t UPDATE_MS = 6;

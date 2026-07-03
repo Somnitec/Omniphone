@@ -1,8 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPR121.h>
-#include "config.h"            // SENSORS, BOARD_ADDRESSES, BELL_* curve consts
-#include "proximity_engine.h"  // the REAL algorithm we're tuning
+#include "../variants/teensy40-11pad/config.h"            // SENSORS, BOARD_ADDRESSES, BELL_* curve consts
+#include "../variants/teensy40-11pad/proximity_engine.h"  // the REAL algorithm we're tuning
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Strike-dynamics & sensor tuning rig

@@ -1,8 +1,8 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <MPR121.h>
-#include "config.h"            // SENSORS, BOARD_ADDRESSES, SENSOR_CDC/CDT
-#include "proximity_engine.h"  // the REAL algorithm (fast EMA + intensity)
+#include "../variants/teensy40-11pad/config.h"            // SENSORS, BOARD_ADDRESSES, SENSOR_CDC/CDT
+#include "../variants/teensy40-11pad/proximity_engine.h"  // the REAL algorithm (fast EMA + intensity)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Proximity tuning rig
