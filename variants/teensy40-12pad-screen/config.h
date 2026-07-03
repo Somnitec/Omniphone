@@ -66,6 +66,23 @@ static constexpr uint8_t SENSE_ELECTRODES[NUM_BOARDS] = { 7, 6 };
 static constexpr uint8_t SENSOR_CDC = 14; // 0–63 (try 10 to A/B; both 1 line)
 static constexpr uint8_t SENSOR_CDT = 3;  // 0–7  (ESI stays 2 ms → flicker-free LEDs)
 
+// Sensor supply voltage — used to compute the auto-configuration charge limits
+// (USL/LSL/TL per the MPR121 datasheet). The Teensy 4.0 powers the MPR121
+// boards at 3.3 V.
+static constexpr float SENSOR_VDD = 3.3f;
+
+// Per-electrode auto-configuration: at boot the chip binary-searches CDC/CDT for
+// each electrode so it charges to ~0.7·Vdd — equalising the mismatched pads and
+// maximising sensitivity/reach. Runs once on the Stop→Run transition during the
+// startup baseline lock (so nothing should be touching at power-on). When on,
+// SENSOR_CDC/CDT above are only the pre-config fallback.
+static constexpr bool SENSOR_AUTOCONFIG = true;
+
+// Chip-side idle recalibration (the old full ECR baseline reload). Superseded by
+// the software baseline; kept as a flag so it's easy to A/B. Leaving it on while
+// auto-config is enabled would re-trigger auto-config every couple of seconds.
+static constexpr bool RECAL_ENABLE = false;
+
 // ── Startup sound-set picker (hold a pad while booting) ──────────────────────
 // Read with the MPR121 in CL=00 mode (baseline frozen at 0) so the raw
 // filtered value reflects whether a finger is on the pad — bypassing the
@@ -577,8 +594,13 @@ static constexpr uint8_t  PROX_CONFIRM_FRAMES  = 2;
 // playable swell lives between a light near-touch and resting on the shell;
 // deadband sits just above idle noise, proxMax ≈ firm-plastic so the sound is
 // full by the time you rest on it (metal contact then adds the bell).
-static constexpr float PROX_DEADBAND = 4.0f;  // ↑ from 2: rejects small idle transients
-                                              // (1 cm ≈ 5 at CDC=16 still registers)
+static constexpr float PROX_DEADBAND = 8.0f;  // ↑ from 4: observed idle baseline noise
+                                              // swings ±6–7 counts (per # RECAL raw
+                                              // logs), which crossed a deadband of 4
+                                              // and phantom-triggered pads. 8 sits
+                                              // above that noise floor. Cost: a hand
+                                              // ~1 cm out (≈5) no longer registers —
+                                              // this is now strictly a near-touch range.
 static constexpr float PROX_MAX      = 18.0f;
 
 // ── Edge de-strobe (smooth response at the far/quiet end) ─────────────────────

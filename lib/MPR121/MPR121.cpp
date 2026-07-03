@@ -75,6 +75,30 @@ void MPR121::lockBaseline(uint8_t numElectrodes) {
     delay(50);
 }
 
+// Enable per-electrode auto-configuration. The chip binary-searches CDC/CDT for
+// each electrode on the next Stop→Run transition so each charges to ≈TL. Limits
+// are derived from Vdd per the datasheet (USL/LSL/TL at 0x7D/0x7E/0x7F):
+//   USL = (Vdd-0.7)/Vdd * 256 · TL = 0.9·USL · LSL = 0.65·USL.
+void MPR121::autoConfig(float vdd) {
+    float uslf = ((vdd - 0.7f) / vdd) * 256.0f;
+    uint8_t usl = (uint8_t)(uslf + 0.5f);
+    uint8_t tl  = (uint8_t)(uslf * 0.9f + 0.5f);
+    uint8_t lsl = (uint8_t)(uslf * 0.65f + 0.5f);
+    write(AC_USL, usl);
+    write(AC_LSL, lsl);
+    write(AC_TL,  tl);
+    write(ACCR1,  0x00);
+    // ACCR0: FFI=00 (must match the FFI in 0x5C), RETRY=00, BVA=10 (reload
+    // baseline after config), ARE=1 (auto-reconfig), ACE=1 (auto-config enable).
+    write(ACCR0,  0x0B);
+}
+
+uint16_t MPR121::autoConfigOOR() {
+    uint8_t buf[2];
+    burstRead(OOR_L, buf, 2);
+    return (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+}
+
 bool MPR121::begin(uint8_t numElectrodes, uint8_t touchTh, uint8_t releaseTh,
                    uint8_t cdc, uint8_t cdt) {
     if (!beginConfig(numElectrodes, touchTh, releaseTh, cdc, cdt)) return false;

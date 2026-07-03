@@ -106,7 +106,12 @@ static int16_t g_hnodeX[HARMONIC_MAX_NODES] = { 0 };
 static int16_t g_hnodeY[HARMONIC_MAX_NODES] = { 0 };
 
 static constexpr int16_t HNODE_R  = 20; // node circle radius (px)
-static constexpr int16_t HTOUCH_R = 26; // tap hit-test radius (a touch wider)
+// Tap hit-test radius — wider than the drawn node for an easier target. Capped
+// by the tightest ring spacing: Jazz has 7 ring nodes (8 total, centerFirst) at
+// R=72, giving ~62.5 px between neighbours, so two 30 px hit-circles (60 px
+// apart) still don't overlap. Don't raise this past ~31 without re-checking
+// HARMONIC_JOURNEYS for a denser atlas.
+static constexpr int16_t HTOUCH_R = 30;
 static constexpr int16_t HTOP_BAND = 36; // tap above this y in a map → back to picker
 
 // Picker row geometry (4 atlas names stacked under a title).
@@ -270,6 +275,18 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
             return sel ? grey565(200) : grey565(22); // fill
         }
     }
+
+#if SCREEN_TOUCH_DEBUG
+    // Debug: thin red ring at HTOUCH_R (the actual tap hit-test radius, wider
+    // than the drawn node) so the real hit area can be checked by eye instead
+    // of guessed at.
+    for (uint8_t n = 0; n < g_hNodes; n++) {
+        int16_t nx=(int16_t)x-g_hnodeX[n], ny=(int16_t)y-g_hnodeY[n];
+        int32_t r2=(int32_t)nx*nx+(int32_t)ny*ny;
+        if (r2 <= (int32_t)HTOUCH_R*HTOUCH_R && r2 >= (int32_t)(HTOUCH_R-1)*(HTOUCH_R-1))
+            return RED;
+    }
+#endif
 
     // Connection lines (dim grey network)
     for (uint8_t a = 0; a < g_hNodes; a++)
@@ -670,6 +687,20 @@ inline DisplayGesture displayPollGesture(uint16_t& tapX, uint16_t& tapY)
 // Raw finger position (debug): true + raw x/y while a finger is down.
 inline bool displayPollTouch(uint16_t& x, uint16_t& y) { return readTouchRaw(x, y); }
 
+// Raw finger position, mapped to display pixel space, while a finger is down
+// THIS poll — unlike GESTURE_TAP, this isn't gated behind the touch chip's
+// internal gesture-commit delay (it only reports CLICK after a few hundred ms,
+// once it has ruled out the touch turning into a long-press or swipe). Callers
+// that want an instant response (e.g. Harmonic Journey node selection) should
+// act on the down-edge of this instead of waiting for GESTURE_TAP.
+inline bool displayPollTouchXY(uint16_t& x, uint16_t& y)
+{
+    uint16_t rx, ry;
+    if (!readTouchRaw(rx, ry)) return false;
+    touchMap(rx, ry, x, y);
+    return true;
+}
+
 #else  // ENABLE_SCREEN == 0 — no-op stubs
 
 inline void displayInit() {}
@@ -686,6 +717,7 @@ inline bool displayRenderStep() { return false; }
 inline DisplayGesture displayTapToGesture(uint16_t, uint16_t) { return GESTURE_NONE; }
 inline DisplayGesture displayPollGesture(uint16_t&, uint16_t&) { return GESTURE_NONE; }
 inline bool displayPollTouch(uint16_t&, uint16_t&) { return false; }
+inline bool displayPollTouchXY(uint16_t&, uint16_t&) { return false; }
 inline void displaySetHarmonicMode(bool) {}
 inline void displaySetHarmonicPicking(bool) {}
 inline void displaySetHarmonicJourney(uint8_t) {}

@@ -241,6 +241,7 @@ static uint32_t holdStartMs[NUM_SENSORS]   = { 0 };    // when each pad became h
 // Screen state: 0 = normal, 1 = harmonic journey, 2 = locked visualiser.
 // Cycles on each 5-second hold: normal → harmonic → locked → normal.
 static uint8_t  screenState = 0;
+static bool     rawDumpOn   = false;       // serial 'r': stream raw 10-bit filtered CSV
 
 // Harmonic Journey: override the pad pitches with the selected chord's tones.
 // harmonicOverride is true once a chord has been chosen; loadHarmonicChord()
@@ -677,17 +678,14 @@ static void fixOutlierBaselines()
                 // BASE register holds the upper 8 of the 10-bit baseline.
                 boards[b].write((uint8_t)(MPR121Reg::BASE_0 + e),
                                 (uint8_t)(median >> 2));
-#if SERIAL_DEBUG
-                Serial.print(F("# baseline outlier: board "));
+                Serial.print(F("#   outlier fix: board "));
                 Serial.print(b);
                 Serial.print(F(" ELE"));
                 Serial.print(e);
-                Serial.print(F(" was "));
+                Serial.print(F(" base "));
                 Serial.print(bases[e]);
-                Serial.print(F(", median "));
-                Serial.print(median);
-                Serial.println(F(" → rewritten"));
-#endif
+                Serial.print(F(" -> median "));
+                Serial.println(median);
             }
         }
     }
@@ -718,19 +716,32 @@ static void recalibrateBaselines()
         boards[b].write(MPR121Reg::ECR, (uint8_t)(0b11000000 | SENSE_ELECTRODES[b]));
         delay(50);
     }
-    fixOutlierBaselines();
+    // NOTE: fixOutlierBaselines() is deliberately NOT called here. The full ECR
+    // reload above already sets every pad's baseline ≈ its current filtered
+    // value (raw ≈ 0). Pads on this build legitimately differ from the per-board
+    // median (relocated ELE6, the abandoned noisy ELE0, mixed trace lengths), so
+    // forcing them to the median rewrites a CLEAN baseline into an offset one —
+    // the exact "phantom moves between pads on every recal" bug. The outlier fix
+    // is only meaningful at startup (a finger may contaminate lockBaseline), so
+    // it stays in setup() and is kept out of the steady-state recal loop.
+
+    // Re-seed each pad's EMA from the fresh baseline, and print the per-pad raw
+    // delta (baseline − filtered) so calibration can be debugged: right after a
+    // clean recal every pad should read ~0. A pad left with a large +raw will
+    // sit "warm" and phantom-trigger; a large −raw means it's been desensitised.
+    Serial.print(F("# RECAL @")); Serial.print(millis()); Serial.print(F("ms raw:"));
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
     {
         const SensorConfig &sc = SENSORS[i];
-        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
+        if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f);
+                                      Serial.print(F(" -")); continue; }
         uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
         uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
         int16_t raw = (int16_t)base - (int16_t)filt;
         seedSensorState(sensorState[i], raw < 0 ? 0.0f : (float)raw);
+        Serial.print(' '); Serial.print(i); Serial.print(':'); Serial.print(raw);
     }
-#if SERIAL_DEBUG
-    Serial.println(F("# baseline recalibrated"));
-#endif
+    Serial.println();
 }
 
 // While a pad is held, the live contact strength modulates the bell's loudness
@@ -1072,10 +1083,25 @@ void setup()
         delay(1000);
     }
 
-    // ── Commit the baseline now that the finger is (presumably) released ─────
+    // ── Per-electrode auto-config, then commit the baseline ──────────────────
+    // autoConfig() arms the binary search; lockBaseline()'s Stop→Run transition
+    // is what actually triggers it (and reloads the baseline). Nothing should be
+    // touching now — the hold/settle sequence above guarantees that.
     for (uint8_t b = 0; b < NUM_BOARDS; b++)
+    {
+        if (SENSOR_AUTOCONFIG) boards[b].autoConfig(SENSOR_VDD);
         boards[b].lockBaseline(SENSE_ELECTRODES[b]);
+    }
     fixOutlierBaselines();
+
+    // Report any electrodes auto-config could not tune (disconnected/abnormal).
+    if (SENSOR_AUTOCONFIG)
+        for (uint8_t b = 0; b < NUM_BOARDS; b++)
+        {
+            uint16_t oor = boards[b].autoConfigOOR();
+            Serial.print(F("# autoconfig OOR board ")); Serial.print(b);
+            Serial.print(F(" = 0x")); Serial.println(oor, HEX);
+        }
 
     // ── Seed per-sensor EMA state from the freshly locked baseline ──────────
     for (uint8_t i = 0; i < NUM_SENSORS; i++)
@@ -1136,6 +1162,7 @@ void setup()
     Serial.println(F("# Timbre (a-i, swipe U/D):  a=Warm b=Crystal c=Edgy d=Dark e=Soft f=Shimmer g=Cry h=Juno i=Moog"));
     Serial.println(F("# Mode   (m, mode arrows):  Proximity / Arp x3 / FM / FM Poly / Benjolin x2 / Cracklebox / Hang Bow"));
     Serial.println(F("#                           Swarm / Grain Hang / Strings / Cathedral / Freeze / Tanpura / Bowls / Flute / Cello / Phase Chimes"));
+    Serial.println(F("# Diag   (t/r):             t=Teleplot readout   r=raw filtered CSV dump (R,ms,f0..f11)"));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1156,6 +1183,8 @@ void loop()
         else if (c == 'm' || c == 'M') loadMode((uint8_t)((activeMode + 1) % NUM_MODES));
         else if (c == 't' || c == 'T') { teleplotOn = !teleplotOn;
             Serial.print(F("# Teleplot readout ")); Serial.println(teleplotOn ? F("ON") : F("OFF")); }
+        else if (c == 'r' || c == 'R') { rawDumpOn = !rawDumpOn;
+            Serial.print(F("# Raw filtered dump ")); Serial.println(rawDumpOn ? F("ON (R,ms,f0..f11)") : F("OFF")); }
     }
 
     // ── High-rate pitch glide (decoupled from the 8 ms sensor cadence) ───────
@@ -1595,12 +1624,23 @@ void loop()
     static uint32_t lastTouchMs   = 0;     // last poll the finger was seen down
     static uint32_t lastPollMs    = 0;     // for the per-poll dt
     static bool     pressActed    = false; // lock already toggled for this hold
+    static bool     fingerWasDown = false; // for edge-triggered harmonic taps
     if (now - lastGestureMs >= 30)
     {
         lastGestureMs = now;
         uint16_t tapX = 0, tapY = 0;
         DisplayGesture g = displayPollGesture(tapX, tapY); // NONE when screen off
         bool wasTap = (g == GESTURE_TAP);
+
+        // Raw finger position (display space), read once per poll and shared by
+        // the immediate harmonic-tap trigger below and the hold-tracking further
+        // down. This is the touch chip's live position, not GESTURE_TAP — CLICK
+        // is only reported a few hundred ms after release (the chip waits to
+        // rule out a long-press/swipe first), which read as sluggish chord
+        // selection in Harmonic Journey.
+        uint16_t fx = 0, fy = 0;
+        bool fingerDown     = displayPollTouchXY(fx, fy);
+        bool fingerDownEdge = fingerDown && !fingerWasDown;
 
         if (screenState == 0) // normal screen: swipes/arrows change scale/timbre/mode
         {
@@ -1639,12 +1679,12 @@ void loop()
                 loadTimbre((uint8_t)((activeTimbre + 1) % NUM_TIMBRE_SETS), true);
             else if (g == GESTURE_LEFT)
                 loadTimbre((uint8_t)((activeTimbre + NUM_TIMBRE_SETS - 1) % NUM_TIMBRE_SETS), true);
-            else if (wasTap)
+            else if (fingerDownEdge) // act on touch-DOWN, not the chip's delayed CLICK
             {
                 if (harmonicPicking)
                 {
-                    // Picker: tap an atlas name to open its chord map.
-                    uint8_t j = displayTapToHarmonicJourney(tapX, tapY);
+                    // Picker: touch an atlas name to open its chord map.
+                    uint8_t j = displayTapToHarmonicJourney(fx, fy);
                     if (j != 0xFF)
                     {
                         setActiveJourney(j);
@@ -1655,8 +1695,9 @@ void loop()
                 }
                 else
                 {
-                    // Map: tap a chord node to retune the pads.
-                    uint8_t chord = displayTapToHarmonicChord(tapX, tapY);
+                    // Map: touch a chord node to retune the pads immediately
+                    // (loadHarmonicChord still glides the pitch over SET_GLIDE_MS).
+                    uint8_t chord = displayTapToHarmonicChord(fx, fy);
                     if (chord != 0xFF) loadHarmonicChord(chord);
                 }
             }
@@ -1668,8 +1709,8 @@ void loop()
         uint32_t dt  = (lastPollMs  == 0) ? 0 : (now - lastPollMs);
         uint32_t gap = (lastTouchMs == 0) ? 99999u : (now - lastTouchMs);
         lastPollMs = now;
-        uint16_t fx, fy;
-        if (displayPollTouch(fx, fy)) // finger down this poll
+        fingerWasDown = fingerDown;
+        if (fingerDown) // finger down this poll
         {
             holdAccum += dt;
             lastTouchMs = now;
@@ -1732,6 +1773,18 @@ void loop()
     // ── Teleplot readout (toggle with serial 't') ───────────────────────────
     // First the engine load (cpu %, mem blocks), then per pad: raw (MPR121
     // filtered), delta (baseline−filtered), int (final 0..1). Teleplot @115200.
+    // ── Raw filtered dump (toggle with serial 'r') ───────────────────────────
+    // One CSV line per sensor frame: "R,<ms>,f0,f1,…,f11" — the full 10-bit
+    // filtered value per pad (NO baseline applied). Feed a capture of this to the
+    // calibration redesign: idle noise, environmental drift, approach curve and
+    // tap signatures all read straight off these numbers.
+    if (rawDumpOn)
+    {
+        Serial.print(F("R,")); Serial.print(now);
+        for (uint8_t i = 0; i < NUM_SENSORS; i++) { Serial.print(','); Serial.print(tpFilt[i]); }
+        Serial.println();
+    }
+
     if (teleplotOn)
     {
         static uint32_t lastTpMs = 0;
@@ -1750,16 +1803,22 @@ void loop()
     }
 
     // ── Idle baseline recalibration ──────────────────────────────────────────
-    if (anyActive)
+    // Disabled by default (RECAL_ENABLE) — superseded by the software baseline,
+    // and it would re-trigger auto-config every couple of seconds (each recal is
+    // a Stop→Run transition). Kept behind the flag for A/B comparison.
+    if (RECAL_ENABLE)
     {
-        lastActivityMs = now;
-    }
-    else if ((now - lastActivityMs) > IDLE_RECAL_MS &&
-             (now - lastRecalMs)    > RECAL_COOLDOWN_MS)
-    {
-        recalibrateBaselines();
-        lastRecalMs    = now;
-        lastActivityMs = now;
+        if (anyActive)
+        {
+            lastActivityMs = now;
+        }
+        else if ((now - lastActivityMs) > IDLE_RECAL_MS &&
+                 (now - lastRecalMs)    > RECAL_COOLDOWN_MS)
+        {
+            recalibrateBaselines();
+            lastRecalMs    = now;
+            lastActivityMs = now;
+        }
     }
 
     // ── Diagnostic output (10 Hz) ────────────────────────────────────────────

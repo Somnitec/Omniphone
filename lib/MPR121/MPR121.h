@@ -23,6 +23,8 @@
 namespace MPR121Reg {
     static constexpr uint8_t TOUCH_L   = 0x00; // Touch status, low byte
     static constexpr uint8_t TOUCH_H   = 0x01; // Touch status, high byte
+    static constexpr uint8_t OOR_L     = 0x02; // Auto-config out-of-range status, ELE0–7
+    static constexpr uint8_t OOR_H     = 0x03; // Auto-config out-of-range status, ELE8–11 + flags
     static constexpr uint8_t FILT_0L   = 0x04; // ELE0 filtered data LSB; ELEi → 0x04+2i
     static constexpr uint8_t BASE_0    = 0x1E; // ELE0 baseline (8 MSBs); ELEi → 0x1E+i
 
@@ -47,6 +49,16 @@ namespace MPR121Reg {
     static constexpr uint8_t CDT_CFG   = 0x5D; // CDT[2:0] | SFI[1:0] | ESI[2:0] – timing
     static constexpr uint8_t ECR       = 0x5E; // Electrode control / run mode
     static constexpr uint8_t SRST      = 0x80; // Soft reset (write 0x63)
+
+    // Auto-configuration (per-electrode CDC/CDT binary search). Datasheet map:
+    //   0x7B ACCR0, 0x7C ACCR1, 0x7D USL, 0x7E LSL, 0x7F Target Level.
+    // (Note: Adafruit's library mislabels 0x7E/0x7F — the datasheet order is
+    //  USL, LSL, TL, which is what's used here.)
+    static constexpr uint8_t ACCR0     = 0x7B; // control 0 (FFI|RETRY|BVA|ARE|ACE)
+    static constexpr uint8_t ACCR1     = 0x7C; // control 1
+    static constexpr uint8_t AC_USL    = 0x7D; // up-side limit
+    static constexpr uint8_t AC_LSL    = 0x7E; // low-side limit
+    static constexpr uint8_t AC_TL     = 0x7F; // target level
 
     // GPIO / PWM registers (for ELE6–ELE11 used as LEDs)
     static constexpr uint8_t GPIOCTL0  = 0x73; // GPIO control register 0
@@ -87,6 +99,17 @@ public:
                         uint8_t cdc, uint8_t cdt);
     void startScanning (uint8_t numElectrodes, uint8_t baselineMode = 0b10);
     void lockBaseline  (uint8_t numElectrodes);
+
+    // Enable per-electrode auto-configuration. Writes the USL/LSL/TL charge
+    // limits (derived from vdd per the datasheet) and turns on ACE+ARE. Call
+    // AFTER beginConfig and BEFORE the Stop→Run transition that should run it
+    // (e.g. immediately before lockBaseline). Auto-config then binary-searches
+    // CDC/CDT for each electrode on that transition. Nothing should be touching.
+    void autoConfig(float vdd = 3.3f);
+
+    // Out-of-range bitmask after auto-config: bit i set if ELEi could not be
+    // tuned within limits (e.g. a disconnected/abnormal electrode).
+    uint16_t autoConfigOOR();
 
     // ── Sensor reads ─────────────────────────────────────────────────────────
 
