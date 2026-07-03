@@ -221,6 +221,58 @@ inline bool glyphPixelAt(uint16_t x, uint16_t y, int16_t cx, int16_t cy,
     return (*gp & (0x80 >> (col % 8))) != 0;
 }
 
+// Point-in-regular-polygon test: n sides (3=triangle … 6=hexagon), circumradius
+// R, first vertex pointing straight up (same convention as the ring layout in
+// displaySetHarmonicJourney). Convex polygon → inside iff on the interior side
+// of every edge's half-plane.
+inline bool insidePolygon(float dx, float dy, uint8_t n, float R)
+{
+    float a0 = -(float)M_PI / 2.0f;
+    float x0 = R * cosf(a0), y0 = R * sinf(a0);
+    for (uint8_t k = 1; k <= n; k++) {
+        float a1 = -(float)M_PI / 2.0f + (float)k * 2.0f * (float)M_PI / (float)n;
+        float x1 = R * cosf(a1), y1 = R * sinf(a1);
+        float ex = x1 - x0, ey = y1 - y0;
+        float px = dx - x0, py = dy - y0;
+        if (ex * py - ey * px < 0.0f) return false;
+        x0 = x1; y0 = y1;
+    }
+    return true;
+}
+
+// Is (dx,dy) — relative to a node's centre — inside the icon for harmonic
+// function `fn`, drawn at "radius" R? Replaces the old chord-name glyph: the
+// SHAPE now carries the function, colour (moodColor/tmColor) carries the mood.
+inline bool insideFunctionShape(float dx, float dy, uint8_t fn, float R)
+{
+    switch (fn) {
+        case HFN_TONIC:       return dx * dx + dy * dy <= R * R;        // circle
+        case HFN_SUBDOMINANT: return insidePolygon(dx, dy, 3, R * 1.15f); // triangle
+        case HFN_DOMINANT:    return insidePolygon(dx, dy, 4, R * 0.95f); // square
+        case HFN_CHROMATIC:   return insidePolygon(dx, dy, 5, R);         // pentagon
+        case HFN_SYMMETRIC:   return insidePolygon(dx, dy, 6, R * 1.05f); // hexagon
+        default:              return false;
+    }
+}
+
+// Per-mood node colour (see HarmonicMood in config.h), scaled by brightness b
+// (0…1) — same pattern as tmColor's per-type palette below.
+inline UWORD moodColor(uint8_t mood, float b)
+{
+    static const float RGB[5][3] = {
+        { 1.00f, 0.70f, 0.25f },  // HMOOD_WARM       — amber
+        { 1.00f, 0.25f, 0.25f },  // HMOOD_TENSION    — red
+        { 0.30f, 0.45f, 1.00f },  // HMOOD_MELANCHOLY — blue
+        { 0.75f, 0.35f, 1.00f },  // HMOOD_MYSTERY    — purple
+        { 0.35f, 0.90f, 0.55f },  // HMOOD_GROUNDED   — green
+    };
+    if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+    uint8_t r  = (uint8_t)(RGB[mood][0] * b * 255.0f);
+    uint8_t g  = (uint8_t)(RGB[mood][1] * b * 255.0f);
+    uint8_t bl = (uint8_t)(RGB[mood][2] * b * 255.0f);
+    return (UWORD)(((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3));
+}
+
 // Distance from pixel (x,y) to line segment (ax,ay)→(bx,by), returns true if ≤ tol.
 inline bool nearSeg(int16_t x, int16_t y,
                     int16_t ax, int16_t ay, int16_t bx, int16_t by, float tol)
@@ -282,6 +334,21 @@ inline UWORD tmColor(uint8_t type, float b)
     uint8_t g  = (uint8_t)(RGB[type][1] * b * 255.0f);
     uint8_t bl = (uint8_t)(RGB[type][2] * b * 255.0f);
     return (UWORD)(((r >> 3) << 11) | ((g >> 2) << 5) | (bl >> 3));
+}
+
+// The Tonal Map has no per-node function/mood data (it's a generated 56-chord
+// graph, not a hand-authored atlas) — so its icon shape is approximated from
+// the chord TYPE alone: major reads as the stable/tonic shape, minor as the
+// departure shape, dominant 7th as the tension/resolving shape, and augmented
+// as the symmetric shape. Colour still comes from tmColor's per-type palette.
+inline uint8_t tmFunction(uint8_t type)
+{
+    switch (type) {
+        case TM_MIN:  return HFN_SUBDOMINANT;
+        case TM_DOM7: return HFN_DOMINANT;
+        case TM_AUG:  return HFN_SYMMETRIC;
+        default:      return HFN_TONIC; // TM_MAJ
+    }
 }
 
 // nearSeg with a bounding-box early-out plus the hit's parameter t and the
@@ -428,8 +495,8 @@ inline UWORD tonalMapPixel(uint16_t x, uint16_t y)
         uint8_t ty  = tmType(v.node);
         bool    ctr = (v.s1 >= TM_CR - 0.5f);      // this node is (becoming) the centre
         if (r2 >= (v.cs - 2.0f) * (v.cs - 2.0f)) return tmColor(ty, v.cb);
-        if (glyphPixelAt(x, y, (int16_t)v.cx, (int16_t)v.cy,
-                         TONAL_NAMES[v.node], &Font16))
+        if (insideFunctionShape((float)x - v.cx, (float)y - v.cy,
+                                 tmFunction(ty), v.cs * 0.55f))
             return ctr ? BLACK : grey565((uint8_t)(230.0f * v.cb));
         return ctr ? tmColor(ty, 0.72f * v.cb) : tmColor(ty, 0.13f * v.cb);
     }
@@ -437,12 +504,14 @@ inline UWORD tonalMapPixel(uint16_t x, uint16_t y)
     // Title (tap the top band / long-press → back to the atlas picker).
     if (glyphPixelAt(x, y, 120, 16, "TONAL MAP", &Font16)) return grey565(110);
 
-    // Preview labels (circle-less nodes) — dim, in their type colour.
+    // Preview icons (circle-less nodes) — dim, in their type colour. These
+    // have no drawn background disc (s1 = 0), so the icon is drawn straight
+    // at a small fixed radius rather than scaled off v.cs.
     for (uint8_t i = 0; i < g_tmNVis; i++) {
         const TMVisNode &v = g_tmVis[i];
         if (v.cs >= 6.0f || v.cb <= 0.02f) continue;
-        if (glyphPixelAt(x, y, (int16_t)v.cx, (int16_t)v.cy,
-                         TONAL_NAMES[v.node], &Font16))
+        if (insideFunctionShape((float)x - v.cx, (float)y - v.cy,
+                                 tmFunction(tmType(v.node)), 6.0f))
             return tmColor(tmType(v.node), 0.85f * v.cb);
     }
 
@@ -524,7 +593,9 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
 
     const HarmonicJourney &J = HARMONIC_JOURNEYS[g_hjIdx];
 
-    // Nodes (highest priority)
+    // Nodes (highest priority). Each node is a mood-coloured disc (see
+    // config.h HarmonicMood) with a small function icon (HarmonicFunction —
+    // circle/triangle/square/pentagon/hexagon) instead of the chord's name.
     for (uint8_t n = 0; n < g_hNodes; n++) {
         int16_t nx=(int16_t)x-g_hnodeX[n], ny=(int16_t)y-g_hnodeY[n];
         int32_t r2=(int32_t)nx*nx+(int32_t)ny*ny;
@@ -532,9 +603,10 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
             bool sel = (n == g_harmonicChord);
             if (r2 >= (int32_t)(HNODE_R-2)*(HNODE_R-2))
                 return sel ? WHITE : grey565(110);   // ring border
-            if (glyphPixelAt(x, y, g_hnodeX[n], g_hnodeY[n], J.chords[n].name, &Font16))
-                return sel ? BLACK : WHITE;           // text (inverted on selected)
-            return sel ? grey565(200) : grey565(22); // fill
+            const HarmonicChord &C = J.chords[n];
+            if (insideFunctionShape((float)nx, (float)ny, C.function, (float)HNODE_R * 0.55f))
+                return sel ? BLACK : WHITE;           // function icon (inverted on selected)
+            return moodColor(C.mood, sel ? 1.0f : 0.45f); // mood fill
         }
     }
 

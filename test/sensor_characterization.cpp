@@ -82,14 +82,16 @@ static void applyTiming(uint8_t ffi, uint8_t cdc, uint8_t cdt)
     curFFI = ffi; curCDC = cdc; curCDT = cdt;
 }
 
+static float readFilt(uint8_t p)
+{
+    return (float)boards[boardOf(p)].filteredData(electrodeOf(p));
+}
+
 static void reseedAll()
 {
     for (uint8_t i = 0; i < NUM_SENSORS; i++) {
         if (SENSORS[i].electrode == NO_PIN) continue;
-        uint16_t filt = boards[boardOf(i)].filteredData(electrodeOf(i));
-        uint16_t base = boards[boardOf(i)].baselineData(electrodeOf(i));
-        int16_t  raw  = (int16_t)base - (int16_t)filt;
-        seedSensorState(st[i], raw < 0 ? 0.0f : (float)raw);
+        seedSensorState(st[i], readFilt(i)); // filtered value = software baseline
     }
 }
 
@@ -204,10 +206,11 @@ static void runTimeSeries(float secDur)
 {
     Serial.print(F("# TIME-SERIES pad ")); Serial.print(padIdx);
     Serial.print(F(" for ")); Serial.print(secDur, 1); Serial.println(F(" s — go"));
-    Serial.println(F("# t_ms  filt  base  rawDelta  medDelta  envRef  effDelta  fast  slow  intensity  touch"));
+    // chipBase is logged for reference only (it shows the 4-count register
+    // quantization); the engine runs purely on filt vs its software baseline.
+    Serial.println(F("# t_ms  filt  chipBase  chipDelta  softBase  effDelta  fast  slow  intensity  touch"));
 
-    seedSensorState(st[padIdx], readRawDelta(padIdx));
-    uint16_t fPrev1 = 0, fPrev2 = 0; bool seeded = false;
+    seedSensorState(st[padIdx], readFilt(padIdx));
 
     uint32_t t0 = millis();
     uint32_t lastUpd = 0;
@@ -218,25 +221,18 @@ static void runTimeSeries(float secDur)
 
         uint16_t filt = boards[boardOf(padIdx)].filteredData(electrodeOf(padIdx));
         uint16_t base = boards[boardOf(padIdx)].baselineData(electrodeOf(padIdx));
-        if (!seeded) { fPrev1 = fPrev2 = filt; seeded = true; }
-        uint16_t lo = min(filt, fPrev1), hi = max(filt, fPrev1);
-        uint16_t fMed = max(lo, min(hi, fPrev2));
-        fPrev2 = fPrev1; fPrev1 = filt;
-
-        float rawDelta = (float)((int16_t)base - (int16_t)filt);   // unclamped
-        float medDelta = (float)((int16_t)base - (int16_t)fMed);   // unclamped
+        float chipDelta = (float)((int16_t)base - (int16_t)filt);   // unclamped, reference
 
         float intensity; bool touch;
-        updateProximity(medDelta, now, cfg, st[padIdx], intensity, touch);
-        float effDelta = medDelta - st[padIdx].envRef;
+        updateProximity((float)filt, now, cfg, st[padIdx], intensity, touch);
+        float effDelta = st[padIdx].base - (float)filt;
         if (effDelta < 0.0f) effDelta = 0.0f;
 
         Serial.print(now - t0);          Serial.print('\t');
         Serial.print(filt);              Serial.print('\t');
         Serial.print(base);              Serial.print('\t');
-        Serial.print(rawDelta, 1);       Serial.print('\t');
-        Serial.print(medDelta, 1);       Serial.print('\t');
-        Serial.print(st[padIdx].envRef, 2); Serial.print('\t');
+        Serial.print(chipDelta, 1);      Serial.print('\t');
+        Serial.print(st[padIdx].base, 2); Serial.print('\t');
         Serial.print(effDelta, 2);       Serial.print('\t');
         Serial.print(st[padIdx].fast, 2);Serial.print('\t');
         Serial.print(st[padIdx].slow, 2);Serial.print('\t');
@@ -320,7 +316,7 @@ static void handleSerial()
     char c = Serial.read();
     switch (c) {
         case 'p': { int v = (int)Serial.parseFloat();
-                    if (v >= 0 && v < NUM_SENSORS) { padIdx = (uint8_t)v; seedSensorState(st[padIdx], readRawDelta(padIdx)); }
+                    if (v >= 0 && v < NUM_SENSORS) { padIdx = (uint8_t)v; seedSensorState(st[padIdx], readFilt(padIdx)); }
                     printConfig(); break; }
         case 'n': { float sec = Serial.parseFloat(); if (sec <= 0.0f) sec = 2.0f;
                     Serial.println(F("# NOISE scan — hand AWAY"));

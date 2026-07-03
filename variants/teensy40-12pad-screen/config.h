@@ -632,15 +632,19 @@ static constexpr uint8_t  PROX_CONFIRM_FRAMES  = 3;
 // playable swell lives between a light near-touch and resting on the shell;
 // deadband sits just above idle noise, proxMax ≈ firm-plastic so the sound is
 // full by the time you rest on it (metal contact then adds the bell).
-static constexpr float PROX_DEADBAND = 4.0f;  // ↓ 8→6→5→4. Bench measurement finally
-                                              // sized the real noise floor: idle wobble
-                                              // is ±1 count (std 0.06), dead flat at
-                                              // FFI≥1 — the ±6–7 that once forced 8
-                                              // was environmental, not the sensor. 4
-                                              // stays 4× above bench noise, and the
-                                              // weak-onset confirm still gates what the
-                                              // full instrument's screen/audio add. If
-                                              // phantoms appear, step back to 5.
+static constexpr float PROX_DEADBAND = 5.0f;  // 8→6→5→4→5. The drop to 4 was justified
+                                              // by BENCH noise (±1 count, MPR121-only
+                                              // rig) — but in-instrument noise with the
+                                              // full-frame screen DMA + audio running
+                                              // was never re-measured, and 4 left zero
+                                              // margin (startup flicker on several
+                                              // pads). 5 buys one count of margin;
+                                              // in-instrument reach is still better
+                                              // than the old chip-baseline builds
+                                              // because nothing eats slow approaches
+                                              // any more. Re-drop to 4 only after a
+                                              // Teleplot idle capture IN the full
+                                              // instrument shows it's clean.
 static constexpr float PROX_MAX      = 18.0f;
 
 // ── Edge de-strobe (smooth response at the far/quiet end) ─────────────────────
@@ -684,20 +688,58 @@ static constexpr float PROX_ATTACK_ALPHA = 0.75f; // 0.5→0.65→0.75 ("still a
 // at full speed (fast fade), small dips keep the slow fall EMA (no strobe).
 static constexpr float PROX_FALL_JUMP_REF = 8.0f;
 
-// ── Software environmental baseline (self-heal, ported from esp32s3-19pad) ───
-// The chip's falling baseline filter is nearly frozen, so an object placed near
-// a pad — or rotating the instrument so ground coupling shifts — used to leave
-// a permanent positive delta: a pad droning forever, which also blocked the
-// idle recal (the stuck pad kept anyActive true → deadlock). A per-pad software
-// zero now sits on top of the chip baseline:
-//   • idle  → tracks slow EM/temperature/rotation drift (~2.7 s time constant)
-//   • held  → frozen, so sustained notes never fade
-//   • stuck → after PROX_HOLD_MAX_FRAMES (~8 s, longer than any musical hold)
-//             the pad is re-zeroed over ~1 s and goes silent; it regains full
-//             sensitivity a couple of seconds after whatever caused it moves.
-static constexpr float    PROX_BASE_IDLE_ALPHA = 0.004f;
+// ── Software baseline (full port of the esp32s3-19pad design) ────────────────
+// The delta is computed ONLY against a per-pad software baseline on the raw
+// filtered value; the chip's baseline registers are not read at all. Why (both
+// measured): the register moves in 4-count jumps (only the top 8 of its 10
+// bits are exposed) — with a deadband of 4, every internal boundary crossing
+// was a phantom +4 delta: pads "popping out of calibration", fluttering, and
+// reading stuck until the heal caught it (pad 7 = A-ELE1, harness neighbour of
+// the abandoned noisy A-ELE0, was hit most often); and the chip's falling
+// baseline filter chases a slowly approaching hand (2× faster at ESI=1 ms),
+// eating the delta before it accumulates = lost reach.
+// The software baseline moves only per this state machine:
+//   • idle      → tracks slow EM/temperature/rotation drift (~2 s tau)
+//   • negative  → filtered ABOVE base is unambiguously a stale baseline (a
+//     delta       hand only pulls filtered DOWN) → track fast (~0.1 s) — a
+//                 desensitised pad recovers almost immediately
+//   • held      → frozen, so sustained notes never fade
+//   • stuck     → after PROX_HOLD_MAX_FRAMES (~8 s, longer than any musical
+//                 hold) the pad re-zeroes over ~1 s; low-parked residuals go
+//                 sooner via PROX_LOW_HOLD_* below.
+static constexpr float    PROX_BASE_IDLE_ALPHA = 0.003f; // ↓ from 0.004: restores the
+                                                         // ~2 s wall-clock tau at the
+                                                         // 6 ms frames (absorbs slow
+                                                         // approaches less = reach)
+static constexpr float    PROX_BASE_NEG_ALPHA  = 0.05f;
 static constexpr float    PROX_HEAL_ALPHA      = 0.02f;
 static constexpr uint16_t PROX_HOLD_MAX_FRAMES = 1333; // 8 s @ 167 Hz (6 ms) frames
+// Settle window after every (re)seed: the baseline hard-follows the filtered
+// value and the pads stay MUTED for this many frames (~1.5 s @ 6 ms). The
+// chip's filtered output keeps converging for up to ~1 s after init — auto-
+// config has just rewritten every electrode's CDC/CDT — so a single-instant
+// seed left phantom deltas on the pads that settle furthest = a few pads
+// flickering right at startup. (Same cure as the esp32s3 SEED_MS window.)
+// Raise if any boot flicker remains.
+static constexpr uint16_t PROX_SEED_FRAMES     = 250;
+// Warm-up after the seed window: idle tracking runs at PROX_BASE_WARM_ALPHA
+// (~0.5 s tau) instead of the slow steady-state alpha for this many frames
+// (~30 s @ 6 ms). Electrodes keep drifting for tens of seconds after power-on
+// (thermal equilibration); at the slow alpha that drift could reach the
+// deadband and flicker before being absorbed. Holds still freeze the baseline,
+// so playing during warm-up is unaffected — only sub-deadband drift-chasing
+// is faster. (Cost: very slow far-hovers during the first 30 s absorb sooner.)
+static constexpr uint16_t PROX_WARM_FRAMES     = 5000;
+static constexpr float    PROX_BASE_WARM_ALPHA = 0.012f;
+
+// Per-pad deadband trim (counts, added to PROX_DEADBAND). Gives one physically
+// noisier pad a higher gate without desensitising the others. Pad 7 (A-ELE1)
+// starts at +1: it shares the harness with the abandoned noisy A-ELE0 wire and
+// was the pad reported popping out of calibration most. Set back to 0 if the
+// software-baseline fix alone cures it; raise further (+2) if it still misfires.
+static constexpr float PAD_DEADBAND_TRIM[NUM_SENSORS] = {
+    0, 0, 0, 0, 0, 0, 0, 1.0f, 0, 0, 0, 0
+};
 // Low-residual fast heal. Observed on hardware: with many notes pressed, the
 // RELEASED pads' LEDs hang at a dim value — coupling from the still-down
 // fingers/body leaves a small delta parked just above the deadband, and the
@@ -772,10 +814,37 @@ static constexpr uint8_t  MPE_PRESSURE_MIN_DELTA  = 2;   // skip if change < thi
 //   territories Thomas discusses as the natural next layers of the map.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Node SHAPE on screen: harmonic function (role the chord plays in the key),
+// not chord quality. Tonic/subdominant/dominant are the three real functional
+// categories; chromatic and symmetric cover chords that sit outside that
+// three-way split (borrowed/substitute chords, and augmented/whole-tone/
+// equal-division chords that have no real tonal "home").
+enum HarmonicFunction : uint8_t {
+    HFN_TONIC = 0,     // stable "home" chord            → circle
+    HFN_SUBDOMINANT,   // pre-dominant / departure chord  → triangle
+    HFN_DOMINANT,      // tension-resolving chord         → square
+    HFN_CHROMATIC,     // borrowed / secondary / sub      → pentagon
+    HFN_SYMMETRIC,     // augmented / whole-tone / hexatonic → hexagon
+};
+
+// Node COLOUR on screen: the emotional character from `feeling`, bucketed
+// into a small fixed palette so the same mood always reads the same colour.
+enum HarmonicMood : uint8_t {
+    HMOOD_WARM = 0,    // positive, restful             → amber
+    HMOOD_TENSION,     // drama, alarm, drive            → red
+    HMOOD_MELANCHOLY,  // sadness, longing               → blue
+    HMOOD_MYSTERY,     // wonder, uncertainty            → purple
+    HMOOD_GROUNDED,    // exploration, lift, warmth      → green
+};
+
 struct HarmonicChord {
-    const char* name;    // short node label shown on screen (≤4 chars)
+    const char* name;    // short chord label (kept for reference/debug — no
+                         // longer drawn; the node shows `function`/`mood` instead)
     const char* feeling; // emotional quality / device — shown when no transition
-                         // matrix is supplied for this journey
+                         // matrix is supplied for this journey; also the source
+                         // for `mood`'s colour bucket
+    uint8_t function;    // HarmonicFunction — the node's on-screen SHAPE
+    uint8_t mood;        // HarmonicMood — the node's on-screen COLOUR
     float freqs[12];     // pad 0-5 = upper ring, 6-11 = lower ring
 };
 
@@ -785,38 +854,38 @@ static const float H_B5 = 987.77f; // B5 (not in Note:: namespace — B4 * 2)
 
 static const HarmonicChord HARMONIC_CHORDS[NUM_HARMONIC_CHORDS] = {
     // 0: I — C major   "Pure positive" — the tonic home
-    { "C",  "Pure positive",
+    { "C",  "Pure positive", HFN_TONIC, HMOOD_WARM,
       { Note::C4, Note::E4, Note::G4, Note::C5, Note::E5, Note::G5,
         Note::C3, Note::E3, Note::G3, Note::C4, Note::E4, Note::G4 } },
 
     // 1: ii — D minor  "Hardship, faltering" — subdominant tension
-    { "Dm", "Hardship",
+    { "Dm", "Hardship", HFN_SUBDOMINANT, HMOOD_MELANCHOLY,
       { Note::D4, Note::F4, Note::A4, Note::D5, Note::F5, Note::A5,
         Note::D3, Note::F3, Note::A3, Note::D4, Note::F4, Note::A4 } },
 
-    // 2: iii — E minor  "Mystery, complexity" — mediant
-    { "Em", "Mystery",
+    // 2: iii — E minor  "Mystery, complexity" — mediant (tonic-function substitute)
+    { "Em", "Mystery", HFN_TONIC, HMOOD_MYSTERY,
       { Note::E4, Note::G4, Note::B4, Note::E5, Note::G5,     H_B5,
         Note::E3, Note::G3, Note::B3, Note::E4, Note::G4, Note::B4 } },
 
     // 3: IV — F major  "Exploration, warmth" — subdominant
-    { "F",  "Warmth",
+    { "F",  "Warmth", HFN_SUBDOMINANT, HMOOD_GROUNDED,
       { Note::F4, Note::A4, Note::C5, Note::F5, Note::A5, Note::C6,
         Note::F3, Note::A3, Note::C4, Note::F4, Note::A4, Note::C5 } },
 
     // 4: V — G major  "Tension, drama, alarm" — dominant
-    { "G",  "Tension",
+    { "G",  "Tension", HFN_DOMINANT, HMOOD_TENSION,
       { Note::G4, Note::B4, Note::D5, Note::G5,     H_B5, Note::D6,
         Note::G3, Note::B3, Note::D4, Note::G4, Note::B4, Note::D5 } },
 
-    // 5: vi — A minor  "Melancholy, pure negative" — relative minor
-    { "Am", "Melancholy",
+    // 5: vi — A minor  "Melancholy, pure negative" — relative minor (tonic-function substitute)
+    { "Am", "Melancholy", HFN_TONIC, HMOOD_MELANCHOLY,
       { Note::A3, Note::C4, Note::E4, Note::A4, Note::C5, Note::E5,
         Note::A2, Note::C3, Note::E3, Note::A3, Note::C4, Note::E4 } },
 
     // 6: vii° — B diminished  "Alarm, destabilization" — leading-tone chord
     // ("Bo" is used as a screen-safe approximation of B°)
-    { "Bo", "Alarm",
+    { "Bo", "Alarm", HFN_DOMINANT, HMOOD_TENSION,
       { Note::B3, Note::D4, Note::F4, Note::B4, Note::D5, Note::F5,
         Note::B2, Note::D3, Note::F3, Note::B3, Note::D4, Note::F4 } },
 };
@@ -847,25 +916,25 @@ static const char* const HARMONIC_TRANSITIONS[7][7] = {
 // tonic E (with its raised G#). Node 0 = E sits at the centre as the cadential
 // home; the ♭II (F) is the iconic "Spanish" colour. Triads voiced oct3/oct4.
 static const HarmonicChord FLAMENCO_CHORDS[7] = {
-    { "E",  "Cante home",                              // Phrygian-dominant tonic (E G# B)
+    { "E",  "Cante home", HFN_TONIC, HMOOD_WARM,       // Phrygian-dominant tonic (E G# B)
       { Note::E4, Note::Ab4, Note::B4, Note::E4, Note::Ab4, Note::B4,
         Note::E3, Note::Ab3, Note::B3, Note::E3, Note::Ab3, Note::B3 } },
-    { "F",  "Spanish bII",                             // the flat-two colour (F A C)
+    { "F",  "Spanish bII", HFN_CHROMATIC, HMOOD_MYSTERY, // the flat-two colour (F A C)
       { Note::F4, Note::A4, Note::C4, Note::F4, Note::A4, Note::C4,
         Note::F3, Note::A3, Note::C3, Note::F3, Note::A3, Note::C3 } },
-    { "G",  "Lift",                                    // (G B D)
+    { "G",  "Lift", HFN_SUBDOMINANT, HMOOD_GROUNDED,   // (G B D)
       { Note::G4, Note::B4, Note::D4, Note::G4, Note::B4, Note::D4,
         Note::G3, Note::B3, Note::D3, Note::G3, Note::B3, Note::D3 } },
-    { "Am", "Lament",                                  // iv (A C E)
+    { "Am", "Lament", HFN_SUBDOMINANT, HMOOD_MELANCHOLY, // iv (A C E)
       { Note::A4, Note::C4, Note::E4, Note::A4, Note::C4, Note::E4,
         Note::A3, Note::C3, Note::E3, Note::A3, Note::C3, Note::E3 } },
-    { "Dm", "Deepening",                               // (D F A)
+    { "Dm", "Deepening", HFN_SUBDOMINANT, HMOOD_MELANCHOLY, // (D F A)
       { Note::D4, Note::F4, Note::A4, Note::D4, Note::F4, Note::A4,
         Note::D3, Note::F3, Note::A3, Note::D3, Note::F3, Note::A3 } },
-    { "C",  "Brightening",                             // (C E G)
+    { "C",  "Brightening", HFN_TONIC, HMOOD_GROUNDED,  // (C E G)
       { Note::C4, Note::E4, Note::G4, Note::C4, Note::E4, Note::G4,
         Note::C3, Note::E3, Note::G3, Note::C3, Note::E3, Note::G3 } },
-    { "B7", "Tension",                                 // dominant pull (B D# F# A)
+    { "B7", "Tension", HFN_DOMINANT, HMOOD_TENSION,    // dominant pull (B D# F# A)
       { Note::B4, Note::Eb4, Note::Gb4, Note::A4, Note::B4, Note::Eb4,
         Note::B3, Note::Eb3, Note::Gb3, Note::A3, Note::B3, Note::Eb3 } },
 };
@@ -876,28 +945,28 @@ static const HarmonicChord FLAMENCO_CHORDS[7] = {
 // Coltrane (major-third) change, augmented / whole-tone. The feeling string
 // names the DEVICE (no per-pair matrix — the move itself is the point).
 static const HarmonicChord JAZZ_CHORDS[8] = {
-    { "CM7","Tonic rest",                              // Imaj7 (C E G B)
+    { "CM7","Tonic rest", HFN_TONIC, HMOOD_WARM,       // Imaj7 (C E G B)
       { Note::C4, Note::E4, Note::G4, Note::B4, Note::C4, Note::E4,
         Note::C3, Note::E3, Note::G3, Note::B3, Note::C3, Note::E3 } },
-    { "Dm7","ii — set out",                            // (D F A C)
+    { "Dm7","ii — set out", HFN_SUBDOMINANT, HMOOD_GROUNDED, // (D F A C)
       { Note::D4, Note::F4, Note::A4, Note::C4, Note::D4, Note::F4,
         Note::D3, Note::F3, Note::A3, Note::C3, Note::D3, Note::F3 } },
-    { "G7", "V — drive",                               // dominant (G B D F)
+    { "G7", "V — drive", HFN_DOMINANT, HMOOD_TENSION,  // dominant (G B D F)
       { Note::G4, Note::B4, Note::D4, Note::F4, Note::G4, Note::B4,
         Note::G3, Note::B3, Note::D3, Note::F3, Note::G3, Note::B3 } },
-    { "Db7","Tritone sub",                             // bII7 for G7 (Db F Ab B)
+    { "Db7","Tritone sub", HFN_CHROMATIC, HMOOD_TENSION, // bII7 for G7 (Db F Ab B)
       { Note::Db4, Note::F4, Note::Ab4, Note::B4, Note::Db4, Note::F4,
         Note::Db3, Note::F3, Note::Ab3, Note::B3, Note::Db3, Note::F3 } },
-    { "A7", "Secondary V",                             // V7/ii (A C# E G)
+    { "A7", "Secondary V", HFN_CHROMATIC, HMOOD_TENSION, // V7/ii (A C# E G)
       { Note::A4, Note::Db4, Note::E4, Note::G4, Note::A4, Note::Db4,
         Note::A3, Note::Db3, Note::E3, Note::G3, Note::A3, Note::Db3 } },
-    { "AbM","Modal mix",                               // bVI borrowed (Ab C Eb G)
+    { "AbM","Modal mix", HFN_CHROMATIC, HMOOD_MYSTERY, // bVI borrowed (Ab C Eb G)
       { Note::Ab4, Note::C4, Note::Eb4, Note::G4, Note::Ab4, Note::C4,
         Note::Ab3, Note::C3, Note::Eb3, Note::G3, Note::Ab3, Note::C3 } },
-    { "EbM","Coltrane",                                // bIII major-third change (Eb G Bb D)
+    { "EbM","Coltrane", HFN_SYMMETRIC, HMOOD_MYSTERY,  // bIII major-third change (Eb G Bb D)
       { Note::Eb4, Note::G4, Note::Bb4, Note::D4, Note::Eb4, Note::G4,
         Note::Eb3, Note::G3, Note::Bb3, Note::D3, Note::Eb3, Note::G3 } },
-    { "F#+","Whole-tone",                              // augmented / side-slip (F# A# D)
+    { "F#+","Whole-tone", HFN_SYMMETRIC, HMOOD_MYSTERY, // augmented / side-slip (F# A# D)
       { Note::Gb4, Note::Bb4, Note::D4, Note::Gb4, Note::Bb4, Note::D4,
         Note::Gb3, Note::Bb3, Note::D3, Note::Gb3, Note::Bb3, Note::D3 } },
 };
@@ -907,23 +976,26 @@ static const HarmonicChord JAZZ_CHORDS[8] = {
 // neighbour is a single-semitone voice-leading move (P = parallel major/minor,
 // L = leading-tone exchange) — Cohn's hexatonic cycle, the chromatic-mediant
 // "magic / awe" sound the article ties to Neo-Riemannian transformations.
+// All six sit outside a tonal centre (that's the point of a symmetric
+// hexatonic cycle), so every node here shares the SYMMETRIC shape (hexagon);
+// only the mood colour distinguishes them.
 static const HarmonicChord CINEMATIC_CHORDS[6] = {
-    { "C",  "Radiance",                               // C major (C E G)
+    { "C",  "Radiance", HFN_SYMMETRIC, HMOOD_WARM,       // C major (C E G)
       { Note::C4, Note::E4, Note::G4, Note::C4, Note::E4, Note::G4,
         Note::C3, Note::E3, Note::G3, Note::C3, Note::E3, Note::G3 } },
-    { "Cm", "Shadow",                                 // P: C minor (C Eb G)
+    { "Cm", "Shadow", HFN_SYMMETRIC, HMOOD_MELANCHOLY,   // P: C minor (C Eb G)
       { Note::C4, Note::Eb4, Note::G4, Note::C4, Note::Eb4, Note::G4,
         Note::C3, Note::Eb3, Note::G3, Note::C3, Note::Eb3, Note::G3 } },
-    { "Ab", "Wonder",                                 // L: Ab major (Ab C Eb)
+    { "Ab", "Wonder", HFN_SYMMETRIC, HMOOD_MYSTERY,      // L: Ab major (Ab C Eb)
       { Note::Ab4, Note::C4, Note::Eb4, Note::Ab4, Note::C4, Note::Eb4,
         Note::Ab3, Note::C3, Note::Eb3, Note::Ab3, Note::C3, Note::Eb3 } },
-    { "Abm","Mystery",                                // P: Ab minor (Ab Cb=B Eb)
+    { "Abm","Mystery", HFN_SYMMETRIC, HMOOD_MYSTERY,     // P: Ab minor (Ab Cb=B Eb)
       { Note::Ab4, Note::B4, Note::Eb4, Note::Ab4, Note::B4, Note::Eb4,
         Note::Ab3, Note::B3, Note::Eb3, Note::Ab3, Note::B3, Note::Eb3 } },
-    { "E",  "Awe",                                    // L: E major (E G# B)
+    { "E",  "Awe", HFN_SYMMETRIC, HMOOD_MYSTERY,         // L: E major (E G# B)
       { Note::E4, Note::Ab4, Note::B4, Note::E4, Note::Ab4, Note::B4,
         Note::E3, Note::Ab3, Note::B3, Note::E3, Note::Ab3, Note::B3 } },
-    { "Em", "Reverie",                                // P: E minor (E G B); ring closes L→C
+    { "Em", "Reverie", HFN_SYMMETRIC, HMOOD_GROUNDED,    // P: E minor (E G B); ring closes L→C
       { Note::E4, Note::G4, Note::B4, Note::E4, Note::G4, Note::B4,
         Note::E3, Note::G3, Note::B3, Note::E3, Note::G3, Note::B3 } },
 };

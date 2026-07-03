@@ -90,9 +90,16 @@ void MPR121::autoConfig(float vdd, uint8_t ffi) {
     write(AC_TL,  tl);
     write(ACCR1,  0x00);
     // ACCR0: FFI (MUST match the FFI in 0x5C — pass the same value given to
-    // beginConfig), RETRY=00, BVA=10 (reload baseline after config), ARE=1
-    // (auto-reconfig), ACE=1 (auto-config enable).
-    write(ACCR0,  (uint8_t)(((ffi & 0x03) << 6) | 0x0B));
+    // beginConfig), RETRY=00, BVA=10 (reload baseline after config), ARE=0,
+    // ACE=1 (auto-config enable).
+    // ARE (auto-RECONFIG) is deliberately OFF: with it on, the chip silently
+    // re-runs the charge search on any electrode that drifts out of range —
+    // most likely during post-power-on thermal settling — and every re-config
+    // JUMPS that pad's filtered value, which a software baseline can only see
+    // as a phantom touch (pads flickering at startup). Auto-config runs ONCE
+    // at the boot Stop→Run transition; after that the charge parameters stay
+    // fixed and the software baseline owns all drift handling.
+    write(ACCR0,  (uint8_t)(((ffi & 0x03) << 6) | 0x09));
 }
 
 uint16_t MPR121::autoConfigOOR() {
