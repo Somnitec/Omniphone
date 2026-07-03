@@ -770,10 +770,8 @@ static void recalibrateBaselines()
         if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f);
                                       Serial.print(F(" -")); continue; }
         uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
-        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
-        int16_t raw = (int16_t)base - (int16_t)filt;
-        seedSensorState(sensorState[i], (float)raw); // unclamped — seeds envRef
-        Serial.print(' '); Serial.print(i); Serial.print(':'); Serial.print(raw);
+        seedSensorState(sensorState[i], (float)filt); // filtered = new software baseline
+        Serial.print(' '); Serial.print(i); Serial.print(':'); Serial.print(filt);
     }
     Serial.println();
 }
@@ -1059,6 +1057,7 @@ void setup()
     proxCfg.fastAlphaRise     = PROX_ATTACK_ALPHA;
     proxCfg.fallJumpRef       = PROX_FALL_JUMP_REF;
     proxCfg.baseIdleAlpha     = PROX_BASE_IDLE_ALPHA;
+    proxCfg.baseNegAlpha      = PROX_BASE_NEG_ALPHA;
     proxCfg.healAlpha         = PROX_HEAL_ALPHA;
     proxCfg.holdMaxFrames     = PROX_HOLD_MAX_FRAMES;
     proxCfg.lowHoldBand       = PROX_LOW_HOLD_BAND;
@@ -1151,9 +1150,7 @@ void setup()
         const SensorConfig &sc = SENSORS[i];
         if (sc.electrode == NO_PIN) { seedSensorState(sensorState[i], 0.0f); continue; }
         uint16_t filt = boards[sc.boardIndex].filteredData(sc.electrode);
-        uint16_t base = boards[sc.boardIndex].baselineData(sc.electrode);
-        int16_t raw = (int16_t)base - (int16_t)filt;
-        seedSensorState(sensorState[i], (float)raw); // unclamped — seeds envRef
+        seedSensorState(sensorState[i], (float)filt); // filtered = new software baseline
     }
 
     // ── Load chosen scale + timbre (scale may be overridden by a held pad) ───
@@ -1283,15 +1280,15 @@ void loop()
     lastUpdateMs = now;
 
     // ── Burst-read all boards ────────────────────────────────────────────────
-    // Sized for the MPR121 max (12 electrodes); each board only reads its own
-    // SENSE_ELECTRODES[b] count — filtered is 2 bytes/electrode, baseline 1.
-    // The chip's touch-status register is deliberately NOT read: nothing uses
-    // it (contact detection is the jump detector in proximity_engine.h), and
-    // dropping those 2 transactions/frame buys back real bus time — measured
-    // total for the reads below is ~3.8 ms of the 6 ms frame at 100 kHz.
+    // ONLY the filtered registers are read (2 bytes/electrode). The chip's
+    // baseline registers are deliberately not read — the delta is computed
+    // against the engine's software baseline (see proximity_engine.h; the
+    // register's 4-count quantization caused ghost flutter, and its falling
+    // filter ate slow approaches). The touch-status register is skipped too:
+    // nothing uses it (contact detection is the jump detector). Net frame cost
+    // is now one burst per board, ~2.6 ms of the 6 ms frame at 100 kHz.
     struct BoardData {
         uint8_t  filt[24];
-        uint8_t  base[12];
     };
     static BoardData bd[NUM_BOARDS];
 
@@ -1299,7 +1296,6 @@ void loop()
     {
         uint8_t n = SENSE_ELECTRODES[b];
         boards[b].burstRead(MPR121Reg::FILT_0L, bd[b].filt, (uint8_t)(n * 2));
-        boards[b].burstRead(MPR121Reg::BASE_0,  bd[b].base, n);
     }
 
     // ── Per-sensor update ────────────────────────────────────────────────────
@@ -1377,10 +1373,9 @@ void loop()
         const BoardData &b = bd[sc.boardIndex];
         uint8_t e = sc.electrode;
 
-        // Reconstruct 10-bit values from burst buffers
+        // Reconstruct the 10-bit filtered value from the burst buffer
         uint16_t filtered = (uint16_t)b.filt[2 * e]
                           | ((uint16_t)(b.filt[2 * e + 1] & 0x03) << 8);
-        uint16_t baseline = (uint16_t)b.base[e] << 2;
 
         // Optional median-of-3 (SENSOR_MEDIAN3 in config.h — bench data showed
         // it costs a full frame of onset latency and FFI≥1 already leaves zero
@@ -1395,19 +1390,16 @@ void loop()
             fPrev1[i] = filtered;
         }
 
-        // UNCLAMPED delta — negative values carry real information (the 8-bit
-        // baseline register can sit up to 3 counts below the true idle level);
-        // the engine's envRef absorbs the offset. See proximity_engine.h.
-        float rawDelta = (float)((int16_t)baseline - (int16_t)fMed);
-
         tpFilt[i] = fMed; // for the Teleplot readout
 
+        // The engine takes the raw filtered value directly — the delta is
+        // formed inside against the per-pad software baseline (state.base).
         float intensity;
         bool  isTouch;
-        updateProximity(rawDelta, now, proxCfg, sensorState[i], intensity, isTouch);
+        updateProximity((float)fMed, now, proxCfg, sensorState[i], intensity, isTouch);
 
         // Teleplot shows the drift-corrected delta the engine actually runs on.
-        float effDelta = rawDelta - sensorState[i].envRef;
+        float effDelta = sensorState[i].base - (float)fMed;
         tpDelta[i] = effDelta < 0.0f ? 0.0f : effDelta;
 
         if (intensity > IDLE_INTENSITY || bellHeld[i]) anyActive = true;

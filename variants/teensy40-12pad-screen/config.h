@@ -684,18 +684,29 @@ static constexpr float PROX_ATTACK_ALPHA = 0.75f; // 0.5→0.65→0.75 ("still a
 // at full speed (fast fade), small dips keep the slow fall EMA (no strobe).
 static constexpr float PROX_FALL_JUMP_REF = 8.0f;
 
-// ── Software environmental baseline (self-heal, ported from esp32s3-19pad) ───
-// The chip's falling baseline filter is nearly frozen, so an object placed near
-// a pad — or rotating the instrument so ground coupling shifts — used to leave
-// a permanent positive delta: a pad droning forever, which also blocked the
-// idle recal (the stuck pad kept anyActive true → deadlock). A per-pad software
-// zero now sits on top of the chip baseline:
-//   • idle  → tracks slow EM/temperature/rotation drift (~2.7 s time constant)
-//   • held  → frozen, so sustained notes never fade
-//   • stuck → after PROX_HOLD_MAX_FRAMES (~8 s, longer than any musical hold)
-//             the pad is re-zeroed over ~1 s and goes silent; it regains full
-//             sensitivity a couple of seconds after whatever caused it moves.
-static constexpr float    PROX_BASE_IDLE_ALPHA = 0.004f;
+// ── Software baseline (full port of the esp32s3-19pad design) ────────────────
+// The delta is now computed ONLY against a per-pad software baseline on the
+// raw filtered value; the chip's baseline registers are not read at all. Why
+// (both measured): the register moves in 4-count jumps (only the top 8 of its
+// 10 bits are exposed) — with a deadband of 4, every jump was a ghost note
+// that fluttered until the heal caught it ("pops out of calibration"); and
+// the chip's falling baseline filter chases a slowly approaching hand (2×
+// faster at ESI=1 ms), eating the delta before it accumulates = lost reach.
+// The software baseline moves only per this state machine:
+//   • idle      → tracks slow EM/temperature/rotation drift (~2 s tau)
+//   • negative  → filtered ABOVE base is unambiguously a stale baseline (a
+//     delta       hand only pulls filtered DOWN) → track fast (~0.1 s) — a
+//                 desensitised pad recovers almost immediately
+//   • held      → frozen, so sustained notes never fade
+//   • stuck     → after PROX_HOLD_MAX_FRAMES (~8 s, longer than any musical
+//                 hold) the pad re-zeroes over ~1 s; low-parked residuals go
+//                 sooner via PROX_LOW_HOLD_* below.
+static constexpr float    PROX_BASE_IDLE_ALPHA = 0.003f; // ↓ from 0.004: restores the
+                                                         // ~2 s wall-clock tau at the
+                                                         // new 6 ms frames (absorbs
+                                                         // slow approaches less =
+                                                         // slightly more reach)
+static constexpr float    PROX_BASE_NEG_ALPHA  = 0.05f;
 static constexpr float    PROX_HEAL_ALPHA      = 0.02f;
 static constexpr uint16_t PROX_HOLD_MAX_FRAMES = 1333; // 8 s @ 167 Hz (6 ms) frames
 // Low-residual fast heal. Observed on hardware: with many notes pressed, the
@@ -902,30 +913,45 @@ static const HarmonicChord JAZZ_CHORDS[8] = {
         Note::Gb3, Note::Bb3, Note::D3, Note::Gb3, Note::Bb3, Note::D3 } },
 };
 
-// ── Atlas 4: Cinematic (Neo-Riemannian hexatonic cycle) ──────────────────────
-// Six triads on a ring (no centre): C, Cm, Ab, Abm, E, Em. Each step to a
-// neighbour is a single-semitone voice-leading move (P = parallel major/minor,
-// L = leading-tone exchange) — Cohn's hexatonic cycle, the chromatic-mediant
-// "magic / awe" sound the article ties to Neo-Riemannian transformations.
-static const HarmonicChord CINEMATIC_CHORDS[6] = {
-    { "C",  "Radiance",                               // C major (C E G)
-      { Note::C4, Note::E4, Note::G4, Note::C4, Note::E4, Note::G4,
-        Note::C3, Note::E3, Note::G3, Note::C3, Note::E3, Note::G3 } },
-    { "Cm", "Shadow",                                 // P: C minor (C Eb G)
+// ── Atlas 4: Cinematic (augmented-triad hub) ─────────────────────────────────
+// C+ (the augmented triad C-E-Ab) sits at the centre — its three roots are a
+// major third apart, so it's equidistant from three chromatic-mediant
+// neighbourhoods. The ring holds a major/minor pair from each of those three
+// regions, clockwise from the top: Cm, F, Em, A, Abm, Db. Coloured by chord
+// type (pink/blue/amber/green), matching the Tonal Map — see typeColor below.
+// No ring-to-ring edges (see ringEdges below): only the 6 hub spokes are
+// legal moves, so voice leading only ever has to be smooth hub<->ring.
+//
+// Voicings: each ring chord keeps the hub's exact pad layout (pad%3 = which
+// of the hub's three tones — C/E/Ab — that pad "descends from") and moves
+// every pad the minimal distance to the nearest tone of the new chord. Since
+// each ring chord shares exactly one tone with C+, and an augmented triad is
+// equidistant (a major third) from its neighbours, this always works out to
+// 0 semitones on the shared tone and exactly ±1 semitone (uniformly) on the
+// other two — every pad glides by at most a half-step on every hub<->ring
+// move. (Verified by exhaustive per-chord-tone search, not hand-tuned.)
+static const HarmonicChord CINEMATIC_CHORDS[7] = {
+    { "C+",  "Suspended",                              // centre: C augmented (C E Ab)
+      { Note::C4, Note::E4, Note::Ab4, Note::C4, Note::E4, Note::Ab4,
+        Note::C3, Note::E3, Note::Ab3, Note::C3, Note::E3, Note::Ab3 } },
+    { "Cm",  "Shadow",                                 // C minor (C Eb G); E,Ab slots -1
       { Note::C4, Note::Eb4, Note::G4, Note::C4, Note::Eb4, Note::G4,
         Note::C3, Note::Eb3, Note::G3, Note::C3, Note::Eb3, Note::G3 } },
-    { "Ab", "Wonder",                                 // L: Ab major (Ab C Eb)
-      { Note::Ab4, Note::C4, Note::Eb4, Note::Ab4, Note::C4, Note::Eb4,
-        Note::Ab3, Note::C3, Note::Eb3, Note::Ab3, Note::C3, Note::Eb3 } },
-    { "Abm","Mystery",                                // P: Ab minor (Ab Cb=B Eb)
-      { Note::Ab4, Note::B4, Note::Eb4, Note::Ab4, Note::B4, Note::Eb4,
-        Note::Ab3, Note::B3, Note::Eb3, Note::Ab3, Note::B3, Note::Eb3 } },
-    { "E",  "Awe",                                    // L: E major (E G# B)
-      { Note::E4, Note::Ab4, Note::B4, Note::E4, Note::Ab4, Note::B4,
-        Note::E3, Note::Ab3, Note::B3, Note::E3, Note::Ab3, Note::B3 } },
-    { "Em", "Reverie",                                // P: E minor (E G B); ring closes L→C
-      { Note::E4, Note::G4, Note::B4, Note::E4, Note::G4, Note::B4,
-        Note::E3, Note::G3, Note::B3, Note::E3, Note::G3, Note::B3 } },
+    { "F",   "Warmth",                                 // F major (F A C); E,Ab slots +1
+      { Note::C4, Note::F4, Note::A4, Note::C4, Note::F4, Note::A4,
+        Note::C3, Note::F3, Note::A3, Note::C3, Note::F3, Note::A3 } },
+    { "Em",  "Longing",                                // E minor (E G B); C,Ab slots -1
+      { Note::B3, Note::E4, Note::G4, Note::B3, Note::E4, Note::G4,
+        Note::B2, Note::E3, Note::G3, Note::B2, Note::E3, Note::G3 } },
+    { "A",   "Radiance",                                // A major (A C# E); C,Ab slots +1
+      { Note::Db4, Note::E4, Note::A4, Note::Db4, Note::E4, Note::A4,
+        Note::Db3, Note::E3, Note::A3, Note::Db3, Note::E3, Note::A3 } },
+    { "Abm", "Mystery",                                 // Ab minor (Ab Cb=B Eb); C,E slots -1
+      { Note::B3, Note::Eb4, Note::Ab4, Note::B3, Note::Eb4, Note::Ab4,
+        Note::B2, Note::Eb3, Note::Ab3, Note::B2, Note::Eb3, Note::Ab3 } },
+    { "Db",  "Wonder",                                  // Db major (Db F Ab); C,E slots +1
+      { Note::Db4, Note::F4, Note::Ab4, Note::Db4, Note::F4, Note::Ab4,
+        Note::Db3, Note::F3, Note::Ab3, Note::Db3, Note::F3, Note::Ab3 } },
 };
 
 // ── Atlas 5: Tonal Map (navigable 48-chord graph) ────────────────────────────
@@ -945,16 +971,22 @@ struct HarmonicJourney {
     bool                 centerFirst; // node 0 centred (home) vs. all on a ring
     const HarmonicChord* chords;
     const char* const*   transitions; // nullptr → use chord.feeling
+    bool                 typeColor;   // colour nodes by chord-type suffix
+                                       // (m/7/+/plain), Tonal-Map style, instead
+                                       // of the plain white/grey scheme
+    bool                 ringEdges;   // draw the ring-to-ring lines between
+                                       // adjacent outer nodes, in addition to
+                                       // the centre spokes (centerFirst only)
 };
 
 static constexpr uint8_t NUM_HARMONIC_JOURNEYS = 5;
 static constexpr uint8_t JOURNEY_TONAL_MAP     = 4; // index of the dynamic map
 static const HarmonicJourney HARMONIC_JOURNEYS[NUM_HARMONIC_JOURNEYS] = {
-    { "Diatonic",  7, true,  HARMONIC_CHORDS,  &HARMONIC_TRANSITIONS[0][0] },
-    { "Flamenco",  7, true,  FLAMENCO_CHORDS,  nullptr },
-    { "Jazz",      8, true,  JAZZ_CHORDS,      nullptr },
-    { "Cinematic", 6, false, CINEMATIC_CHORDS, nullptr },
-    { "Tonal Map", 0, false, nullptr,          nullptr },
+    { "Diatonic",  7, true,  HARMONIC_CHORDS,  &HARMONIC_TRANSITIONS[0][0], false, true  },
+    { "Flamenco",  7, true,  FLAMENCO_CHORDS,  nullptr, false, true  },
+    { "Jazz",      8, true,  JAZZ_CHORDS,      nullptr, false, true  },
+    { "Cinematic", 7, true,  CINEMATIC_CHORDS, nullptr, true,  false }, // spokes only, no hexagon
+    { "Tonal Map", 0, false, nullptr,          nullptr, false, false },
 };
 
 // Update timing. Bench-measured (sensor_characterization `u`): the production

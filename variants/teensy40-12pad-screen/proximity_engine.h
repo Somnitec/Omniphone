@@ -4,12 +4,17 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Proximity engine — pure C++, no Arduino dependencies
 //
-// Converts raw MPR121 delta values (baseline − filtered) into:
+// Converts the raw MPR121 FILTERED value (10-bit; a hand pulls it DOWN) into:
 //   outIntensity  0.0 (hand far) → 1.0 (very close), used for amplitude + LED
 //   outTouch      true on the frame a contact event is detected
 //
 // Signal model:
-//   delta = baseline − filtered  (positive when hand is near)
+//   delta = softwareBaseline − filtered   (positive when hand is near)
+//
+// The chip's own baseline registers are NOT read — they quantize to 4 counts
+// and their falling filter chases slow approaches (both measured, 2026-07-03).
+// The software baseline in SensorState.base is the only zero reference; it
+// idles/tracks/freezes/heals per the state machine in updateProximity.
 //
 //   fast EMA (α_rise / α_fall)   follows hand movement; drives amplitude + LEDs
 //   slow EMA (α_slow)            tracks only slow environmental drift
@@ -51,19 +56,29 @@ struct ProximityConfig {
     float    fallJumpRef   = 8.0f;   // downward delta step (counts/frame) that gives
                                      // full-speed release tracking; small dips keep
                                      // fastAlphaFall (anti-strobe), a real lift snaps
-    // ── Software environmental baseline (ported from esp32s3-19pad) ──────────
-    // The chip's falling baseline filter is nearly frozen (NCL_F=200/FDL_F=255),
-    // so an object set down near a pad — or a rotation that shifts ground
-    // coupling — leaves a permanent positive delta = a pad stuck droning.
-    // envRef is a per-pad software zero on top of rawDelta:
-    //   idle  (eff < deadband)      → envRef slowly TRACKS rawDelta (absorbs EM
-    //                                 drift, rotation, temperature)
-    //   held  (eff ≥ deadband)      → envRef FREEZES (sustained notes don't fade)
-    //   stuck (held > holdMaxFrames)→ envRef HEALS toward rawDelta (re-zeroes a
+    // ── Software baseline (full port of the esp32s3-19pad design) ─────────────
+    // The delta is computed against a per-pad SOFTWARE baseline on the raw
+    // filtered value — the chip's baseline registers are not used at all. Two
+    // measured reasons (see the 2026-07-03 characterization capture):
+    //   • the register exposes only the top 8 of the baseline's 10 bits, so it
+    //     moves in jumps of 4 counts — with a deadband of 4, every jump was a
+    //     ghost note / flutter until the heal absorbed it;
+    //   • the chip's falling baseline filter chases an approaching hand (2×
+    //     faster at ESI=1 ms), eating the delta on slow approaches = lost reach.
+    // The software baseline moves ONLY per the state machine below:
+    //   idle  (eff < deadband)      → base slowly TRACKS the filtered value
+    //                                 (absorbs EM drift, rotation, temperature)
+    //   negative delta (filt > base)→ base tracks FAST — a hand can only lower
+    //                                 the filtered value, so a negative delta is
+    //                                 unambiguously a stale baseline (pad was
+    //                                 desensitised; recover in ~0.1 s, not ~2 s)
+    //   held  (eff ≥ deadband)      → base FREEZES (sustained notes don't fade)
+    //   stuck (held > holdMaxFrames)→ base HEALS toward filtered (re-zeroes a
     //                                 pad no musical hold is this long)
-    float    baseIdleAlpha = 0.004f; // idle drift tracking (~2.7 s tau @ 8 ms frames;
+    float    baseIdleAlpha = 0.003f; // idle drift tracking (~2 s tau @ 6 ms frames;
                                      // slower = more reach on very slow approaches,
                                      // faster = quicker recovery from EM change)
+    float    baseNegAlpha  = 0.05f;  // negative-delta recovery (~0.12 s tau)
     float    healAlpha     = 0.02f;  // stuck-pad re-zero rate (~0.4 s tau)
     uint16_t holdMaxFrames = 1000;   // frames above deadband before "stuck" verdict
                                      // (1000 ≈ 8 s @ 125 Hz — longer than any hold)
@@ -90,17 +105,18 @@ struct SensorState {
     uint8_t  aboveCount  = 0;     // consecutive frames fast has been over the deadband
     bool     gateOpen    = false; // proximity gate latch (hysteresis, anti-strobe)
     float    intensitySm = 0.0f;  // smoothed output intensity (1-pole)
-    float    envRef      = 0.0f;  // software environmental zero (subtracted from rawDelta)
+    float    base        = 0.0f;  // software baseline of the raw filtered value
     uint16_t holdFrames  = 0;     // consecutive frames the pad has been above deadband
     uint16_t lowFrames   = 0;     // consecutive frames parked in the low band
 };
 
 // ── Seed state from an initial reading ───────────────────────────────────────
 // Call once after startup reads so the jump detector does not fire spuriously
-// on the first loop iteration. Pass the RAW delta, unclamped — a negative
-// initial delta (baseline register quantized below the true idle level) seeds
-// envRef so the pad's effective zero is its actual idle reading, not 0.
-inline void seedSensorState(SensorState& s, float initialDelta) {
+// on the first loop iteration. Pass the pad's current RAW FILTERED value — it
+// becomes the initial software baseline. (Nothing should be touching; a finger
+// present at seed time self-heals via the fast negative-delta recovery once it
+// lifts.)
+inline void seedSensorState(SensorState& s, float initialFiltered) {
     s.fast        = 0.0f;
     s.slow        = 0.0f;
     s.prevFast    = 0.0f;
@@ -111,39 +127,38 @@ inline void seedSensorState(SensorState& s, float initialDelta) {
     s.aboveCount  = 0;
     s.gateOpen    = false;
     s.intensitySm = 0.0f;
-    s.envRef      = initialDelta;
+    s.base        = initialFiltered;
     s.holdFrames  = 0;
     s.lowFrames   = 0;
 }
 
 // ── Update one sensor for the current frame ───────────────────────────────────
-// rawDelta   : baseline − filtered, UNCLAMPED. Negative values are expected and
-//              important: the chip only exposes the top 8 bits of its 10-bit
-//              baseline, so the register can read up to 3 counts BELOW the true
-//              idle level — measured on hardware (idle filt 791 vs base 788).
-//              Clamping at 0 hid that offset and silently cost 0–3 counts of
-//              sensitivity per pad; instead envRef tracks the true idle level
-//              (negative included) and effDelta = rawDelta − envRef restores
-//              the full signal.
+// rawFiltered : the pad's raw 10-bit FILTERED value straight from the chip. A
+//               hand near the pad pulls it DOWN. The chip's baseline registers
+//               are deliberately not used (4-count quantization jumps + their
+//               falling filter chases slow approaches) — the software baseline
+//               below is the only zero reference, at sub-count resolution.
 // nowMs      : current time in milliseconds (from millis())
 // cfg        : tuning parameters
 // state      : per-sensor mutable state (updated in place)
 // outIntensity : normalised proximity in [0.0, 1.0]
 // outTouch     : set to true if a contact event fired this frame
-inline void updateProximity(float rawDelta, uint32_t nowMs,
+inline void updateProximity(float rawFiltered, uint32_t nowMs,
                             const ProximityConfig& cfg, SensorState& state,
                             float& outIntensity, bool& outTouch) {
-    // ── Software environmental baseline ───────────────────────────────────────
-    // effDelta = rawDelta − envRef is what everything below runs on. envRef
-    // tracks slow environmental change while the pad is idle, freezes during a
-    // musical hold, and heals (re-zeroes) a pad that has been "held" longer
-    // than any musical hold — an object set down nearby, or a rotation shift.
-    float effDelta = rawDelta - state.envRef;
-    if (effDelta < 0.0f) effDelta = 0.0f;
+    // ── Software baseline ──────────────────────────────────────────────────────
+    // effDelta = base − filtered is what everything below runs on. The baseline
+    // tracks slow environmental change while the pad is idle, snaps up quickly
+    // on a negative delta (unambiguously stale — a hand only pulls filtered
+    // DOWN), freezes during a musical hold, and heals a pad "held" longer than
+    // any musical hold — an object set down nearby, or a rotation shift.
+    float effDelta = state.base - rawFiltered;
     if (effDelta < cfg.proxDeadband) {
         state.holdFrames = 0;
         state.lowFrames  = 0;
-        state.envRef += cfg.baseIdleAlpha * (rawDelta - state.envRef);
+        float k = (effDelta < 0.0f) ? cfg.baseNegAlpha : cfg.baseIdleAlpha;
+        state.base += k * (rawFiltered - state.base);
+        if (effDelta < 0.0f) effDelta = 0.0f;
     } else {
         if (state.holdFrames < 0xFFFF) state.holdFrames++;
         // Low-residual detector: parked just above the deadband (dim LED /
@@ -155,7 +170,7 @@ inline void updateProximity(float rawDelta, uint32_t nowMs,
         }
         if (state.holdFrames > cfg.holdMaxFrames ||
             state.lowFrames  > cfg.lowHoldFrames)
-            state.envRef += cfg.healAlpha * (rawDelta - state.envRef);
+            state.base += cfg.healAlpha * (rawFiltered - state.base);
         // else: frozen — a held note sustains at full level
     }
 
