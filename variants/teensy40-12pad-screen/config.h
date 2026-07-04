@@ -971,7 +971,7 @@ static const HarmonicChord JAZZ_CHORDS[8] = {
         Note::Gb3, Note::Bb3, Note::D3, Note::Gb3, Note::Bb3, Note::D3 } },
 };
 
-// ── Atlas 4: Cinematic (Neo-Riemannian hexatonic cycle) ──────────────────────
+// ── Atlas 4a: Cinematic Hexatonic (Neo-Riemannian hexatonic cycle) ───────────
 // Six triads on a ring (no centre): C, Cm, Ab, Abm, E, Em. Each step to a
 // neighbour is a single-semitone voice-leading move (P = parallel major/minor,
 // L = leading-tone exchange) — Cohn's hexatonic cycle, the chromatic-mediant
@@ -979,7 +979,7 @@ static const HarmonicChord JAZZ_CHORDS[8] = {
 // All six sit outside a tonal centre (that's the point of a symmetric
 // hexatonic cycle), so every node here shares the SYMMETRIC shape (hexagon);
 // only the mood colour distinguishes them.
-static const HarmonicChord CINEMATIC_CHORDS[6] = {
+static const HarmonicChord CINEMATIC_HEXATONIC_CHORDS[6] = {
     { "C",  "Radiance", HFN_SYMMETRIC, HMOOD_WARM,       // C major (C E G)
       { Note::C4, Note::E4, Note::G4, Note::C4, Note::E4, Note::G4,
         Note::C3, Note::E3, Note::G3, Note::C3, Note::E3, Note::G3 } },
@@ -1000,6 +1000,47 @@ static const HarmonicChord CINEMATIC_CHORDS[6] = {
         Note::E3, Note::G3, Note::B3, Note::E3, Note::G3, Note::B3 } },
 };
 
+// ── Atlas 4b: Cinematic (augmented-triad hub) ────────────────────────────────
+// C+ (the augmented triad C-E-Ab) sits at the centre — its three roots are a
+// major third apart, so it's equidistant from three chromatic-mediant
+// neighbourhoods. The ring holds a major/minor pair from each of those three
+// regions, clockwise from the top: Cm, F, Em, A, Abm, Db. Coloured by chord
+// type (pink/blue/amber/green), matching the Tonal Map — see typeColor below.
+// No ring-to-ring edges (see ringEdges below): only the 6 hub spokes are
+// legal moves, so voice leading only ever has to be smooth hub<->ring.
+//
+// Voicings: each ring chord keeps the hub's exact pad layout (pad%3 = which
+// of the hub's three tones — C/E/Ab — that pad "descends from") and moves
+// every pad the minimal distance to the nearest tone of the new chord. Since
+// each ring chord shares exactly one tone with C+, and an augmented triad is
+// equidistant (a major third) from its neighbours, this always works out to
+// 0 semitones on the shared tone and exactly ±1 semitone (uniformly) on the
+// other two — every pad glides by at most a half-step on every hub<->ring
+// move. (Verified by exhaustive per-chord-tone search, not hand-tuned.)
+static const HarmonicChord CINEMATIC_CHORDS[7] = {
+    { "C+",  "Suspended",                              // centre: C augmented (C E Ab)
+      { Note::C4, Note::E4, Note::Ab4, Note::C4, Note::E4, Note::Ab4,
+        Note::C3, Note::E3, Note::Ab3, Note::C3, Note::E3, Note::Ab3 } },
+    { "Cm",  "Shadow",                                 // C minor (C Eb G); E,Ab slots -1
+      { Note::C4, Note::Eb4, Note::G4, Note::C4, Note::Eb4, Note::G4,
+        Note::C3, Note::Eb3, Note::G3, Note::C3, Note::Eb3, Note::G3 } },
+    { "F",   "Warmth",                                 // F major (F A C); E,Ab slots +1
+      { Note::C4, Note::F4, Note::A4, Note::C4, Note::F4, Note::A4,
+        Note::C3, Note::F3, Note::A3, Note::C3, Note::F3, Note::A3 } },
+    { "Em",  "Longing",                                // E minor (E G B); C,Ab slots -1
+      { Note::B3, Note::E4, Note::G4, Note::B3, Note::E4, Note::G4,
+        Note::B2, Note::E3, Note::G3, Note::B2, Note::E3, Note::G3 } },
+    { "A",   "Radiance",                                // A major (A C# E); C,Ab slots +1
+      { Note::Db4, Note::E4, Note::A4, Note::Db4, Note::E4, Note::A4,
+        Note::Db3, Note::E3, Note::A3, Note::Db3, Note::E3, Note::A3 } },
+    { "Abm", "Mystery",                                 // Ab minor (Ab Cb=B Eb); C,E slots -1
+      { Note::B3, Note::Eb4, Note::Ab4, Note::B3, Note::Eb4, Note::Ab4,
+        Note::B2, Note::Eb3, Note::Ab3, Note::B2, Note::Eb3, Note::Ab3 } },
+    { "Db",  "Wonder",                                  // Db major (Db F Ab); C,E slots +1
+      { Note::Db4, Note::F4, Note::Ab4, Note::Db4, Note::F4, Note::Ab4,
+        Note::Db3, Note::F3, Note::Ab3, Note::Db3, Note::F3, Note::Ab3 } },
+};
+
 // ── Atlas 5: Tonal Map (navigable 48-chord graph) ────────────────────────────
 // Unlike the fixed atlases above, this journey is a dynamic graph: the current
 // chord sits at the centre and its legal moves radiate outward, re-centring on
@@ -1017,16 +1058,23 @@ struct HarmonicJourney {
     bool                 centerFirst; // node 0 centred (home) vs. all on a ring
     const HarmonicChord* chords;
     const char* const*   transitions; // nullptr → use chord.feeling
+    bool                 typeColor;   // colour nodes by chord-type suffix
+                                       // (m/7/+/plain), Tonal-Map style, instead
+                                       // of the plain white/grey scheme
+    bool                 ringEdges;   // draw the ring-to-ring lines between
+                                       // adjacent outer nodes, in addition to
+                                       // the centre spokes (centerFirst only)
 };
 
-static constexpr uint8_t NUM_HARMONIC_JOURNEYS = 5;
-static constexpr uint8_t JOURNEY_TONAL_MAP     = 4; // index of the dynamic map
+static constexpr uint8_t NUM_HARMONIC_JOURNEYS = 6;
+static constexpr uint8_t JOURNEY_TONAL_MAP     = 5; // index of the dynamic map
 static const HarmonicJourney HARMONIC_JOURNEYS[NUM_HARMONIC_JOURNEYS] = {
-    { "Diatonic",  7, true,  HARMONIC_CHORDS,  &HARMONIC_TRANSITIONS[0][0] },
-    { "Flamenco",  7, true,  FLAMENCO_CHORDS,  nullptr },
-    { "Jazz",      8, true,  JAZZ_CHORDS,      nullptr },
-    { "Cinematic", 6, false, CINEMATIC_CHORDS, nullptr },
-    { "Tonal Map", 0, false, nullptr,          nullptr },
+    { "Diatonic",   7, true,  HARMONIC_CHORDS,            &HARMONIC_TRANSITIONS[0][0], false, true  },
+    { "Flamenco",   7, true,  FLAMENCO_CHORDS,            nullptr, false, true  },
+    { "Jazz",       8, true,  JAZZ_CHORDS,                nullptr, false, true  },
+    { "Cinematic",  7, true,  CINEMATIC_CHORDS,           nullptr, true,  false }, // spokes only, no hexagon
+    { "Hexatonic",  6, false, CINEMATIC_HEXATONIC_CHORDS, nullptr, false, true  }, // ring only, no centre
+    { "Tonal Map",  0, false, nullptr,                    nullptr, false, false },
 };
 
 // Update timing. Bench-measured (sensor_characterization `u`): the production

@@ -111,6 +111,7 @@ static uint8_t g_harmonicChord = 0;     // currently selected node (0 … nNodes
 static uint8_t g_hjIdx   = 0;           // active journey index
 static uint8_t g_hNodes  = 7;           // node count for the active journey
 static bool    g_hCenter = true;        // node 0 centred (home) vs. all-on-ring
+static bool    g_hRingEdges = true;     // draw ring-to-ring lines (false = spokes only)
 static int16_t g_hnodeX[HARMONIC_MAX_NODES] = { 0 };
 static int16_t g_hnodeY[HARMONIC_MAX_NODES] = { 0 };
 
@@ -351,6 +352,20 @@ inline uint8_t tmFunction(uint8_t type)
     }
 }
 
+// Guess a fixed-atlas chord's type from its short label suffix (m/7/+/plain),
+// for journeys that opt into the Tonal Map's colour coding via typeColor.
+// Only safe for atlases using that plain suffix convention (see config.h).
+inline uint8_t harmonicChordType(const char* name)
+{
+    size_t len = strlen(name);
+    if (len == 0) return TM_MAJ;
+    char last = name[len - 1];
+    if (last == 'm') return TM_MIN;
+    if (last == '7') return TM_DOM7;
+    if (last == '+') return TM_AUG;
+    return TM_MAJ;
+}
+
 // nearSeg with a bounding-box early-out plus the hit's parameter t and the
 // segment length — needed to dash dotted edges and clip them at the nodes.
 inline bool nearSegT(uint16_t x, uint16_t y, float ax, float ay,
@@ -547,14 +562,17 @@ inline UWORD tonalMapPixel(uint16_t x, uint16_t y)
 }
 
 // Is the edge a→b part of the active journey's network? Center-first journeys
-// draw spokes from node 0 to every ring node plus the ring; ring journeys draw
-// only the ring. (Generated from g_hCenter — no per-journey edge table.)
+// draw spokes from node 0 to every ring node, plus the ring itself unless
+// g_hRingEdges is false (spokes-only star, e.g. Cinematic); ring journeys
+// (no centre) always draw the ring. (Generated from g_hCenter — no
+// per-journey edge table.)
 inline bool harmonicEdge(uint8_t a, uint8_t b)
 {
     uint8_t start = g_hCenter ? 1 : 0;       // first ring node index
     uint8_t ringN = (uint8_t)(g_hNodes - start);
     if (g_hCenter && (a == 0 || b == 0))     // spoke to the centre
         return true;
+    if (g_hCenter && !g_hRingEdges) return false; // spokes only, no ring
     if (a < start || b < start) return false;
     // Adjacent on the ring (consecutive, with wrap)?
     uint8_t ia = (uint8_t)(a - start), ib = (uint8_t)(b - start);
@@ -601,6 +619,14 @@ inline UWORD harmonicPixel(uint16_t x, uint16_t y)
         int32_t r2=(int32_t)nx*nx+(int32_t)ny*ny;
         if (r2 <= (int32_t)HNODE_R*HNODE_R) {
             bool sel = (n == g_harmonicChord);
+            if (J.typeColor) {
+                uint8_t ty = harmonicChordType(J.chords[n].name);
+                if (r2 >= (int32_t)(HNODE_R-2)*(HNODE_R-2))
+                    return tmColor(ty, sel ? 1.0f : 0.55f);          // ring border
+                if (glyphPixelAt(x, y, g_hnodeX[n], g_hnodeY[n], J.chords[n].name, &Font16))
+                    return sel ? BLACK : WHITE;                      // text
+                return tmColor(ty, sel ? 0.85f : 0.16f);             // fill
+            }
             if (r2 >= (int32_t)(HNODE_R-2)*(HNODE_R-2))
                 return sel ? WHITE : grey565(110);   // ring border
             const HarmonicChord &C = J.chords[n];
@@ -743,9 +769,10 @@ inline void displaySetHarmonicJourney(uint8_t j)
 {
     if (j >= NUM_HARMONIC_JOURNEYS) return;
     const HarmonicJourney &J = HARMONIC_JOURNEYS[j];
-    g_hjIdx   = j;
-    g_hNodes  = J.nNodes;
-    g_hCenter = J.centerFirst;
+    g_hjIdx      = j;
+    g_hNodes     = J.nNodes;
+    g_hCenter    = J.centerFirst;
+    g_hRingEdges = J.ringEdges;
 
     // The dynamic Tonal Map lays itself out (displaySetTonalMapCenter).
     if (J.nNodes == 0) { markDirty(); return; }

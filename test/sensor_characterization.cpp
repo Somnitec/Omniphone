@@ -36,11 +36,11 @@
 //            noise-scan row per FFI value.
 //   g        AUTO CDC SWEEP: cycles CDC 6/8/10/12/14/16/20 at the current
 //            FFI/CDT. Hand away ONCE — one row per CDC value.
-//   t<sec>   RAW TIME-SERIES: streams every sample (raw filtered, raw
-//            baseline, raw delta, median-of-3 delta, envRef, effDelta, fast
-//            EMA, intensity) as a timestamped CSV for <sec> seconds. Start
-//            it, then either hold a slow steady approach or do a quick tap —
-//            both use this same capture, the difference is what you did.
+//   t<sec>   RAW TIME-SERIES: streams every sample (raw filtered, chip
+//            baseline + delta for reference, software baseline, effDelta,
+//            fast/slow EMA, intensity, touch) as a timestamped CSV for <sec>
+//            seconds. Start it, then either hold a slow steady approach or do
+//            a quick tap — same capture, the difference is what you did.
 //   x<sec>   CROSSTALK: streams ALL pads' raw delta in one row per sample for
 //            <sec> seconds while you press one or more pads OTHER than the
 //            selected one — quantifies how much delta leaks into idle pads.
