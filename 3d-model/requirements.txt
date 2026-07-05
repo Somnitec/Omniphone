@@ -1,0 +1,5 @@
+# Python deps for the 3d-model CAD scripts (thistle.py).
+# Recreate the env with ./setup.sh  (or: python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
+#
+# build123d pulls the OpenCASCADE bindings (OCP) — a few hundred MB, downloaded once.
+build123d==0.11.1

@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cymatics dome — live preview</title>
+<style>
+  :root { --bg:#0f141a; --panel:#171e26; --ink:#e6eef5; --muted:#93a3b4; --accent:#59c7c0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #app { display:flex; height:100%; }
+  #view { flex:1; position:relative; }
+  #panel { width:340px; background:var(--panel); padding:14px 16px; overflow-y:auto;
+    border-left:1px solid #26303b; }
+  h1 { font-size:15px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:11px; margin:0 0 12px; }
+  .grp { margin:14px 0 4px; color:var(--accent); font-size:11px; text-transform:uppercase;
+    letter-spacing:.06em; border-bottom:1px solid #26303b; padding-bottom:3px; }
+  .row { display:grid; grid-template-columns:1fr 1.3fr 62px; align-items:center; gap:8px; margin:7px 0; }
+  .row label { color:var(--muted); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  input[type=number] { width:100%; background:#0b1015; color:var(--ink); border:1px solid #26303b;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif;
+    font-variant-numeric:tabular-nums; text-align:right; }
+  input[type=number]:focus { outline:none; border-color:var(--accent); }
+  select { width:100%; background:#0b1015; color:var(--ink); border:1px solid #26303b;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif; }
+  select:focus { outline:none; border-color:var(--accent); }
+  input:disabled { opacity:.35; }
+  #dims { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:8px 10px;
+    font-size:12px; margin:2px 0 4px; }
+  #dims b { color:var(--accent); font-variant-numeric:tabular-nums; }
+  #dims .tgt { color:var(--muted); font-size:11px; }
+  pre { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:10px;
+    font-size:11px; color:#bfe6e2; overflow-x:auto; margin:6px 0; }
+  button { background:var(--accent); color:#08201e; border:0; border-radius:6px;
+    padding:7px 10px; font-weight:600; cursor:pointer; width:100%; }
+  button:hover { filter:brightness(1.08); }
+  #hint { position:absolute; left:12px; bottom:10px; color:var(--muted); font-size:11px; }
+  #tris { position:absolute; right:12px; top:10px; color:var(--muted); font-size:11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="tris"></div>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+  </div>
+  <div id="panel">
+    <h1>Cymatics dome</h1>
+    <p class="sub">Live preview of a drum-membrane standing wave <b>J<sub>m</sub>(k·r/R)·cos(mθ)</b>
+      displaced onto a dome. Same math as <b>cymatics.py</b> — dial it here, hit
+      <b>Copy params</b>, paste, then <code>python3 cymatics.py</code> for the STL.</p>
+    <div class="grp">Envelope</div>
+    <div id="dims"></div>
+    <div id="controls"></div>
+    <div class="grp">cymatics.py params</div>
+    <pre id="params"></pre>
+    <button id="copy">Copy params</button>
+  </div>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script>
+// ---- parameter definitions: [key, label, min, max, step, default] ----
+const DEFS = [
+  ["__g_dome", "Dome"],
+  ["DOME_RADIUS",  "Radius R (mm)",        40, 160, 0.5, 90],
+  ["DOME_HEIGHT",  "Apex height H (mm)",    0, 140, 0.5, 55],
+  ["DOME_PROFILE", "Profile", "select", ["ellipse", "parabola", "cosine", "flat"],
+      ["Ellipsoid dome", "Parabolic", "Bell (cosine)", "Flat plate"], "ellipse"],
+  ["__g_mode", "Cymatic mode"],
+  ["MODE_M",       "Angular m (petals)",    0, 12, 1, 5],
+  ["MODE_N",       "Radial n (rings)",      1, 8,  1, 3],
+  ["AMPLITUDE",    "Ripple height (mm)",    0, 40, 0.2, 10],
+  ["ANGLE_OFFSET", "Rotate pattern (deg)",  0, 180, 1, 0],
+  ["RECTIFY",  "Field", "select", ["signed", "absolute"],
+      ["Peaks + valleys", "All-positive ridges"], "signed"],
+  ["DISPLACE", "Direction", "select", ["vertical", "normal"],
+      ["Straight up (+Z)", "Along dome normal"], "vertical"],
+  ["__g_mode2", "Second mode (blend)"],
+  ["MODE2_M",   "Angular m2",     0, 12, 1, 0],
+  ["MODE2_N",   "Radial n2",      1, 8,  1, 1],
+  ["MODE2_MIX", "Mix (0 = off)",  0, 1, 0.01, 0],
+  ["__g_distort", "Distort (break symmetry)"],
+  ["SWIRL", "Swirl / twist (deg)", -360, 360, 1, 0],
+  ["WARP",  "Organic warp (0=off)", 0, 1, 0.01, 0],
+  ["__g_screen", "Screen"],
+  ["SCREEN_MODE", "Mount", "select", ["none", "center", "peak"],
+      ["None", "Recess in the top", "Pad over a peak"], "none"],
+  ["SCREEN_DIA",    "Screen dia (mm)",   5, 90, 0.5, 32],
+  ["SCREEN_MARGIN", "Bezel margin (mm)", 0, 20, 0.5, 4],
+  ["SCREEN_DEPTH",  "Recess depth (mm)", 0, 25, 0.5, 6],
+  ["SCREEN_PEAK_IDX", "Which peak (idx)", 0, 60, 1, 0],
+  ["SCREEN_PEAK_H", "Pad height (mm)",    2, 40, 0.5, 10],
+  ["__g_base", "Base & mesh"],
+  ["BASE_HEIGHT", "Foot height (mm)", 0, 20, 0.5, 4],
+  ["RES_RADIAL",  "Mesh rings",      24, 220, 1, 130],
+  ["RES_ANGULAR", "Mesh segments",   24, 400, 1, 240],
+];
+const P = {}, STEPS = {};
+DEFS.forEach(d => {
+  if (d[0].startsWith("__")) return;
+  if (d[2] === "select") { P[d[0]] = d[d.length - 1]; return; }
+  P[d[0]] = d[5]; STEPS[d[0]] = d[4];
+});
+
+// ---- build sliders + editable number fields (dropdowns for the "select" rows) ----
+const controls = document.getElementById("controls");
+DEFS.forEach(d => {
+  if (d[0].startsWith("__g")) {
+    const h = document.createElement("div"); h.className = "grp"; h.textContent = d[1];
+    controls.appendChild(h); return;
+  }
+  if (d[2] === "select") {
+    const [key, label, , vals, labels, def] = d;
+    const row = document.createElement("div"); row.className = "row";
+    row.style.gridTemplateColumns = "1fr 2fr";
+    const lab = document.createElement("label"); lab.textContent = label;
+    const sel = document.createElement("select");
+    vals.forEach((v, i) => {
+      const op = document.createElement("option"); op.value = v; op.textContent = labels[i]; sel.appendChild(op);
+    });
+    sel.value = def;
+    sel.addEventListener("change", () => { P[key] = sel.value; rebuild(); });
+    row.append(lab, sel); controls.appendChild(row); return;
+  }
+  const [key, label, min, max, step, def] = d;
+  const row = document.createElement("div"); row.className = "row";
+  const lab = document.createElement("label"); lab.textContent = label;
+  const rng = document.createElement("input");
+  rng.type = "range"; rng.min = min; rng.max = max; rng.step = step; rng.value = def;
+  const num = document.createElement("input");
+  num.type = "number"; num.step = step; num.value = def;
+  rng.addEventListener("input", () => { P[key] = parseFloat(rng.value); num.value = fmt(key, P[key]); rebuild(); });
+  num.addEventListener("input", () => {
+    const v = parseFloat(num.value); if (Number.isNaN(v)) return;
+    P[key] = v; rng.value = v; rebuild();
+  });
+  row.append(lab, rng, num); controls.appendChild(row);
+});
+function fmt(key, v) { return STEPS[key] < 1 ? +v.toFixed(2) : Math.round(v); }
+
+// ================= shared cymatics math (identical to cymatics.py) =================
+function besselJ(m, x) {                       // (1/pi) * integral_0^pi cos(m t - x sin t) dt
+  const K = 48, h = Math.PI / K; let s = 0;
+  for (let i = 0; i <= K; i++) {
+    const t = i * h, w = (i === 0 || i === K) ? 1 : (i % 2 ? 4 : 2);
+    s += w * Math.cos(m * t - x * Math.sin(t));
+  }
+  return (s * h / 3) / Math.PI;
+}
+function besselZero(m, n) {                     // n-th positive root of J_m
+  let prevX = 1e-4, prevF = besselJ(m, prevX), found = 0, x = prevX;
+  while (x < 200) {
+    x += 0.05; const f = besselJ(m, x);
+    if (prevF === 0 || (f < 0) !== (prevF < 0)) {
+      let lo = prevX, hi = x, flo = prevF;
+      for (let k = 0; k < 60; k++) {
+        const mid = 0.5 * (lo + hi), fm = besselJ(m, mid);
+        if ((fm < 0) === (flo < 0)) { lo = mid; flo = fm; } else hi = mid;
+      }
+      if (++found === n) return 0.5 * (lo + hi);
+    }
+    prevX = x; prevF = f;
+  }
+  return x;
+}
+function modeScale(m, z) {                       // 1 / peak|J_m(z u)|, u in [0,1]
+  let peak = 1e-9;
+  for (let i = 0; i <= 200; i++) peak = Math.max(peak, Math.abs(besselJ(m, z * (i / 200))));
+  return 1 / peak;
+}
+function domeProfile(u) {
+  if (P.DOME_PROFILE === "ellipse")  return P.DOME_HEIGHT * Math.sqrt(Math.max(0, 1 - u * u));
+  if (P.DOME_PROFILE === "parabola") return P.DOME_HEIGHT * (1 - u * u);
+  if (P.DOME_PROFILE === "cosine")   return P.DOME_HEIGHT * Math.cos(0.5 * Math.PI * u);
+  return 0;                                       // flat plate
+}
+
+// ================= three.js scene =================
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f141a);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 3000);
+camera.position.set(150, 130, 200);
+const controlsO = new THREE.OrbitControls(camera, renderer.domElement);
+controlsO.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x20303a, 0.85));
+const keyL = new THREE.DirectionalLight(0xffffff, 0.85); keyL.position.set(0.8, 1.4, 0.7); scene.add(keyL);
+const fill = new THREE.DirectionalLight(0x8fdfff, 0.3); fill.position.set(-1, 0.4, -0.6); scene.add(fill);
+
+const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.5, metalness: 0.08 });
+let mesh = null;
+
+// nodal-line colouring: dark at nodes (field ~ 0), bright at antinodes
+const C_NODE = new THREE.Color(0x123038), C_ANTI = new THREE.Color(0x7fe6dd);
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+
+// ---- build the displaced-dome solid, vertex/face layout identical to cymatics.py ----
+function buildGeometry() {
+  const R = P.DOME_RADIUS, na = Math.round(P.RES_ANGULAR), nr = Math.round(P.RES_RADIAL);
+  const off = P.ANGLE_OFFSET * Math.PI / 180, swirl = P.SWIRL * Math.PI / 180, warp = P.WARP;
+  const m1 = Math.round(P.MODE_M), m2 = Math.round(P.MODE2_M);
+  const z1 = besselZero(m1, Math.round(P.MODE_N)), z2 = besselZero(m2, Math.round(P.MODE2_N));
+  const s1 = modeScale(m1, z1), s2 = modeScale(m2, z2);
+  const mix = Math.max(0, Math.min(1, P.MODE2_MIX));
+  const rect = P.RECTIFY === "absolute", normalMode = P.DISPLACE === "normal";
+  const delta = 1e-3 * R;
+  const pos = [], col = [], idx = [];
+  let maxR = 0, maxZ = 0;
+  const tmp = new THREE.Color();
+
+  // distort the sampling coords so the pattern loses its symmetry (swirl twist + warp wobble)
+  function warpCoords(u, theta) {
+    const ph = theta + swirl * u + warp * (0.6 * Math.sin(2 * theta + 1.3)
+      + 0.4 * Math.sin(3 * theta - 0.7) + 0.25 * Math.sin(5 * theta + 2.1));
+    const ue = u * (1 + warp * (0.22 * Math.sin(3 * theta + 0.9) + 0.14 * Math.sin(2 * theta - 1.7)));
+    return [ue, ph];
+  }
+  function fieldRaw(u, theta) {                                 // signed combined field
+    const [ue, ph] = warpCoords(u, theta);
+    return (1 - mix) * besselJ(m1, z1 * ue) * s1 * Math.cos(m1 * ph + off)
+      + mix * besselJ(m2, z2 * ue) * s2 * Math.cos(m2 * ph + off);
+  }
+  const ffield = (u, theta) => { const r = fieldRaw(u, theta); return rect ? Math.abs(r) : r; };
+
+  function surfXYZ(r, theta) {                                  // -> [x, y, z, fSigned]
+    const u = r / R, f = fieldRaw(u, theta), disp = P.AMPLITUDE * (rect ? Math.abs(f) : f), h0 = domeProfile(u);
+    let rr, z;
+    if (normalMode) {
+      const dh = (domeProfile((r + delta) / R) - domeProfile((r - delta) / R)) / (2 * delta), inv = 1 / Math.hypot(1, dh);
+      rr = r + disp * (-dh) * inv; z = P.BASE_HEIGHT + h0 + disp * inv;
+    } else { rr = r; z = P.BASE_HEIGHT + h0 + disp; }
+    if (z < 0.4) z = 0.4;
+    return [rr * Math.cos(theta), rr * Math.sin(theta), z, f];
+  }
+  function pushV(x, y, z, f) {                                  // dome frame -> three.js Y-up buffer
+    const i = pos.length / 3; pos.push(x, z, y);
+    tmp.copy(C_NODE).lerp(C_ANTI, Math.min(1, Math.abs(f))); col.push(tmp.r, tmp.g, tmp.b);
+    const rr = Math.hypot(x, y); if (rr > maxR) maxR = rr; if (z > maxZ) maxZ = z;
+    return i;
+  }
+  const thetas = []; for (let i = 0; i < na; i++) thetas.push(2 * Math.PI * i / na);
+  const dispRing = r => thetas.map(t => surfXYZ(r, t));
+  const flatRing = (r, z) => thetas.map(t => [r * Math.cos(t), r * Math.sin(t), z, 0]);
+
+  // ----- screen geometry (centre recess carved into the polar top) -----
+  const screen = (P.SCREEN_MODE !== "none" && P.SCREEN_DIA > 0) ? P.SCREEN_MODE : "none";
+  const rBez = Math.min(P.SCREEN_DIA / 2 + P.SCREEN_MARGIN, R * 0.92);
+  const rScr = Math.min(P.SCREEN_DIA / 2, rBez - 0.5);
+  const shelfZ = P.BASE_HEIGHT + domeProfile(rBez / R), floorZ = Math.max(P.BASE_HEIGHT + 0.5, shelfZ - P.SCREEN_DEPTH);
+
+  let stations, centerPt;
+  if (screen === "center") {
+    centerPt = [0, 0, floorZ, 0];
+    stations = [flatRing(rScr, floorZ), flatRing(rScr, shelfZ), flatRing(rBez, shelfZ), dispRing(rBez)];
+    for (let j = 1; j <= nr; j++) { const r = R * j / nr; if (r > rBez + 1e-6) stations.push(dispRing(r)); }
+    const last = stations[stations.length - 1][0];
+    if (Math.hypot(last[0], last[1]) < R - 1e-6) stations.push(dispRing(R));
+  } else {
+    centerPt = surfXYZ(0, 0);
+    stations = []; for (let j = 1; j <= nr; j++) stations.push(dispRing(R * j / nr));
+  }
+
+  const centerIdx = pushV(centerPt[0], centerPt[1], centerPt[2], centerPt[3]);
+  const ringBases = stations.map(st => { const base = pos.length / 3; for (const v of st) pushV(v[0], v[1], v[2], v[3]); return base; });
+
+  const b0 = ringBases[0];
+  for (let i = 0; i < na; i++) idx.push(centerIdx, b0 + i, b0 + (i + 1) % na);   // cap fan
+  for (let k = 0; k < ringBases.length - 1; k++) {                                // ring quad strips
+    const a = ringBases[k], b = ringBases[k + 1];
+    for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; idx.push(a + i, a + i1, b + i1, a + i, b + i1, b + i); }
+  }
+  const rim = ringBases[ringBases.length - 1], botBase = pos.length / 3;
+  for (let i = 0; i < na; i++) { const k = rim + i; pos.push(pos[k * 3], 0, pos[k * 3 + 2]); col.push(C_NODE.r, C_NODE.g, C_NODE.b); }
+  const bcIdx = pos.length / 3; pos.push(0, 0, 0); col.push(C_NODE.r, C_NODE.g, C_NODE.b);
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; idx.push(rim + i, botBase + i, botBase + i1, rim + i, botBase + i1, rim + i1); }
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; idx.push(bcIdx, botBase + i1, botBase + i); }
+
+  // ----- peaks: strict local maxima of the ripple over the (ring, angle) grid -----
+  const grid = []; for (let j = 0; j <= nr; j++) { const row = []; for (let i = 0; i < na; i++) row.push(ffield(j / nr, thetas[i])); grid.push(row); }
+  const apexV = ffield(0, 0);
+  let peaks = 0; const peaksRT = [];
+  let apexMax = true; for (let i = 0; i < na; i++) if (apexV <= grid[1][i]) { apexMax = false; break; }
+  if (apexMax) { peaks++; peaksRT.push([0, 0]); }
+  for (let j = 1; j <= nr; j++)
+    for (let i = 0; i < na; i++) {
+      const d = grid[j][i];
+      let ok = d > grid[j][(i + 1) % na] && d > grid[j][(i + na - 1) % na] && d > grid[j - 1][i];
+      if (ok && j < nr) ok = d > grid[j + 1][i];
+      if (ok) { peaks++; peaksRT.push([R * j / nr, thetas[i]]); }
+    }
+
+  // ----- screen pad standing on a chosen peak (separate overlapping solid) -----
+  function revolveInto(profile, origin, zdir, seg) {
+    const norm = v => { const L = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / L, v[1] / L, v[2] / L]; };
+    const cross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+    const Z = norm(zdir), ax = Math.abs(Z[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0], U = norm(cross(ax, Z)), V = cross(Z, U);
+    const pushW = (rad, h, phi) => {
+      const cr = rad * Math.cos(phi), sr = rad * Math.sin(phi);
+      const x = origin[0] + cr * U[0] + sr * V[0] + h * Z[0];
+      const y = origin[1] + cr * U[1] + sr * V[1] + h * Z[1];
+      const z = origin[2] + cr * U[2] + sr * V[2] + h * Z[2];
+      const i = pos.length / 3; pos.push(x, z, y); col.push(C_NODE.r, C_NODE.g, C_NODE.b);
+      const rr = Math.hypot(x, y); if (rr > maxR) maxR = rr; if (z > maxZ) maxZ = z; return i;
+    };
+    const rows = [];
+    for (const [rad, h] of profile) {
+      if (rad < 1e-6) rows.push(["apex", pushW(0, h, 0)]);
+      else { const base = pos.length / 3; for (let k = 0; k < seg; k++) pushW(rad, h, 2 * Math.PI * k / seg); rows.push(["ring", base]); }
+    }
+    for (let k = 0; k < rows.length - 1; k++) {
+      const [ka, ia] = rows[k], [kb, ib] = rows[k + 1];
+      if (ka === "apex" && kb === "ring") for (let i = 0; i < seg; i++) idx.push(ia, ib + i, ib + (i + 1) % seg);
+      else if (ka === "ring" && kb === "apex") for (let i = 0; i < seg; i++) idx.push(ia + i, ib, ia + (i + 1) % seg);
+      else if (ka === "ring" && kb === "ring") for (let i = 0; i < seg; i++) { const i1 = (i + 1) % seg; idx.push(ia + i, ia + i1, ib + i1, ia + i, ib + i1, ib + i); }
+    }
+  }
+  if (screen === "peak" && peaksRT.length) {
+    const order = peaksRT.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+    const [rp, tp] = order[((Math.round(P.SCREEN_PEAK_IDX) % order.length) + order.length) % order.length];
+    const sp = surfXYZ(rp, tp);
+    const dh = (domeProfile((rp + delta) / R) - domeProfile((rp - delta) / R)) / (2 * delta), inv = 1 / Math.hypot(1, dh);
+    const H = Math.max(2, P.SCREEN_PEAK_H), sink = 4, depth = Math.max(0, Math.min(P.SCREEN_DEPTH, H + sink - 1));
+    revolveInto([[0, -sink], [rBez, -sink], [rBez, H], [rScr, H], [rScr, H - depth], [0, H - depth]],
+      [sp[0], sp[1], sp[2]], [-dh * inv * Math.cos(tp), -dh * inv * Math.sin(tp), inv], Math.max(24, Math.floor(na / 4)));
+  }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(pos), 3));
+  g.setAttribute("color", new THREE.BufferAttribute(new Float32Array(col), 3));
+  g.setIndex(new THREE.BufferAttribute(new Uint32Array(idx), 1));
+  g.computeVertexNormals();
+  g.userData = { maxR, maxZ, peaks, tris: idx.length / 3 };
+  return g;
+}
+
+function rebuild() {
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  const g = buildGeometry();
+  mesh = new THREE.Mesh(g, mat); scene.add(mesh);
+  const { maxR, maxZ, tris, peaks } = g.userData;
+  document.getElementById("tris").textContent =
+    `J${Math.round(P.MODE_M)},${Math.round(P.MODE_N)}` +
+    (P.MODE2_MIX > 0 ? ` + J${Math.round(P.MODE2_M)},${Math.round(P.MODE2_N)}` : "") +
+    ` · ${peaks} peaks · ${tris.toLocaleString()} tris`;
+  document.getElementById("dims").innerHTML =
+    `≈ <b>${(2 * maxR).toFixed(0)} × ${(2 * maxR).toFixed(0)} × ${maxZ.toFixed(0)}</b> mm` +
+    ` · <b>${peaks}</b> peaks` +
+    `<div class="tgt">${Math.round(P.MODE_M)} petals · ${Math.round(P.MODE_N)} rings · ` +
+    `${P.RECTIFY === "absolute" ? "all antinodes raised" : "raised bumps only"} · ` +
+    `watertight solid (hollow it in the slicer)</div>`;
+  updateParams();
+}
+
+function updateParams() {
+  const f = (k, d = 2) => Number.isInteger(P[k]) ? P[k] : P[k].toFixed(d);
+  document.getElementById("params").textContent =
+`DOME_RADIUS   = ${f("DOME_RADIUS",1)}
+DOME_HEIGHT   = ${f("DOME_HEIGHT",1)}
+DOME_PROFILE  = "${P.DOME_PROFILE}"
+MODE_M        = ${Math.round(P.MODE_M)}
+MODE_N        = ${Math.round(P.MODE_N)}
+AMPLITUDE     = ${f("AMPLITUDE",1)}
+MODE2_M       = ${Math.round(P.MODE2_M)}
+MODE2_N       = ${Math.round(P.MODE2_N)}
+MODE2_MIX     = ${f("MODE2_MIX")}
+RECTIFY       = "${P.RECTIFY}"
+DISPLACE      = "${P.DISPLACE}"
+ANGLE_OFFSET  = ${Math.round(P.ANGLE_OFFSET)}
+SWIRL         = ${Math.round(P.SWIRL)}
+WARP          = ${f("WARP")}
+SCREEN_MODE   = "${P.SCREEN_MODE}"
+SCREEN_DIA    = ${f("SCREEN_DIA",1)}
+SCREEN_MARGIN = ${f("SCREEN_MARGIN",1)}
+SCREEN_DEPTH  = ${f("SCREEN_DEPTH",1)}
+SCREEN_PEAK_IDX = ${Math.round(P.SCREEN_PEAK_IDX)}
+SCREEN_PEAK_H = ${f("SCREEN_PEAK_H",1)}
+BASE_HEIGHT   = ${f("BASE_HEIGHT",1)}
+RES_RADIAL    = ${Math.round(P.RES_RADIAL)}
+RES_ANGULAR   = ${Math.round(P.RES_ANGULAR)}`;
+}
+
+document.getElementById("copy").addEventListener("click", () => {
+  navigator.clipboard.writeText(document.getElementById("params").textContent);
+});
+
+resize(); rebuild();
+(function loop() { requestAnimationFrame(loop); controlsO.update(); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>

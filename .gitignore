@@ -7,3 +7,12 @@
 # Local secrets (WiFi creds, host IPs) — never commit. Use secrets.example.h.
 secrets.h
 **/secrets.h
+
+# Python venv for the CAD scripts — large (~800 MB), machine-specific.
+# Recreate it with 3d-model/setup.sh (deps are pinned in requirements.txt).
+3d-model/.venv/
+**/__pycache__/
+
+# Generated CAD artifacts — regenerable from thistle.py (thistle.stl is ~27 MB).
+3d-model/thistle.stl
+3d-model/thistle.step

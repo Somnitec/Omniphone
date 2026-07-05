@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandelbulb — live preview</title>
+<style>
+  :root { --bg:#14121a; --panel:#1b1622; --ink:#ece6f5; --muted:#a394b4; --accent:#b98be0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #app { display:flex; height:100%; }
+  #view { flex:1; position:relative; }
+  #panel { width:340px; background:var(--panel); padding:14px 16px; overflow-y:auto;
+    border-left:1px solid #2c2438; }
+  h1 { font-size:15px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:11px; margin:0 0 12px; }
+  .grp { margin:14px 0 4px; color:var(--accent); font-size:11px; text-transform:uppercase;
+    letter-spacing:.06em; border-bottom:1px solid #2c2438; padding-bottom:3px; }
+  .row { display:grid; grid-template-columns:1fr 1.3fr 62px; align-items:center; gap:8px; margin:7px 0; }
+  .row label { color:var(--muted); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  input[type=number] { width:100%; background:#0d0a12; color:var(--ink); border:1px solid #2c2438;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif;
+    font-variant-numeric:tabular-nums; text-align:right; }
+  input[type=number]:focus { outline:none; border-color:var(--accent); }
+  select { width:100%; background:#0d0a12; color:var(--ink); border:1px solid #2c2438;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif; }
+  select:focus { outline:none; border-color:var(--accent); }
+  input:disabled { opacity:.35; }
+  #dims { background:#0d0a12; border:1px solid #2c2438; border-radius:6px; padding:8px 10px;
+    font-size:12px; margin:2px 0 4px; }
+  #dims b { color:var(--accent); font-variant-numeric:tabular-nums; }
+  #dims .tgt { color:var(--muted); font-size:11px; margin-top:3px; }
+  pre { background:#0d0a12; border:1px solid #2c2438; border-radius:6px; padding:10px;
+    font-size:11px; color:#e0cdf2; overflow-x:auto; margin:6px 0; }
+  button { background:var(--accent); color:#1a0e28; border:0; border-radius:6px;
+    padding:7px 10px; font-weight:600; cursor:pointer; width:100%; }
+  button:hover { filter:brightness(1.08); }
+  #hint { position:absolute; left:12px; bottom:10px; color:var(--muted); font-size:11px; }
+  #tris { position:absolute; right:12px; top:10px; color:var(--muted); font-size:11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="tris"></div>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+  </div>
+  <div id="panel">
+    <h1>Mandelbulb</h1>
+    <p class="sub">Live raymarch of the classic power-8 Mandelbulb distance estimator — same
+      iteration formula as <b>mandelbulb.py</b>'s <code>escape_field()</code>. Dial it in, then
+      <b>Copy params</b> into mandelbulb.py and run <code>python3 mandelbulb.py</code> for the STL.</p>
+    <div class="grp">Envelope</div>
+    <div id="dims"></div>
+    <div id="controls"></div>
+    <div class="grp">mandelbulb.py params</div>
+    <pre id="params"></pre>
+    <button id="copy">Copy params</button>
+  </div>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script>
+// ================= parameter definitions =================
+// types: "islider" int slider, "fslider" float slider, "inum" int number-only,
+//        "fnum" float number-only, "select"
+const DEFS = [
+  ["__g_fractal", "Fractal"],
+  ["POWER",      "Power n",       "islider", 2, 12, 1, 8],
+  ["ITERATIONS", "Iterations",    "islider", 1, 12, 1, 6],
+  ["BAILOUT",    "Bailout |z|",   "fslider", 1.2, 4, 0.05, 2.0],
+  ["LEVEL",      "Iso level",     "fslider", 0.5, 6, 0.05, 3.6],   // max re-clamped to ITERATIONS
+  ["__g_mesh", "Mesh / output"],
+  ["GRID",         "Grid (samples/axis)", "inum", 32, 256, 1, 96],
+  ["BOX",          "Sample box (half)",   "fnum", 0.5, 3, 0.05, 1.25],
+  ["SIZE_MM",      "Size (mm span)",      "inum", 20, 400, 1, 120],
+  ["BASE_FLATTEN", "Base flatten",        "fslider", 0, 0.4, 0.01, 0.0],
+  ["SMOOTH_ITERS", "Smooth passes",       "islider", 0, 3, 1, 1],
+  ["__g_screen", "Screen"],
+  ["SCREEN_MODE",  "Mount", "select", ["none", "bulb"], ["None", "Recess in top lobe"], "none"],
+  ["SCREEN_DIA",   "Screen dia (mm)",   "fslider", 0, 70, 0.5, 0],
+  ["SCREEN_DEPTH", "Recess depth (mm)", "fslider", 0, 20, 0.5, 8],
+];
+
+const P = {};
+DEFS.forEach(d => {
+  if (d[0].startsWith("__")) return;
+  if (d[2] === "select") { P[d[0]] = d[d.length - 1]; return; }
+  P[d[0]] = d[6];
+});
+
+// ================= build controls =================
+const controls = document.getElementById("controls");
+const REG = {};   // key -> {range, num, sel}
+DEFS.forEach(d => {
+  if (d[0].startsWith("__g")) {
+    const h = document.createElement("div"); h.className = "grp"; h.textContent = d[1];
+    controls.appendChild(h); return;
+  }
+  const key = d[0], type = d[2];
+  if (type === "select") {
+    const [, label, , vals, labels, def] = d;
+    const row = document.createElement("div"); row.className = "row";
+    row.style.gridTemplateColumns = "1fr 2fr";
+    const lab = document.createElement("label"); lab.textContent = label;
+    const sel = document.createElement("select");
+    vals.forEach((v, i) => {
+      const op = document.createElement("option"); op.value = v; op.textContent = labels[i]; sel.appendChild(op);
+    });
+    sel.value = def;
+    sel.addEventListener("change", () => { P[key] = sel.value; onChange(); });
+    row.append(lab, sel); controls.appendChild(row);
+    REG[key] = { sel }; return;
+  }
+  const [, label, , min, max, step, def] = d;
+  const isInt = (type === "islider" || type === "inum");
+  const hasSlider = (type === "islider" || type === "fslider");
+  const row = document.createElement("div"); row.className = "row";
+  if (!hasSlider) row.style.gridTemplateColumns = "1fr 1fr 62px";
+  const lab = document.createElement("label"); lab.textContent = label;
+  let rng = null;
+  if (hasSlider) {
+    rng = document.createElement("input");
+    rng.type = "range"; rng.min = min; rng.max = max; rng.step = step; rng.value = def;
+  } else {
+    const spacer = document.createElement("span");   // keep the 3-col grid aligned
+    row.append(lab, spacer);
+  }
+  const num = document.createElement("input");
+  num.type = "number"; num.min = min; num.max = max; num.step = step; num.value = def;
+  const fmt = v => isInt ? Math.round(v) : +(+v).toFixed(2);
+  if (rng) rng.addEventListener("input", () => { P[key] = fmt(rng.value); num.value = P[key]; onChange(); });
+  num.addEventListener("input", () => {
+    let v = parseFloat(num.value); if (Number.isNaN(v)) return;
+    v = Math.min(max, Math.max(min, v)); P[key] = fmt(v);
+    if (rng) rng.value = P[key]; onChange();
+  });
+  if (hasSlider) row.append(lab, rng, num); else row.append(num);
+  controls.appendChild(row);
+  REG[key] = { range: rng, num };
+});
+
+// keep LEVEL's max clamped to ITERATIONS (matches the .py "range 0.5–ITERATIONS")
+function clampLevel() {
+  const it = P.ITERATIONS, lv = REG.LEVEL;
+  if (lv.range) lv.range.max = it;
+  lv.num.max = it;
+  if (P.LEVEL > it) { P.LEVEL = it; if (lv.range) lv.range.value = it; lv.num.value = it; }
+}
+// grey out screen dia/depth when mount = none
+function updateScreenEnabled() {
+  const on = (P.SCREEN_MODE === "bulb");
+  ["SCREEN_DIA", "SCREEN_DEPTH"].forEach(k => {
+    const r = REG[k]; if (r.range) r.range.disabled = !on; r.num.disabled = !on;
+  });
+}
+
+// ================= three.js setup =================
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.autoClear = false;
+view.appendChild(renderer.domElement);
+
+// --- perspective orbit camera (shared by raymarch rays + the screen marker) ---
+const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
+camera.up.set(0, 0, 1);                 // fractal Z is "up" (matches BASE_FLATTEN plane)
+camera.position.set(2.7, 2.3, 2.0);
+const controlsO = new THREE.OrbitControls(camera, renderer.domElement);
+controlsO.enableDamping = true;
+controlsO.target.set(0, 0, 0);
+controlsO.minDistance = 1.4;
+controlsO.maxDistance = 20;
+
+// --- background scene: full-screen raymarch quad, own passthrough camera ---
+const bgScene = new THREE.Scene();
+const bgCam = new THREE.Camera();
+
+const uniforms = {
+  uCamPos:     { value: new THREE.Vector3() },
+  uCamRight:   { value: new THREE.Vector3() },
+  uCamUp:      { value: new THREE.Vector3() },
+  uCamFwd:     { value: new THREE.Vector3() },
+  uTanFov:     { value: 0.4 },
+  uAspect:     { value: 1.0 },
+  uPower:      { value: 8.0 },
+  uIterations: { value: 6.0 },
+  uBailout:    { value: 2.0 },
+  uInflate:    { value: 0.07 },
+  uZcut:       { value: -1.25 },
+  uBound:      { value: 1.5 },
+};
+
+const VERT = `
+  varying vec2 vNdc;
+  void main() { vNdc = position.xy; gl_Position = vec4(position.xy, 0.0, 1.0); }
+`;
+
+const FRAG = `
+  precision highp float;
+  varying vec2 vNdc;
+  uniform vec3 uCamPos, uCamRight, uCamUp, uCamFwd;
+  uniform float uTanFov, uAspect;
+  uniform float uPower, uIterations, uBailout, uInflate, uZcut, uBound;
+
+  const int   MAX_ITER  = 12;
+  const int   MAX_STEPS = 140;
+  const float SURF_EPS  = 0.0007;
+
+  // power-n Mandelbulb distance estimator — mirrors escape_field()'s triplex iteration:
+  //   theta = acos(z.z/r), phi = atan2(z.y, z.x),
+  //   z <- r^n * (sin(n*theta)cos(n*phi), sin(n*theta)sin(n*phi), cos(n*theta)) + c
+  float bulbDE(vec3 p) {
+    vec3 z = p;
+    float dr = 1.0;
+    float r  = length(z);
+    for (int i = 0; i < MAX_ITER; i++) {
+      if (float(i) >= uIterations) break;
+      r = length(z);
+      if (r > uBailout) break;
+      float rr = max(r, 1e-9);
+      float theta = acos(clamp(z.z / rr, -1.0, 1.0));
+      float phi   = atan(z.y, z.x);
+      float rn    = pow(rr, uPower);
+      dr = pow(rr, uPower - 1.0) * uPower * dr + 1.0;
+      float st = sin(uPower * theta);
+      z = rn * vec3(st * cos(uPower * phi), st * sin(uPower * phi), cos(uPower * theta)) + p;
+    }
+    return 0.5 * log(max(r, 1e-9)) * r / max(dr, 1e-9);
+  }
+
+  // scene = inflated bulb  ∩  half-space { z >= uZcut }   (BASE_FLATTEN cut plane)
+  float mapScene(vec3 p) {
+    float db = bulbDE(p) - uInflate;
+    float dp = uZcut - p.z;
+    return max(db, dp);
+  }
+
+  vec3 calcNormal(vec3 p) {
+    vec2 e = vec2(0.0008, 0.0);
+    return normalize(vec3(
+      mapScene(p + e.xyy) - mapScene(p - e.xyy),
+      mapScene(p + e.yxy) - mapScene(p - e.yxy),
+      mapScene(p + e.yyx) - mapScene(p - e.yyx)));
+  }
+
+  float calcAO(vec3 p, vec3 n) {
+    float occ = 0.0, sca = 1.0;
+    for (int i = 0; i < 5; i++) {
+      float hr = 0.01 + 0.11 * float(i) / 4.0;
+      float dd = mapScene(p + n * hr);
+      occ += (hr - dd) * sca;
+      sca *= 0.7;
+    }
+    return clamp(1.0 - 2.0 * occ, 0.0, 1.0);
+  }
+
+  void main() {
+    // ray from the orbit camera
+    vec3 ro = uCamPos;
+    vec3 rd = normalize(vNdc.x * uAspect * uTanFov * uCamRight
+                      + vNdc.y * uTanFov * uCamUp
+                      + uCamFwd);
+
+    // background gradient (dark purple, matches page bg)
+    vec3 bg = mix(vec3(0.055, 0.045, 0.075), vec3(0.10, 0.08, 0.14), 0.5 + 0.5 * vNdc.y);
+
+    // clip the ray to the bounding sphere of the fractal
+    float b = dot(ro, rd);
+    float c = dot(ro, ro) - uBound * uBound;
+    float h = b * b - c;
+    if (h < 0.0) { gl_FragColor = vec4(bg, 1.0); return; }
+    h = sqrt(h);
+    float t    = max(-b - h, 0.0);
+    float tmax = -b + h;
+
+    bool hit = false;
+    int steps = 0;
+    for (int i = 0; i < MAX_STEPS; i++) {
+      steps = i;
+      vec3 p = ro + rd * t;
+      float d = mapScene(p);
+      if (d < SURF_EPS) { hit = true; break; }
+      t += d;
+      if (t > tmax) break;
+    }
+
+    if (!hit) { gl_FragColor = vec4(bg, 1.0); return; }
+
+    vec3 p = ro + rd * t;
+    vec3 n = calcNormal(p);
+    float ao = calcAO(p, n);
+
+    vec3 keyDir  = normalize(vec3(0.4, 0.5, 0.75));
+    vec3 fillDir = normalize(vec3(-0.5, -0.35, 0.15));
+    float key  = max(dot(n, keyDir), 0.0);
+    float fill = max(dot(n, fillDir), 0.0) * 0.35;
+    float amb  = 0.28 + 0.22 * (0.5 + 0.5 * n.z);           // hemispheric ambient
+
+    // deep violet body, brighter toward the top / lit faces
+    vec3 base = mix(vec3(0.34, 0.20, 0.48), vec3(0.72, 0.56, 0.95),
+                    clamp(0.5 + 0.5 * n.z, 0.0, 1.0));
+    vec3 col = base * (amb + key + fill) * ao;
+
+    // teal fresnel rim for a bit of pop
+    float fres = pow(1.0 - max(dot(n, -rd), 0.0), 3.0);
+    col += vec3(0.20, 0.55, 0.52) * fres * 0.6 * ao;
+
+    col = pow(clamp(col, 0.0, 1.0), vec3(0.4545));           // gamma
+    gl_FragColor = vec4(col, 1.0);
+  }
+`;
+
+const quadMat = new THREE.ShaderMaterial({
+  uniforms, vertexShader: VERT, fragmentShader: FRAG,
+  depthTest: false, depthWrite: false,
+});
+bgScene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), quadMat));
+
+// --- foreground scene: translucent screen-recess placement guide ---
+const fgScene = new THREE.Scene();
+const discGeo = new THREE.CylinderGeometry(1, 1, 1, 48);
+const discMat = new THREE.MeshBasicMaterial({
+  color: 0x59c7c0, transparent: true, opacity: 0.30,
+  depthTest: false, depthWrite: false, side: THREE.DoubleSide,
+});
+const disc = new THREE.Mesh(discGeo, discMat);
+disc.rotation.x = Math.PI / 2;     // cylinder Y-axis -> world Z (fractal up)
+fgScene.add(disc);
+
+// ================= sync + render =================
+const SPAN_APPROX = 2.2;            // approx fractal-unit span used for mm<->unit guide
+
+function syncUniforms() {
+  uniforms.uPower.value      = P.POWER;
+  uniforms.uIterations.value = P.ITERATIONS;
+  uniforms.uBailout.value    = P.BAILOUT;
+  const inflate = Math.max(0, (P.ITERATIONS - P.LEVEL)) * 0.03;   // lower LEVEL -> puffier
+  uniforms.uInflate.value    = inflate;
+  uniforms.uZcut.value       = -P.BOX + P.BASE_FLATTEN * 2.0 * P.BOX;
+  uniforms.uBound.value      = Math.max(1.4, P.BOX + inflate + 0.2);
+
+  // screen marker
+  const on = (P.SCREEN_MODE === "bulb" && P.SCREEN_DIA > 0);
+  disc.visible = on;
+  if (on) {
+    const scaleMM = P.SIZE_MM / SPAN_APPROX;          // mm per fractal unit
+    const rUnit = (P.SCREEN_DIA * 0.5) / scaleMM;
+    const dUnit = Math.max(0.01, P.SCREEN_DEPTH / scaleMM);
+    disc.scale.set(rUnit, dUnit, rUnit);              // (radius, height->Z, radius)
+    disc.position.set(0, 0, 0.98 - dUnit * 0.5);      // seated into the top lobe
+  }
+}
+
+function onChange() {
+  clampLevel();
+  updateScreenEnabled();
+  syncUniforms();
+  updateReadout();
+  updateParams();
+}
+
+function updateReadout() {
+  const s = Math.round(P.SIZE_MM);
+  const g = Math.round(P.GRID);
+  document.getElementById("dims").innerHTML =
+    `≈ <b>${s} × ${s} × ${s}</b> mm envelope` +
+    `<div class="tgt">GRID ${g} → ${g}³ = ${(g * g * g).toLocaleString()} voxels · ` +
+    `higher GRID = finer + slower · LEVEL ${(+P.LEVEL).toFixed(2)} iso-surface</div>`;
+  document.getElementById("tris").textContent =
+    `power ${P.POWER} · ${P.ITERATIONS} iters · level ${(+P.LEVEL).toFixed(1)}` +
+    (P.SCREEN_MODE === "bulb" && P.SCREEN_DIA > 0 ? ` · screen ⌀${P.SCREEN_DIA}mm` : "");
+}
+
+// render the exact python assignment block (same order & names as mandelbulb.py)
+function pyf(v) {                       // float with a guaranteed decimal
+  let s = (Math.round(v * 1000) / 1000).toString();
+  if (!s.includes(".")) s += ".0";
+  return s;
+}
+function pynum(v) {                     // int if whole, else float
+  return Number.isInteger(v) ? String(v) : pyf(v);
+}
+function line(name, val) { return name.padEnd(12) + " = " + val; }
+
+function updateParams() {
+  const lines = [
+    line("POWER",        Math.round(P.POWER)),
+    line("ITERATIONS",   Math.round(P.ITERATIONS)),
+    line("BAILOUT",      pyf(P.BAILOUT)),
+    line("LEVEL",        pyf(P.LEVEL)),
+    line("GRID",         Math.round(P.GRID)),
+    line("BOX",          pyf(P.BOX)),
+    line("SIZE_MM",      Math.round(P.SIZE_MM)),
+    line("BASE_FLATTEN", pyf(P.BASE_FLATTEN)),
+    line("SMOOTH_ITERS", Math.round(P.SMOOTH_ITERS)),
+    line("SCREEN_MODE",  '"' + P.SCREEN_MODE + '"'),
+    line("SCREEN_DIA",   pynum(P.SCREEN_DIA)),
+    line("SCREEN_DEPTH", pynum(P.SCREEN_DEPTH)),
+  ];
+  document.getElementById("params").textContent = lines.join("\n");
+}
+
+document.getElementById("copy").addEventListener("click", () => {
+  navigator.clipboard.writeText(document.getElementById("params").textContent);
+});
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+
+function updateCameraUniforms() {
+  camera.updateMatrixWorld();
+  const e = camera.matrixWorld.elements;
+  uniforms.uCamPos.value.copy(camera.position);
+  uniforms.uCamRight.value.set(e[0], e[1], e[2]);
+  uniforms.uCamUp.value.set(e[4], e[5], e[6]);
+  uniforms.uCamFwd.value.set(-e[8], -e[9], -e[10]);
+  uniforms.uTanFov.value = Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5);
+  uniforms.uAspect.value = camera.aspect;
+}
+
+resize();
+onChange();
+(function loop() {
+  requestAnimationFrame(loop);
+  controlsO.update();
+  updateCameraUniforms();
+  renderer.clear();
+  renderer.render(bgScene, bgCam);     // raymarched fractal (background)
+  renderer.render(fgScene, camera);    // translucent screen guide (on top)
+})();
+</script>
+</body>
+</html>

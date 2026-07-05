@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/3d-model/.venv/bin/python",
+  "python.terminal.activateEnvironment": true
+}

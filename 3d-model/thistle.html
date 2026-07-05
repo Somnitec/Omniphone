@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Thistle bulb — live preview</title>
+<style>
+  :root { --bg:#14121a; --panel:#1e1b27; --ink:#e8e4f0; --muted:#a49db8; --accent:#b483e0; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #app { display:flex; height:100%; }
+  #view { flex:1; position:relative; }
+  #panel { width:340px; background:var(--panel); padding:14px 16px; overflow-y:auto;
+    border-left:1px solid #322c40; }
+  h1 { font-size:15px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:11px; margin:0 0 12px; }
+  .grp { margin:14px 0 4px; color:var(--accent); font-size:11px; text-transform:uppercase;
+    letter-spacing:.06em; border-bottom:1px solid #322c40; padding-bottom:3px; }
+  .row { display:grid; grid-template-columns:1fr 1.3fr 62px; align-items:center; gap:8px; margin:7px 0; }
+  .row label { color:var(--muted); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  input[type=number] { width:100%; background:#100e16; color:var(--ink); border:1px solid #322c40;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif;
+    font-variant-numeric:tabular-nums; text-align:right; }
+  input[type=number]:focus { outline:none; border-color:var(--accent); }
+  select { width:100%; background:#100e16; color:var(--ink); border:1px solid #322c40;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif; }
+  select:focus { outline:none; border-color:var(--accent); }
+  input:disabled { opacity:.35; }
+  .row.locked label { opacity:.5; }
+  #dims { background:#100e16; border:1px solid #322c40; border-radius:6px; padding:8px 10px;
+    font-size:12px; margin:2px 0 4px; }
+  #dims b { color:var(--accent); font-variant-numeric:tabular-nums; }
+  #dims .tgt { color:var(--muted); font-size:11px; }
+  pre { background:#100e16; border:1px solid #322c40; border-radius:6px; padding:10px;
+    font-size:11px; color:#cdbde8; overflow-x:auto; margin:6px 0; }
+  button { background:var(--accent); color:#1a1420; border:0; border-radius:6px;
+    padding:7px 10px; font-weight:600; cursor:pointer; width:100%; }
+  button:hover { filter:brightness(1.08); }
+  #hint { position:absolute; left:12px; bottom:10px; color:var(--muted); font-size:11px; }
+  #tris { position:absolute; right:12px; top:10px; color:var(--muted); font-size:11px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="tris"></div>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+  </div>
+  <div id="panel">
+    <h1>Thistle bulb</h1>
+    <p class="sub">Live preview — needles overlap the bulb (no boolean); tip, base &amp;
+      rim fillets are approximated. Copy the params into <b>thistle.py</b> for the real STEP/STL.</p>
+    <div class="grp">Envelope</div>
+    <div id="dims"></div>
+    <div id="controls"></div>
+    <div class="grp">thistle.py params</div>
+    <pre id="params"></pre>
+    <button id="copy">Copy params</button>
+  </div>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script>
+// ---- parameter definitions: [key, label, min, max, step, default] ----
+// Ranges are set comfortably around a ~220 x 220 x 100 mm target envelope.
+const DEFS = [
+  ["__g_bulb", "Bulb"],
+  ["BULB_RADIUS",      "Radius (mm)",         40, 140, 0.5, 95],
+  ["BULB_HEIGHT",      "Height / elong.",     20, 140, 0.5, 88],
+  ["TOP_CUT_FRAC",     "Top cut (1 = dome)",  0.1, 1.0, 0.01, 0.83],
+  ["BOT_CUT_FRAC",     "Bottom cut (-1=dome)", -1.0, -0.05, 0.01, -0.08],
+  ["RIM_FILLET_TOP",   "Top rim fillet (mm)", 0, 100, 0.1, 3.0],
+  ["RIM_FILLET_BOT",   "Bot rim fillet (mm)", 0, 100, 0.1, 8.0],
+  ["__g_screen", "Screen"],
+  ["SCREEN_MODE", "Mount", "select", ["bulb", "needle"], ["Recess in bulb top", "On a central needle"], "bulb"],
+  ["SCREEN_DIA",       "Screen dia (0=off)",  0, 80, 0.5, 32],
+  ["SCREEN_MARGIN",    "Margin around (mm)",  0, 15, 0.5, 3],
+  ["SCREEN_DEPTH",     "Recess depth (mm)",   0, 25, 0.5, 6],
+  ["SCREEN_NEEDLE_LEN","Screen needle len",   4, 60, 0.5, 22],
+  ["SCREEN_NEEDLE_BASE_DIA","Screen needle base Ø", 5, 90, 0.5, 44],
+  ["SCREEN_NEEDLE_IDX","Which needle (from top)", 0, 40, 1, 0],
+  ["__g_needle", "Needles"],
+  ["N_NEEDLES",        "Count",               8, 300, 1, 144],
+  ["NEEDLE_BASE_DIA",  "Base dia (mm)",       1, 40, 0.2, 18],
+  ["NEEDLE_LEN",       "Length (mm)",         2, 50, 0.5, 16],
+  ["NEEDLE_TIP_DIA",   "Flat tip dia (mm)",   0, 34, 0.1, 2.6],
+  ["NEEDLE_SIZE_START","Size ramp: first ×",  0.2, 3, 0.05, 1.0],
+  ["NEEDLE_SIZE_END",  "Size ramp: last ×",   0.2, 3, 0.05, 1.0],
+  ["NEEDLE_TIP_FILLET","Tip fillet (mm)",     0, 20, 0.05, 0.8],
+  ["NEEDLE_BASE_FILLET","Base→bulb fillet (mm)", 0, 15, 0.1, 4.0],
+  ["NEEDLE_MERGE_FILLET","Merge fillet (mm)", 0, 15, 0.1, 2.0],
+  ["NEEDLE_EMBED",     "Embed into bulb (mm)",0, 15, 0.1, 3.0],
+  ["BAND_LOW",         "Band low (frac)",    -0.95, 0.3, 0.01, -0.05],
+  ["BAND_HIGH",        "Band high (frac)",   -0.5, 1., 0.01, 0.74],
+];
+const P = {}, STEPS = {};
+DEFS.forEach(d => {
+  if (d[0].startsWith("__")) return;
+  if (d[2] === "select") { P[d[0]] = d[d.length - 1]; return; }   // [key,label,"select",vals,labels,def]
+  P[d[0]] = d[5]; STEPS[d[0]] = d[4];
+});
+
+// ---- build sliders + editable number fields ----
+const controls = document.getElementById("controls");
+const inputs = {};                 // key -> {rng, num} so we can lock some in a given mode
+DEFS.forEach(d => {
+  if (d[0].startsWith("__g")) {
+    const h = document.createElement("div"); h.className = "grp"; h.textContent = d[1];
+    controls.appendChild(h); return;
+  }
+  if (d[2] === "select") {                                        // dropdown control
+    const [key, label, , vals, labels, def] = d;
+    const row = document.createElement("div"); row.className = "row";
+    row.style.gridTemplateColumns = "1fr 2fr";
+    const lab = document.createElement("label"); lab.textContent = label;
+    const sel = document.createElement("select");
+    vals.forEach((v, i) => {
+      const op = document.createElement("option"); op.value = v; op.textContent = labels[i]; sel.appendChild(op);
+    });
+    sel.value = def;
+    sel.addEventListener("change", () => { P[key] = sel.value; applyModeLocks(); rebuild(); });
+    row.append(lab, sel); controls.appendChild(row); return;
+  }
+  const [key, label, min, max, step, def] = d;
+  const row = document.createElement("div"); row.className = "row";
+  const lab = document.createElement("label"); lab.textContent = label;
+  const rng = document.createElement("input");
+  rng.type = "range"; rng.min = min; rng.max = max; rng.step = step; rng.value = def;
+  const num = document.createElement("input");
+  num.type = "number"; num.step = step; num.value = def;   // free text entry, ranges not clamped
+  // slider -> value + number field
+  rng.addEventListener("input", () => {
+    P[key] = parseFloat(rng.value);
+    num.value = fmt(key, P[key]);
+    rebuild();
+  });
+  // typed number -> value + slider (slider clamps visually, P keeps the exact value)
+  num.addEventListener("input", () => {
+    const v = parseFloat(num.value);
+    if (Number.isNaN(v)) return;
+    P[key] = v; rng.value = v; rebuild();
+  });
+  inputs[key] = { rng, num };
+  row.append(lab, rng, num); controls.appendChild(row);
+});
+
+// some controls are forced/greyed out in certain modes (e.g. band-high on a screen needle)
+function applyModeLocks() {
+  const lockBandHigh = P.SCREEN_MODE === "needle";   // screen needle needs the band up to the pole
+  const bh = inputs["BAND_HIGH"];
+  if (bh) {
+    bh.rng.disabled = bh.num.disabled = lockBandHigh;
+    if (lockBandHigh) { bh.rng.value = 1; bh.num.value = 1; }
+    else { bh.rng.value = P.BAND_HIGH; bh.num.value = fmt("BAND_HIGH", P.BAND_HIGH); }
+  }
+}
+function fmt(key, v) {
+  return STEPS[key] < 1 ? +v.toFixed(2) : Math.round(v);
+}
+
+// ---- three.js scene ----
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14121a);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 2000);
+camera.position.set(150, 120, 190);
+const controlsO = new THREE.OrbitControls(camera, renderer.domElement);
+controlsO.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x352b45, 0.9));
+const keyL = new THREE.DirectionalLight(0xffffff, 0.8); keyL.position.set(1, 1.4, 0.8); scene.add(keyL);
+const fill = new THREE.DirectionalLight(0xbfa8ff, 0.3); fill.position.set(-1, 0.3, -0.6); scene.add(fill);
+
+const mat = new THREE.MeshStandardMaterial({ color: 0x8f5bc4, roughness: 0.55, metalness: 0.05 });
+let bulbMesh = null, needleMesh = null, screenMesh = null;
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+
+// ---- round a lathe-profile corner A-B-C with radius r (returns arc points) ----
+// clampIn/clampOut cap how far the tangent may travel down each edge. Uses A & C
+// only for direction, so a densely-sampled wall edge still gets a full-size fillet.
+function cornerFillet(A, B, C, r, segs, clampIn, clampOut) {
+  if (r <= 0) return { pts: [B], t: 0 };
+  let ux = A.x - B.x, uy = A.y - B.y, ul = Math.hypot(ux, uy);
+  let vx = C.x - B.x, vy = C.y - B.y, vl = Math.hypot(vx, vy);
+  if (ul < 1e-6 || vl < 1e-6) return { pts: [B], t: 0 };
+  ux /= ul; uy /= ul; vx /= vl; vy /= vl;
+  const dot = Math.max(-1, Math.min(1, ux * vx + uy * vy)), th = Math.acos(dot);
+  if (th < 1e-3 || Math.PI - th < 1e-3) return { pts: [B], t: 0 };  // straight -> no fillet
+  const half = th / 2;
+  const t = Math.min(r / Math.tan(half), clampIn, clampOut);
+  const rr = t * Math.tan(half);
+  const p1 = new THREE.Vector2(B.x + ux * t, B.y + uy * t);
+  const p2 = new THREE.Vector2(B.x + vx * t, B.y + vy * t);
+  let bx = ux + vx, by = uy + vy, bl = Math.hypot(bx, by);
+  if (bl < 1e-6) return { pts: [p1, p2], t };
+  bx /= bl; by /= bl;
+  const cx = B.x + bx * (rr / Math.sin(half)), cy = B.y + by * (rr / Math.sin(half));
+  let a1 = Math.atan2(p1.y - cy, p1.x - cx), a2 = Math.atan2(p2.y - cy, p2.x - cx), da = a2 - a1;
+  while (da > Math.PI) da -= 2 * Math.PI;
+  while (da < -Math.PI) da += 2 * Math.PI;
+  const pts = [];
+  for (let i = 0; i <= segs; i++) {
+    const a = a1 + da * i / segs;
+    pts.push(new THREE.Vector2(cx + rr * Math.cos(a), cy + rr * Math.sin(a)));
+  }
+  return { pts, t };
+}
+
+// ---- bulb via lathe profile (flat cuts, rounded rims, screen recess baked in) ----
+function bulbGeometry() {
+  const a = P.BULB_RADIUS, c = P.BULB_HEIGHT;
+  const yb = P.BOT_CUT_FRAC * c, yt = P.TOP_CUT_FRAC * c, span = yt - yb;
+  const rAt = y => a * Math.sqrt(Math.max(0, 1 - (y / c) ** 2));
+  const N = 80, wall = [];
+  for (let i = 0; i <= N; i++) { const y = yb + span * i / N; wall.push(new THREE.Vector2(rAt(y), y)); }
+  const rtB = wall[0], rtT = wall[N];
+  const botPointed = rtB.x < 0.5;   // cut at/near the pole -> that end is a smooth dome
+  const topPointed = rtT.x < 0.5;
+  const hasScreen = P.SCREEN_DIA > 0 && P.SCREEN_DEPTH > 0 && !topPointed && P.SCREEN_MODE !== "needle";
+  const sr = hasScreen ? Math.min(P.SCREEN_DIA / 2, rtT.x - 0.5) : 0;  // 0 => flat top to axis
+  const axisB = new THREE.Vector2(0, yb), annT = new THREE.Vector2(sr, yt);
+  // rim fillets (skipped when the end is a dome or the radius is 0)
+  const botR = botPointed ? 0 : Math.min(P.RIM_FILLET_BOT, rtB.x * 0.9, span * 0.45);
+  const topR = topPointed ? 0 : Math.min(P.RIM_FILLET_TOP, Math.max(0, rtT.x - sr) * 0.9, span * 0.45);
+  const botF = cornerFillet(axisB, rtB, wall[1], botR, 10, rtB.x * 0.9, span * 0.45);
+  const topF = cornerFillet(wall[N - 1], rtT, annT, topR, 10, span * 0.45, Math.max(0.01, rtT.x - sr) * 0.9);
+  const pts = [axisB];
+  if (botPointed) pts.push(rtB); else for (const p of botF.pts) pts.push(p);   // bottom rim
+  for (let i = 1; i < N; i++) {                                // wall interior, minus arc zones
+    const p = wall[i];
+    if (p.distanceTo(rtB) < botF.t * 1.02 || p.distanceTo(rtT) < topF.t * 1.02) continue;
+    pts.push(p);
+  }
+  if (topPointed) {
+    pts.push(rtT);                                             // dome closes at the pole
+  } else {
+    for (const p of topF.pts) pts.push(p);                     // top rim arc
+    if (hasScreen) {
+      pts.push(annT);                                          // finish flat top annulus at screen edge
+      pts.push(new THREE.Vector2(sr, yt - P.SCREEN_DEPTH));    // vertical wall down into recess
+      pts.push(new THREE.Vector2(0, yt - P.SCREEN_DEPTH));     // recess floor -> axis
+    } else {
+      pts.push(new THREE.Vector2(0, yt));                      // flat top closes to axis
+    }
+  }
+  return new THREE.LatheGeometry(pts, 96);
+}
+
+// ---- one needle profile (flat filleted tip + flared filleted foot) ----
+function needleGeometry() {
+  const rb = P.NEEDLE_BASE_DIA / 2, rt = P.NEEDLE_TIP_DIA / 2;
+  const L = P.NEEDLE_LEN, bf = Math.max(0, P.NEEDLE_BASE_FILLET);
+  const mf = Math.max(0, P.NEEDLE_MERGE_FILLET);   // extra flare so close feet fuse
+  const tf = Math.max(0, Math.min(P.NEEDLE_TIP_FILLET, rt - 0.05, L * 0.45));
+  const rfoot = rb + bf + mf;                  // outer radius of the flared foot
+  const sink = P.NEEDLE_EMBED + bf + 0.5;      // foot buried below the surface (y=0)
+  const v = [
+    new THREE.Vector2(0, -sink),               // 0 foot floor, axis
+    new THREE.Vector2(rfoot, -sink),           // 1 skirt out
+    new THREE.Vector2(rfoot, -bf),             // 2 flare up
+    new THREE.Vector2(rb, 0),                  // 3 side meets the surface  <- base fillet
+    new THREE.Vector2(rt, L),                  // 4 flat tip rim            <- tip fillet
+    new THREE.Vector2(0, L),                   // 5 tip centre, axis
+  ];
+  const baseF = cornerFillet(v[2], v[3], v[4], bf, 8, v[3].distanceTo(v[2]) * 0.49, v[3].distanceTo(v[4]) * 0.49);
+  const tipF  = cornerFillet(v[3], v[4], v[5], tf, 8, v[4].distanceTo(v[3]) * 0.49, v[4].distanceTo(v[5]) * 0.49);
+  const pts = [v[0], v[1], v[2], ...baseF.pts, ...tipF.pts, v[5]];
+  return new THREE.LatheGeometry(pts, 24);     // +Y = tip
+}
+
+// ---- the screen-mount needle: a flat-topped pillar with a recess for the screen ----
+function screenNeedleGeometry() {
+  const rTop = P.SCREEN_DIA / 2 + P.SCREEN_MARGIN;   // flat top outer radius (screen + margin)
+  const rScr = P.SCREEN_DIA / 2;                      // recess radius (the screen itself)
+  const rBase = P.SCREEN_NEEDLE_BASE_DIA / 2;         // base width where it meets the bulb
+  const L = P.SCREEN_NEEDLE_LEN;
+  let depth = Math.min(P.SCREEN_DEPTH, L - 1);
+  if (rTop > rBase && rScr > rBase)                   // mushroom: keep recess inside the tapered body
+    depth = Math.min(depth, L - L * (rScr - rBase) / (rTop - rBase) - 0.5);
+  depth = Math.max(0, depth);
+  const bf = Math.max(0, Math.min(P.NEEDLE_BASE_FILLET, rBase * 0.9));  // keep cove off the axis
+  const mf = Math.max(0, P.NEEDLE_MERGE_FILLET);
+  const tf = Math.max(0, Math.min(P.NEEDLE_TIP_FILLET, P.SCREEN_MARGIN * 0.9, L * 0.3));
+  const rfoot = rBase + bf + mf, sink = P.NEEDLE_EMBED + bf + 0.5;
+  const v = [
+    new THREE.Vector2(0, -sink),                 // 0 foot floor
+    new THREE.Vector2(rfoot, -sink),             // 1 skirt out
+    new THREE.Vector2(rfoot, -bf),               // 2 flare up
+    new THREE.Vector2(rBase, 0),                 // 3 base meets surface  <- base fillet
+    new THREE.Vector2(rTop, L),                  // 4 flat top rim        <- tip fillet
+    new THREE.Vector2(rScr, L),                  // 5 flat top -> screen edge
+    new THREE.Vector2(rScr, L - depth),          // 6 recess wall down
+    new THREE.Vector2(0, L - depth),             // 7 recess floor -> axis
+  ];
+  const baseF = cornerFillet(v[2], v[3], v[4], bf, 8, v[3].distanceTo(v[2]) * 0.49, v[3].distanceTo(v[4]) * 0.49);
+  const tipF  = cornerFillet(v[3], v[4], v[5], tf, 8, v[4].distanceTo(v[3]) * 0.49, v[4].distanceTo(v[5]) * 0.49);
+  const pts = [v[0], v[1], v[2], ...baseF.pts, ...tipF.pts, v[5], v[6], v[7]];
+  return new THREE.LatheGeometry(pts, 64);
+}
+
+// ---- instanced needles placed on the ellipsoid, foot sunk into the wall ----
+// In screen-needle mode one needle (counted from the top) becomes the screen mount:
+// its instance is hidden here and its transform handed to rebuild() for a separate mesh.
+function buildNeedles() {
+  const a = P.BULB_RADIUS, c = P.BULB_HEIGHT, n = Math.round(P.N_NEEDLES), L = P.NEEDLE_LEN;
+  const GA = Math.PI * (3 - Math.sqrt(5));
+  const screenMode = P.SCREEN_MODE === "needle" && P.SCREEN_DIA > 0;
+  const bandHigh = screenMode ? 1 : P.BAND_HIGH;             // needle reaches the pole
+  // topmost needle is the last one placed (highest u); index counts down from there
+  const screenIdx = screenMode ? n - 1 - Math.min(Math.max(0, Math.round(P.SCREEN_NEEDLE_IDX)), n - 1) : -1;
+  const geo = needleGeometry();
+  const mesh = new THREE.InstancedMesh(geo, mat, n);
+  const up = new THREE.Vector3(0, 1, 0);
+  const pos = new THREE.Vector3(), nrm = new THREE.Vector3(), q = new THREE.Quaternion(),
+        s = new THREE.Vector3(1, 1, 1), m = new THREE.Matrix4();
+  // envelope: start from the bare bulb, then grow with each needle tip
+  let maxR = (P.BOT_CUT_FRAC <= 0 && P.TOP_CUT_FRAC >= 0)
+    ? a
+    : a * Math.sqrt(Math.max(0, 1 - Math.min(Math.abs(P.BOT_CUT_FRAC), P.TOP_CUT_FRAC) ** 2));
+  let minY = P.BOT_CUT_FRAC * c, maxY = P.TOP_CUT_FRAC * c;
+  const s0 = P.NEEDLE_SIZE_START, s1 = P.NEEDLE_SIZE_END;   // per-needle radial size ramp
+  let screenXform = null;
+  for (let i = 0; i < n; i++) {
+    const u = P.BAND_LOW + (bandHigh - P.BAND_LOW) * (i + 0.5) / n;
+    const th = i * GA, r = a * Math.sqrt(Math.max(0, 1 - u * u));
+    const x = r * Math.cos(th), z = r * Math.sin(th), y = c * u;
+    nrm.set(x / a ** 2, y / c ** 2, z / a ** 2).normalize();
+    q.setFromUnitVectors(up, nrm);
+    pos.set(x, y, z);                          // profile's y=0 sits on the surface
+    if (i === screenIdx) {                      // hide this needle; it becomes the screen mount
+      s.set(0, 0, 0); m.compose(pos, q, s); mesh.setMatrixAt(i, m);
+      screenXform = { pos: pos.clone(), quat: q.clone() };
+      const sl = P.SCREEN_NEEDLE_LEN;
+      maxR = Math.max(maxR, Math.hypot(x + nrm.x * sl, z + nrm.z * sl),
+        P.SCREEN_DIA / 2 + P.SCREEN_MARGIN, P.SCREEN_NEEDLE_BASE_DIA / 2);
+      const ty = y + nrm.y * sl; minY = Math.min(minY, ty); maxY = Math.max(maxY, ty);
+      continue;
+    }
+    const sc = n > 1 ? s0 + (s1 - s0) * i / (n - 1) : s0;  // ramp first -> last
+    s.set(sc, 1, sc);                          // scale radially (dia), keep length
+    m.compose(pos, q, s); mesh.setMatrixAt(i, m);
+    // envelope from the needle tip (surface point + normal * length)
+    const tx = x + nrm.x * L, ty = y + nrm.y * L, tz = z + nrm.z * L;
+    maxR = Math.max(maxR, Math.hypot(tx, tz));
+    minY = Math.min(minY, ty); maxY = Math.max(maxY, ty);
+  }
+  mesh.instanceMatrix.needsUpdate = true;
+  mesh.userData.env = { maxR, minY, maxY };
+  mesh.userData.screenXform = screenXform;
+  return mesh;
+}
+
+function rebuild() {
+  if (bulbMesh) { scene.remove(bulbMesh); bulbMesh.geometry.dispose(); }
+  if (needleMesh) { scene.remove(needleMesh); needleMesh.geometry.dispose(); }
+  if (screenMesh) { scene.remove(screenMesh); screenMesh.geometry.dispose(); screenMesh = null; }
+  bulbMesh = new THREE.Mesh(bulbGeometry(), mat); scene.add(bulbMesh);
+  needleMesh = buildNeedles(); scene.add(needleMesh);
+  const e = needleMesh.userData.env;
+  let maxR = e.maxR, minY = e.minY, maxY = e.maxY;
+  const xf = needleMesh.userData.screenXform;             // set when a needle is the screen mount
+  if (xf) {
+    screenMesh = new THREE.Mesh(screenNeedleGeometry(), mat);
+    screenMesh.position.copy(xf.pos); screenMesh.quaternion.copy(xf.quat);
+    scene.add(screenMesh);
+  }
+  document.getElementById("tris").textContent =
+    Math.round(P.N_NEEDLES) + " needles" + (screenMesh ? " + screen" : "");
+  document.getElementById("dims").innerHTML =
+    `≈ <b>${(2 * maxR).toFixed(0)} × ${(2 * maxR).toFixed(0)} × ${(maxY - minY).toFixed(0)}</b> mm` +
+    `<div class="tgt">target ~ 220 × 220 × 100 mm (footprint = radius + needle length)</div>`;
+  updateParams();
+}
+
+function updateParams() {
+  const f = (k, d = 2) => Number.isInteger(P[k]) ? P[k] : P[k].toFixed(d);
+  document.getElementById("params").textContent =
+`BULB_RADIUS       = ${f("BULB_RADIUS",1)}
+BULB_HEIGHT       = ${f("BULB_HEIGHT",1)}
+TOP_CUT_FRAC      = ${f("TOP_CUT_FRAC")}
+BOT_CUT_FRAC      = ${f("BOT_CUT_FRAC")}
+RIM_FILLET_TOP    = ${f("RIM_FILLET_TOP",1)}
+RIM_FILLET_BOT    = ${f("RIM_FILLET_BOT",1)}
+SCREEN_MODE       = "${P.SCREEN_MODE}"
+SCREEN_DIA        = ${f("SCREEN_DIA",1)}
+SCREEN_MARGIN     = ${f("SCREEN_MARGIN",1)}
+SCREEN_DEPTH      = ${f("SCREEN_DEPTH",1)}
+SCREEN_NEEDLE_LEN = ${f("SCREEN_NEEDLE_LEN",1)}
+SCREEN_NEEDLE_BASE_DIA = ${f("SCREEN_NEEDLE_BASE_DIA",1)}
+SCREEN_NEEDLE_IDX = ${Math.round(P.SCREEN_NEEDLE_IDX)}
+N_NEEDLES         = ${Math.round(P.N_NEEDLES)}
+NEEDLE_BASE_DIA   = ${f("NEEDLE_BASE_DIA",1)}
+NEEDLE_LEN        = ${f("NEEDLE_LEN",1)}
+NEEDLE_TIP_DIA    = ${f("NEEDLE_TIP_DIA",1)}
+NEEDLE_SIZE_START = ${f("NEEDLE_SIZE_START")}
+NEEDLE_SIZE_END   = ${f("NEEDLE_SIZE_END")}
+NEEDLE_TIP_FILLET = ${f("NEEDLE_TIP_FILLET")}
+NEEDLE_BASE_FILLET= ${f("NEEDLE_BASE_FILLET",1)}
+NEEDLE_MERGE_FILLET = ${f("NEEDLE_MERGE_FILLET",1)}
+NEEDLE_EMBED      = ${f("NEEDLE_EMBED",1)}
+BAND_LOW          = ${f("BAND_LOW")}
+BAND_HIGH         = ${P.SCREEN_MODE === "needle" ? 1 : f("BAND_HIGH")}`;
+}
+
+document.getElementById("copy").addEventListener("click", () => {
+  navigator.clipboard.writeText(document.getElementById("params").textContent);
+});
+
+applyModeLocks(); resize(); rebuild();
+(function loop() { requestAnimationFrame(loop); controlsO.update(); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>
