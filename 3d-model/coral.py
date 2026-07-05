@@ -39,7 +39,8 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))  # write next to this script
 
 # ---------- PARAMETERS (edit these) ----------
-FORM          = "dome"      # "dome" | "bulb" | "fingers"
+FORM          = "dome"      # RD forms: "dome" | "bulb" | "fingers"
+                            # sculpted species: "bubble" | "cauliflower" | "greatstar"
 
 # ---- body envelope (target ~ 180 x 180 x 60 mm for the dome) ----
 BODY_RADIUS   = 90          # dome/bulb radius (x,y); base plate radius for "fingers"
@@ -60,6 +61,8 @@ PAD_LAYOUT    = "phyllotaxis"  # "phyllotaxis" (golden-angle) | "ring" (single c
 PAD_STYLE     = "raised"    # DOME only: "raised" = flat copper seats on bumps ·
                             #   "flat" = pure brain-coral surface, pads are just marked
                             #   positions (RD still seeds them; stick copper on the ridges)
+PAD_MODE      = "features"  # sculpted species: "features" = pads ARE the natural features
+                            #   (bubbles / knobs / corallite cups) · "uniform" = N flat seats
 
 # ---- reaction-diffusion (Gray-Scott) : the coral pattern ----
 RD_AMOUNT     = 6.0         # amplitude of the coral ridges (mm). 0 = smooth body, just pads
@@ -88,6 +91,16 @@ SCREEN_PAD_IDX = 0          # which pad carries the screen when SCREEN_MODE = "p
 RES_RADIAL    = 150         # dome: rings from centre to rim
 RES_ANGULAR   = 260         # dome/bulb/branch: samples around the circle
 BRANCH_SEG    = 15          # bulb/fingers: rings up each branch
+
+# ---- sculpted coral species (FORM = bubble / cauliflower / greatstar) ----
+BUBBLE_COUNT  = 46          # "bubble": number of vesicles piled on the mound
+BUBBLE_MIN    = 12          # smallest vesicle radius (mm)
+BUBBLE_MAX    = 26          # largest vesicle radius (mm)
+KNOB_AMP      = 18          # "cauliflower": lump depth (mm) of the knobby crust
+KNOB_FREQ     = 3.4         # "cauliflower": lump frequency (higher = finer florets)
+CORALLITE_DIA = 26          # "greatstar": outer diameter of each corallite cup (mm)
+CORALLITE_H   = 7           # "greatstar": how far each cup rim stands off the boulder (mm)
+CORALLITE_PIT = 5           # "greatstar": depth of the central pit below the rim (mm)
 # ---------------------------------------------
 
 R, C = float(BODY_RADIUS), float(BODY_HEIGHT)
@@ -600,8 +613,229 @@ def build_fingers(rd_at, pads):
 # ============================================================================
 #  Driver
 # ============================================================================
+# ============================================================================
+#  Sculpted (non-RD) coral species — bubble, cauliflower, great-star.
+#  These share a small mesh toolkit: closed UV spheres, a flat-bottomed dome
+#  boulder, a revolve-a-profile routine (corallite cups & pad seats).
+# ============================================================================
+def add_uv_sphere(verts, tris, cx, cy, cz, r, na=48, nlat=24, disp=None):
+    """A closed, watertight UV sphere. disp(theta, phi) -> extra radius (mm)."""
+    north = len(verts); verts.append((cx, cy, cz + r + (disp(0.0, 0.0) if disp else 0.0)))
+    ring_bases = []
+    for i in range(1, nlat):
+        phi = math.pi * i / nlat
+        sp, cp = math.sin(phi), math.cos(phi)
+        b = len(verts)
+        for j in range(na):
+            th = 2.0 * math.pi * j / na
+            rr = r + (disp(th, phi) if disp else 0.0)
+            verts.append((cx + rr * sp * math.cos(th), cy + rr * sp * math.sin(th), cz + rr * cp))
+        ring_bases.append(b)
+    south = len(verts); verts.append((cx, cy, cz - r - (disp(0.0, math.pi) if disp else 0.0)))
+    b0 = ring_bases[0]
+    for j in range(na):
+        tris.append((north, b0 + j, b0 + (j + 1) % na))
+    for k in range(len(ring_bases) - 1):
+        a, b = ring_bases[k], ring_bases[k + 1]
+        for j in range(na):
+            j1 = (j + 1) % na
+            tris.append((a + j, a + j1, b + j1)); tris.append((a + j, b + j1, b + j))
+    bl = ring_bases[-1]
+    for j in range(na):
+        tris.append((south, bl + (j + 1) % na, bl + j))
+
+
+def add_dome_body(verts, tris, R, H, na, nrings, base_z, disp=None):
+    """Upper half-ellipsoid boulder, closed with a foot wall + flat base disc at
+    z=0. disp(theta, phi) adds mm outward (fade it near the rim to keep the foot
+    circular). Returns nothing; appends a watertight solid."""
+    apex = len(verts); verts.append((0.0, 0.0, base_z + H + (disp(0.0, 0.0) if disp else 0.0)))
+    ring_bases = []
+    for i in range(1, nrings + 1):
+        phi = 0.5 * math.pi * i / nrings
+        sp, cp = math.sin(phi), math.cos(phi)
+        b = len(verts)
+        for j in range(na):
+            th = 2.0 * math.pi * j / na
+            d = disp(th, phi) if disp else 0.0
+            rr = R * sp + d * sp
+            verts.append((rr * math.cos(th), rr * math.sin(th), base_z + H * cp + d * cp))
+        ring_bases.append(b)
+    b0 = ring_bases[0]
+    for j in range(na):
+        tris.append((apex, b0 + j, b0 + (j + 1) % na))
+    for k in range(len(ring_bases) - 1):
+        a, b = ring_bases[k], ring_bases[k + 1]
+        for j in range(na):
+            j1 = (j + 1) % na
+            tris.append((a + j, a + j1, b + j1)); tris.append((a + j, b + j1, b + j))
+    rim = ring_bases[-1]                              # phi=pi/2 rim sits at z=base_z
+    bot = len(verts)
+    for j in range(na):
+        x, y, _ = verts[rim + j]; verts.append((x, y, 0.0))
+    bc = len(verts); verts.append((0.0, 0.0, 0.0))
+    for j in range(na):
+        j1 = (j + 1) % na
+        tris.append((rim + j, bot + j, bot + j1)); tris.append((rim + j, bot + j1, rim + j1))
+    for j in range(na):
+        tris.append((bc, bot + (j + 1) % na, bot + j))
+
+
+def revolve_into(verts, tris, profile, origin, zdir, seg=44):
+    """Revolve a (radius, height) profile about zdir at origin; radius-0 points
+    become axis apices. Appends a closed solid (same idea as cymatics.revolve)."""
+    def norm(v):
+        L = math.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2) or 1.0
+        return (v[0] / L, v[1] / L, v[2] / L)
+    def cross(a, b):
+        return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+    Z = norm(zdir); ax = (0.0, 0.0, 1.0) if abs(Z[2]) < 0.9 else (1.0, 0.0, 0.0)
+    U = norm(cross(ax, Z)); V = cross(Z, U)
+    def pt(rad, h, phi):
+        cr, sr = rad * math.cos(phi), rad * math.sin(phi)
+        return (origin[0] + cr * U[0] + sr * V[0] + h * Z[0],
+                origin[1] + cr * U[1] + sr * V[1] + h * Z[1],
+                origin[2] + cr * U[2] + sr * V[2] + h * Z[2])
+    rows = []
+    for (rad, h) in profile:
+        if rad < 1e-6:
+            rows.append(("apex", len(verts))); verts.append(pt(0.0, h, 0.0))
+        else:
+            base = len(verts)
+            for k in range(seg):
+                verts.append(pt(rad, h, 2.0 * math.pi * k / seg))
+            rows.append(("ring", base))
+    for k in range(len(rows) - 1):
+        (ka, ia), (kb, ib) = rows[k], rows[k + 1]
+        if ka == "apex" and kb == "ring":
+            for i in range(seg):
+                tris.append((ia, ib + i, ib + (i + 1) % seg))
+        elif ka == "ring" and kb == "apex":
+            for i in range(seg):
+                tris.append((ia + i, ib, ia + (i + 1) % seg))
+        else:
+            for i in range(seg):
+                i1 = (i + 1) % seg
+                tris.append((ia + i, ia + i1, ib + i1)); tris.append((ia + i, ib + i1, ib + i))
+
+
+def dome_point_normal(u, theta, R, H, base_z):
+    """Surface point + outward unit normal of the dome boulder at (u in [0,1], theta)."""
+    phi = 0.5 * math.pi * u
+    sp, cp = math.sin(phi), math.cos(phi)
+    x, y, z = R * sp * math.cos(theta), R * sp * math.sin(theta), base_z + H * cp
+    nx, ny, nz = x / (R * R), y / (R * R), (z - base_z) / (H * H) if H > 0 else 1.0
+    L = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+    return (x, y, z), (nx / L, ny / L, nz / L)
+
+
+def add_pad_seat(verts, tris, point, normal, dia, height, seg=44, sink=3.0):
+    """A raised, flat-topped round copper seat on the surface (uniform-pad mode)."""
+    r = dia / 2.0
+    revolve_into(verts, tris, [(0.0, -sink), (r + 2.0, -sink), (r + 2.0, 0.0),
+                               (r, height), (0.0, height)], point, normal, seg)
+
+
+def build_bubble(pads):
+    """Bubble coral: vesicles piled on a low mound. Pads (features) = the biggest
+    bubbles; (uniform) = flat seats on the mound. Screen recesses the base."""
+    na_b = max(28, RES_ANGULAR // 8); nlat_b = max(16, RES_RADIAL // 8)
+    verts, tris = [], []
+    Rm, Hm = R * 0.86, C * 0.55
+    add_dome_body(verts, tris, Rm, Hm, max(56, RES_ANGULAR // 4), max(28, RES_RADIAL // 4), BASE_HEIGHT)
+    rng = np.random.RandomState(int(RD_SEED))
+    n = int(BUBBLE_COUNT); ga = math.pi * (3.0 - math.sqrt(5.0))
+    for i in range(n):
+        u = math.sqrt((i + 0.5) / n); th = i * ga
+        (px, py, pz), _ = dome_point_normal(u, th, Rm, Hm, BASE_HEIGHT)
+        br = BUBBLE_MIN + (BUBBLE_MAX - BUBBLE_MIN) * (1.0 - u) * rng.uniform(0.7, 1.12)
+        add_uv_sphere(verts, tris, px, py, pz + br * 0.45, br, na_b, nlat_b)
+    if PAD_MODE == "uniform":
+        for (dx, dy) in pads:
+            u = min(0.98, math.hypot(dx, dy)); th = math.atan2(dy, dx)
+            pt, nrm = dome_point_normal(u, th, Rm, Hm, BASE_HEIGHT)
+            add_pad_seat(verts, tris, pt, nrm, PAD_DIA, PAD_HEIGHT)
+    _carve_base_screen(verts, tris)
+    return verts, tris
+
+
+def build_cauliflower(pads):
+    """Cauliflower coral: a lumpy knobby mound. Pads = raised flat seats on the
+    florets (both modes place N_PADS seats; features clusters them on the crown)."""
+    na = max(96, RES_ANGULAR // 2); nrings = max(60, RES_RADIAL // 2)
+    verts, tris = [], []
+    def disp(th, phi):
+        sx, sy, sz = math.sin(phi) * math.cos(th), math.sin(phi) * math.sin(th), math.cos(phi)
+        f = KNOB_FREQ
+        n = (vnoise(sx * f * 3.0 + 1.1, sy * f * 3.0 - 0.7) * 0.6
+             + vnoise(sy * f * 6.0 + 3.2, sz * f * 6.0 + 1.4) * 0.3
+             + vnoise(sz * f * 11.0 - 2.1, sx * f * 11.0 + 0.5) * 0.1)
+        fade = smoothstep((0.5 * math.pi - phi) / 0.30)      # ribs vanish at the foot rim
+        return KNOB_AMP * n * fade
+    add_dome_body(verts, tris, R * 0.9, C, na, nrings, BASE_HEIGHT, disp)
+    for (dx, dy) in pads:
+        u = min(0.9, math.hypot(dx, dy)); th = math.atan2(dy, dx)
+        pt, nrm = dome_point_normal(u, th, R * 0.9, C, BASE_HEIGHT)
+        pt = (pt[0] + nrm[0] * KNOB_AMP * 0.5, pt[1] + nrm[1] * KNOB_AMP * 0.5, pt[2] + nrm[2] * KNOB_AMP * 0.5)
+        add_pad_seat(verts, tris, pt, nrm, PAD_DIA, PAD_HEIGHT * 0.7)
+    _carve_top_screen(verts, tris, R * 0.9, C)
+    return verts, tris
+
+
+def build_greatstar(pads):
+    """Great star coral: a boulder studded with corallite cups (raised rings with
+    a central pit). Pads (features) = the cups; (uniform) = flat seats."""
+    na = max(80, RES_ANGULAR // 3); nrings = max(50, RES_RADIAL // 3)
+    Hb = C * 0.72
+    verts, tris = [], []
+    add_dome_body(verts, tris, R, Hb, na, nrings, BASE_HEIGHT)
+    ro = CORALLITE_DIA / 2.0; wall = max(2.0, ro * 0.28); ri = ro - wall
+    sink = 4.0
+    if PAD_MODE == "features":
+        for (dx, dy) in pads:
+            u = min(0.9, math.hypot(dx, dy)); th = math.atan2(dy, dx)
+            pt, nrm = dome_point_normal(u, th, R, Hb, BASE_HEIGHT)
+            revolve_into(verts, tris, [(0.0, CORALLITE_H - CORALLITE_PIT), (ri, CORALLITE_H - CORALLITE_PIT),
+                                       (ri, CORALLITE_H), (ro, CORALLITE_H), (ro, -sink), (0.0, -sink)],
+                         pt, nrm, max(28, RES_ANGULAR // 6))
+    else:
+        for (dx, dy) in pads:
+            u = min(0.9, math.hypot(dx, dy)); th = math.atan2(dy, dx)
+            pt, nrm = dome_point_normal(u, th, R, Hb, BASE_HEIGHT)
+            add_pad_seat(verts, tris, pt, nrm, PAD_DIA, PAD_HEIGHT * 0.6)
+    _carve_top_screen(verts, tris, R, Hb)
+    return verts, tris
+
+
+def _carve_top_screen(verts, tris, R, H):
+    """A round screen bezel + recess standing on the crown (a separate solid)."""
+    if SCREEN_MODE not in ("top", "center") or SCREEN_DIA <= 0:
+        return
+    ro = SCREEN_DIA / 2.0 + SCREEN_MARGIN; ri = SCREEN_DIA / 2.0
+    hr = max(4.0, SCREEN_DEPTH + 2.0)
+    revolve_into(verts, tris, [(0.0, hr - SCREEN_DEPTH), (ri, hr - SCREEN_DEPTH), (ri, hr),
+                               (ro, hr), (ro, -3.0), (0.0, -3.0)],
+                 (0.0, 0.0, BASE_HEIGHT + H), (0.0, 0.0, 1.0), max(36, RES_ANGULAR // 5))
+
+
+def _carve_base_screen(verts, tris):
+    """A round screen recess pushed up into the flat base underside."""
+    if SCREEN_MODE not in ("base",) or SCREEN_DIA <= 0:
+        return
+    ri = SCREEN_DIA / 2.0; ro = SCREEN_DIA / 2.0 + SCREEN_MARGIN
+    revolve_into(verts, tris, [(0.0, SCREEN_DEPTH), (ri, SCREEN_DEPTH), (ri, 0.0),
+                               (ro, 0.0), (ro, -0.1), (0.0, -0.1)],
+                 (0.0, 0.0, 0.0), (0.0, 0.0, 1.0), max(36, RES_ANGULAR // 5))
+
+
 def build():
     pads = pad_disc_positions()
+    if FORM == "bubble":
+        return build_bubble(pads)
+    if FORM == "cauliflower":
+        return build_cauliflower(pads)
+    if FORM == "greatstar":
+        return build_greatstar(pads)
     print(f"  {N_PADS} pads, running reaction-diffusion "
           f"({RD_GRID}^2 x {RD_STEPS} steps, F={RD_FEED} k={RD_KILL})...")
     field = run_reaction_diffusion(pads)

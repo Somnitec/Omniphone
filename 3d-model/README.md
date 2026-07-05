@@ -4,6 +4,26 @@ Procedural generators for Omniphone enclosures, each paired with a live
 browser viewer (three.js, vendored offline) that emits a copy-pasteable
 parameter block:
 
+> **Start here for exploring shapes:** [`sculptor.html`](sculptor.html) is a
+> unified playground — one page, ~24 shapes in a dropdown grouped by family:
+> **Classic** (thistle, Lloyd-relaxed thistle, cymatics, mandelbulb),
+> **Coral** (brain-coral/RD, bubble, cauliflower, great-star),
+> **Cactus**, **Mushroom**, **Fractals** (mandelbox, quaternion-Julia,
+> juliabulb, Menger sponge, Sierpiński tetra, Apollonian packing, fBm blob,
+> romanesco), and natural-shape *algorithms* (metaball lobes ≈ the real device,
+> puffed Voronoi cells, pollen/geodesic bumps, gourd lobing, superformula,
+> crystal facets). Shared knobs (size, feature count, screen) persist as you
+> switch shapes; shape-specific knobs swap in/out. Every shape is one connected
+> shell you can wall-hollow, with distinct convex touch pads.
+>
+> - **★ Save current** stores the shape + all its params as a named **favourite**
+>   (browser localStorage); reload it any time from the *Saved* dropdown, or 🗑 delete it.
+> - **Copy params** emits the settings; **⬇ Download STL** exports the current
+>   shape from the browser (binary STL, z-up, base down).
+>
+> The per-family `.py` scripts below remain the higher-fidelity source for
+> production STLs (the fractal/algorithm families are viewer-only for now).
+
 | Generator | Viewer | Shape |
 |-----------|--------|-------|
 | [`thistle.py`](thistle.py) | [`viewer.html`](viewer.html) | thistle-flower bulb with phyllotaxis needles |
