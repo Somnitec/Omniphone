@@ -32,18 +32,18 @@ from array import array
 HERE = os.path.dirname(os.path.abspath(__file__))  # write next to this script
 
 # ---------- PARAMETERS (edit these — or dial them in mandelbulb.html and paste) ----------
-POWER        = 8
-ITERATIONS   = 3
-BAILOUT      = 1.2
-LEVEL        = 1.9
+POWER        = 6
+ITERATIONS   = 5
+BAILOUT      = 2.0
+LEVEL        = 4.8
 GRID         = 96
 BOX          = 1.25
 SIZE_MM      = 120
-BASE_FLATTEN = 0.4
-SMOOTH_ITERS = 1
-SCREEN_MODE  = "bulb"
-SCREEN_DIA   = 28
-SCREEN_DEPTH = 10
+BASE_FLATTEN = 0.54
+SMOOTH_ITERS = 2
+SCREEN_MODE  = "none"
+SCREEN_DIA   = 0
+SCREEN_DEPTH = 8
 # ----------------------------------------------------------------------------------------
 
 

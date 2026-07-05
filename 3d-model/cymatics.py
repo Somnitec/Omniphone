@@ -29,15 +29,15 @@ import struct
 HERE = os.path.dirname(os.path.abspath(__file__))  # write next to this script
 
 # ---------- PARAMETERS (edit these — or dial them in cymatics.html and paste) ----------
-DOME_RADIUS   = 106.5
+DOME_RADIUS   = 90
 DOME_HEIGHT   = 55
 DOME_PROFILE  = "ellipse"
-MODE_M        = 3
+MODE_M        = 5
 MODE_N        = 3
-AMPLITUDE     = 11.2
-MODE2_M       = 5
-MODE2_N       = 3
-MODE2_MIX     = 0.68
+AMPLITUDE     = 10
+MODE2_M       = 4
+MODE2_N       = 4
+MODE2_MIX     = 0.63
 RECTIFY       = "absolute"
 DISPLACE      = "normal"
 ANGLE_OFFSET  = 0
@@ -45,10 +45,10 @@ SWIRL         = 0
 WARP          = 0
 SCREEN_MODE   = "center"
 SCREEN_DIA    = 32
-SCREEN_MARGIN = 1.5
-SCREEN_DEPTH  = 2.5
+SCREEN_MARGIN = 4
+SCREEN_DEPTH  = 6
 SCREEN_PEAK_IDX = 0
-SCREEN_PEAK_H = 39
+SCREEN_PEAK_H = 10
 BASE_HEIGHT   = 4
 RES_RADIAL    = 130
 RES_ANGULAR   = 240

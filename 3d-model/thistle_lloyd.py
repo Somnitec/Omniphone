@@ -26,34 +26,35 @@ HERE = os.path.dirname(os.path.abspath(__file__))  # write next to this script
 
 # ---------- PARAMETERS (edit these) ----------
 # Target envelope ~ 220 x 220 x 100 mm (tune with viewer_lloyd.html).
-BULB_RADIUS       = 108
-BULB_HEIGHT       = 78.5
+BULB_RADIUS       = 95
+BULB_HEIGHT       = 88
 TOP_CUT_FRAC      = 1
-BOT_CUT_FRAC      = 0.05
-RIM_FILLET_TOP    = 0
-RIM_FILLET_BOT    = 10
-SCREEN_MODE       = "bulb"  # "bulb" = recess in the top; "needle" = central screen pillar
-SCREEN_DIA        = 0
+BOT_CUT_FRAC      = 0.19
+RIM_FILLET_TOP    = 3
+RIM_FILLET_BOT    = 0
+SCREEN_MODE       = "needle"  # "bulb" = recess in the top; "needle" = central screen pillar
+SCREEN_DIA        = 32
 SCREEN_MARGIN     = 3        # ring of material around the screen on the pillar top (mm)
-SCREEN_DEPTH      = 10
-SCREEN_NEEDLE_LEN = 22       # height of the screen pillar (used when SCREEN_MODE = "needle")
+SCREEN_DEPTH      = 6.5
+SCREEN_NEEDLE_LEN = 9       # height of the screen pillar (used when SCREEN_MODE = "needle")
 SCREEN_NEEDLE_BASE_DIA = 44  # base width of the screen needle where it meets the bulb (mm)
-N_NEEDLES         = 14
-NEEDLE_BASE_DIA   = 80
-NEEDLE_LEN        = 27
-NEEDLE_TIP_DIA    = 34
-NEEDLE_TIP_FILLET = 2
-NEEDLE_BASE_FILLET= 15
-NEEDLE_MERGE_FILLET = 6
-NEEDLE_EMBED      = 15
-BAND_LOW          = 0.63     # spikes live between these height fractions of the bulb (u = z/c)
+BASE_MODE         = "web"  # "cone" = flared foot per needle; "web" = bases reach out & merge with nearest neighbours
+N_NEEDLES         = 39
+NEEDLE_BASE_DIA   = 40
+NEEDLE_LEN        = 6.5
+NEEDLE_TIP_DIA    = 12.3
+NEEDLE_TIP_FILLET = 0.80
+NEEDLE_BASE_FILLET= 2.7
+NEEDLE_MERGE_FILLET = 0
+NEEDLE_EMBED      = 5.3
+BAND_LOW          = 0.47     # spikes live between these height fractions of the bulb (u = z/c)
 BAND_HIGH         = 1        # 1 = up to the top pole
-NEEDLE_SIZE_START = 1.0      # radial size x of the "lowest" needle (ramps by height to _END)
-NEEDLE_SIZE_END   = 1.0      # radial size x of the "highest" needle
+NEEDLE_SIZE_START = 1      # radial size x of the "lowest" needle (ramps by height to _END)
+NEEDLE_SIZE_END   = 1      # radial size x of the "highest" needle
 # ---- Lloyd's-relaxation controls ----
-RELAX_ITERS       = 40       # relaxation passes (more = more even; 0 = raw random seeding)
-RELAX_SEED        = 7        # RNG seed — change it to get a different organic arrangement
-RELAX_SAMPLES     = 20000    # Monte-Carlo samples used to estimate each Voronoi centroid
+RELAX_ITERS       = 68       # relaxation passes (more = more even; 0 = raw random seeding)
+RELAX_SEED        = 29        # RNG seed — change it to get a different organic arrangement
+RELAX_SAMPLES     = 26600    # Monte-Carlo samples used to estimate each Voronoi centroid
 # ---------------------------------------------
 
 a, c = BULB_RADIUS, BULB_HEIGHT
@@ -188,6 +189,99 @@ def screen_spike():
 
 
 # ============================================================================
+#  BASE_MODE "web": flat-tipped membrane funnels merged by a weighted Voronoi
+# ============================================================================
+# No cone/shaft. Each site becomes a thin SOLID funnel: a small flat top floating
+# `len` above the surface, walls flaring down to this site's cell on the bulb, then
+# tucked under it so a boolean union with the bulb is clean. Cells tile the surface by
+# a WEIGHTED (power-diagram) Voronoi — the boundary between two sites is offset from the
+# midpoint by (wI**2 - wJ**2)/(2*d), so a bigger weight claims a bigger cell and pushes
+# neighbours back. The screen mount is just a site with a large weight + flat top (and a
+# recess cut into it). Same construction as the "web" mode in thistle_lloyd's viewer.
+def _tangent_basis(nx, ny, nz):
+    hx, hy, hz = (0.0, 1.0, 0.0) if abs(ny) < 0.9 else (1.0, 0.0, 0.0)
+    tx, ty, tz = hy * nz - hz * ny, hz * nx - hx * nz, hx * ny - hy * nx
+    tl = sqrt(tx * tx + ty * ty + tz * tz)
+    tx, ty, tz = tx / tl, ty / tl, tz / tl
+    bx, by, bz = ny * tz - nz * ty, nz * tx - nx * tz, nx * ty - ny * tx
+    return (tx, ty, tz), (bx, by, bz)
+
+
+def _web_polygons(surf, K=40):
+    """Pure geometry. For every site (dict x,y,z,nx,ny,nz,topR,reach,weight,len,screen)
+    return a dict with the funnel's tip/base 3-D point loops plus the data needed to cut
+    a screen recess: {tip, base, tipC, n, screen}."""
+    rcurv = min(BULB_RADIUS, BULB_HEIGHT)
+    maxW = max((s["weight"] for s in surf), default=0.0)
+    out = []
+    for i, s in enumerate(surf):
+        Px, Py, Pz = s["x"], s["y"], s["z"]
+        Nx, Ny, Nz = s["nx"], s["ny"], s["nz"]
+        topR = max(0.2, s["topR"])
+        reach, wI, L = s["reach"], s["weight"], s["len"]
+        (Tx, Ty, Tz), (Bx, By, Bz) = _tangent_basis(Nx, Ny, Nz)
+        nb = []                                          # neighbours in the tangent plane
+        for j, q in enumerate(surf):
+            if j == i:
+                continue
+            dx, dy, dz = q["x"] - Px, q["y"] - Py, q["z"] - Pz
+            dn = dx * Nx + dy * Ny + dz * Nz
+            dx -= dn * Nx; dy -= dn * Ny; dz -= dn * Nz
+            wl = sqrt(dx * dx + dy * dy + dz * dz)
+            if wl < 1e-6 or wl > 2 * reach + 2 * maxW:
+                continue
+            nb.append(((dx * Tx + dy * Ty + dz * Tz) / wl,
+                       (dx * Bx + dy * By + dz * Bz) / wl, wl, q["weight"]))
+        radii = []
+        maxR = topR
+        for k in range(K):
+            th = 2.0 * pi * k / K
+            cx, sy = cos(th), sin(th)
+            R = reach
+            for (wx, wy, wl, wj) in nb:
+                ca = cx * wx + sy * wy
+                if ca > 1e-3:
+                    pln = wl / 2.0 + (wI * wI - wj * wj) / (2.0 * wl)   # power-diagram plane
+                    rl = pln / ca
+                    if rl < R:
+                        R = rl
+            if R < topR:
+                R = topR
+            radii.append((cx, sy, R))
+            if R > maxR:
+                maxR = R
+        sink = maxR * maxR / (2.0 * rcurv) + max(1.0, NEEDLE_EMBED)     # dip under the surface for a clean union
+        Tcx, Tcy, Tcz = Px + Nx * L, Py + Ny * L, Pz + Nz * L
+        tip, baseloop = [], []
+        for (cx, sy, R) in radii:
+            dx = Tx * cx + Bx * sy
+            dy = Ty * cx + By * sy
+            dz = Tz * cx + Bz * sy
+            tip.append((Tcx + dx * topR, Tcy + dy * topR, Tcz + dz * topR))
+            baseloop.append((Px + dx * R - Nx * sink, Py + dy * R - Ny * sink, Pz + dz * R - Nz * sink))
+        out.append({"tip": tip, "base": baseloop, "tipC": (Tcx, Tcy, Tcz),
+                    "n": (Nx, Ny, Nz), "screen": s["screen"]})
+    return out
+
+
+def build_web_spikes(surf, K=40):
+    """Turn the pure polygons into build123d solids (loft base->tip; cut the screen recess)."""
+    spikes = []
+    for w in _web_polygons(surf, K):
+        tip_wire = Wire.make_polygon([Vector(*p) for p in w["tip"]], close=True)
+        base_wire = Wire.make_polygon([Vector(*p) for p in w["base"]], close=True)
+        solid = Solid.make_loft([base_wire, tip_wire])
+        scr = w["screen"]
+        if scr is not None and scr["rScr"] > 0.2 and scr["depth"] > 0.1:
+            recess = Plane(origin=w["tipC"], z_dir=w["n"]) * Cylinder(
+                scr["rScr"], scr["depth"], align=(Align.CENTER, Align.CENTER, Align.MAX)
+            )
+            solid = solid - recess
+        spikes.append(solid)
+    return spikes
+
+
+# ============================================================================
 #  Lloyd's relaxation placement  (this is what differs from thistle.py)
 # ============================================================================
 def lloyd_points(n, u_lo, u_hi, iters, seed, samples):
@@ -250,22 +344,41 @@ screen_needle = screen_spike() if screen_on_needle else None
 pts = lloyd_points(N_NEEDLES, BAND_LOW, band_high, RELAX_ITERS, RELAX_SEED, RELAX_SAMPLES)
 screen_i = N_NEEDLES - 1 if screen_on_needle else -1   # topmost point after the sort
 
+base_web = BASE_MODE == "web"
+bf_web = max(0.0, NEEDLE_BASE_FILLET) + max(0.0, NEEDLE_MERGE_FILLET)   # extra cell reach
+rt0 = NEEDLE_TIP_DIA / 2.0
+r_screen = SCREEN_DIA / 2.0 + SCREEN_MARGIN            # screen flat-top radius (its cell weight)
+
 spikes = []
+surf = []                                              # web-mode sites (needles + screen)
 for i, (sx, sy, sz) in enumerate(pts):
     x, y, z = a * sx, a * sy, c * sz                   # unit sphere -> ellipsoid
     # outward ellipsoid normal = gradient (x/a^2, y/a^2, z/c^2)
     nx, ny, nz = x / a**2, y / a**2, z / c**2
     Ln = sqrt(nx * nx + ny * ny + nz * nz)
     nx, ny, nz = nx / Ln, ny / Ln, nz / Ln
-    place = Plane(origin=(x, y, z), z_dir=(nx, ny, nz))  # surface plane; foot buried below
-    if i == screen_i:                                    # this point carries the screen
-        spikes.append(place * screen_needle)
-        continue
-    # per-needle radial size ramp (lowest -> highest)
     frac = i / (N_NEEDLES - 1) if N_NEEDLES > 1 else 0.0
     sc = NEEDLE_SIZE_START + (NEEDLE_SIZE_END - NEEDLE_SIZE_START) * frac
-    part = needle if abs(sc - 1.0) < 1e-9 else scale(needle, by=(sc, sc, 1))
-    spikes.append(place * part)
+    if i == screen_i:                                    # this point carries the screen
+        if base_web:                                     # screen is a web cell: big weight pushes needles out
+            depth = max(0.0, min(SCREEN_DEPTH, SCREEN_NEEDLE_LEN - 1.0))
+            surf.append(dict(x=x, y=y, z=z, nx=nx, ny=ny, nz=nz, topR=r_screen,
+                             reach=SCREEN_NEEDLE_BASE_DIA / 2.0 + bf_web, weight=r_screen,
+                             len=SCREEN_NEEDLE_LEN, screen=dict(rScr=SCREEN_DIA / 2.0, depth=depth)))
+        else:
+            spikes.append(Plane(origin=(x, y, z), z_dir=(nx, ny, nz)) * screen_needle)
+        continue
+    if base_web:                                         # needle is a web cell (built after the loop)
+        surf.append(dict(x=x, y=y, z=z, nx=nx, ny=ny, nz=nz, topR=rt0 * sc,
+                         reach=(NEEDLE_BASE_DIA / 2.0 + bf_web) * sc, weight=rt0 * sc,
+                         len=NEEDLE_LEN, screen=None))
+    else:                                                # classic flared-cone needle
+        place = Plane(origin=(x, y, z), z_dir=(nx, ny, nz))
+        part = needle if abs(sc - 1.0) < 1e-9 else scale(needle, by=(sc, sc, 1))
+        spikes.append(place * part)
+
+if base_web:
+    spikes.extend(build_web_spikes(surf))
 
 model = bulb
 for s in spikes:

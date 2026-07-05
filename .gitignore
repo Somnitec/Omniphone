@@ -13,6 +13,13 @@ secrets.h
 3d-model/.venv/
 **/__pycache__/
 
-# Generated CAD artifacts — regenerable from thistle.py (thistle.stl is ~27 MB).
-3d-model/thistle.stl
-3d-model/thistle.step
+# Generated CAD artifacts — large and regenerable from the .py scripts.
+# Ignore every mesh/solid export under 3d-model/ (thistle, cymatics, mandelbulb,
+# the "saved models" archive, etc.).
+3d-model/**/*.stl
+3d-model/**/*.step
+
+# …except the printed-model reference archive: those files ARE the record of
+# what was physically printed, kept next to their photos + settings. Commit them.
+!3d-model/printed/**/*.stl
+!3d-model/printed/**/*.step

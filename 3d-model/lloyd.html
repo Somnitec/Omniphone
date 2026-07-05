@@ -85,6 +85,7 @@ const DEFS = [
   ["SCREEN_NEEDLE_BASE_DIA","Screen needle base Ø", 5, 90, 0.5, 44],
   ["SCREEN_NEEDLE_IDX","Which needle (from top)", 0, 40, 1, 0],
   ["__g_needle", "Needles"],
+  ["BASE_MODE", "Base style", "select", ["cone", "web"], ["Flared cone (each separate)", "Merged web (reach to neighbours)"], "web"],
   ["N_NEEDLES",        "Count",               8, 300, 1, 144],
   ["NEEDLE_BASE_DIA",  "Base dia (mm)",       1, 40, 0.2, 18],
   ["NEEDLE_LEN",       "Length (mm)",         2, 50, 0.5, 16],
@@ -272,7 +273,9 @@ const keyL = new THREE.DirectionalLight(0xffffff, 0.8); keyL.position.set(1, 1.4
 const fill = new THREE.DirectionalLight(0xbfa8ff, 0.3); fill.position.set(-1, 0.3, -0.6); scene.add(fill);
 
 const mat = new THREE.MeshStandardMaterial({ color: 0x8f5bc4, roughness: 0.55, metalness: 0.05 });
-let bulbMesh = null, needleMesh = null, screenMesh = null;
+// merged-base skirt is an open shell -> draw both sides so it reads as solid material
+const matWeb = mat.clone(); matWeb.side = THREE.DoubleSide;
+let bulbMesh = null, needleMesh = null, screenMesh = null, webMesh = null;
 
 function resize() {
   const w = view.clientWidth, h = view.clientHeight;
@@ -351,7 +354,7 @@ function bulbGeometry() {
   return new THREE.LatheGeometry(pts, 96);
 }
 
-// ---- one needle profile (flat filleted tip + flared filleted foot) ----
+// ---- one needle profile (flat filleted tip + flared filleted foot) — BASE_MODE "cone" ----
 function needleGeometry() {
   const rb = P.NEEDLE_BASE_DIA / 2, rt = P.NEEDLE_TIP_DIA / 2;
   const L = P.NEEDLE_LEN, bf = Math.max(0, P.NEEDLE_BASE_FILLET);
@@ -403,6 +406,97 @@ function screenNeedleGeometry() {
   return new THREE.LatheGeometry(pts, 64);
 }
 
+// ---- membrane "web" spikes (BASE_MODE = "web") -------------------------------
+// In web mode there is NO cone/shaft. Each site is a thin membrane funnel: a small flat
+// tip disc floating at spike height, whose walls flare down and out to this site's cell
+// on the bulb surface, then tuck under it. Cells tile the surface by a WEIGHTED (power-
+// diagram) Voronoi: the boundary between two sites is offset from the midpoint by
+// (wI² − wJ²)/(2·d), so a site with a bigger weight claims a bigger cell and pushes its
+// neighbours back. The screen mount is just another site with a large weight + flat top
+// (and a recess), so it shoulders room for itself out of the surrounding needles. Where
+// two cells share an edge their walls land together and merge. Returns one double-sided
+// BufferGeometry (funnel walls + flat/annular tops) for every site.
+// sites[i] = { pos, nrm, topR (flat-top radius), reach (max cell radius), weight,
+//              len (spike height), screen: null | { rScr, depth } }.
+function buildWeb(sites) {
+  const K = 40;                          // azimuth samples per funnel
+  const a = P.BULB_RADIUS;               // curvature proxy for tucking the base onto the surface
+  const maxW = sites.reduce((mx, s) => Math.max(mx, s.weight), 0);
+  const pos = [], idx = [];
+  let base = 0;
+  const tmpDir = new THREE.Vector3(), tmpV = new THREE.Vector3(), tipC = new THREE.Vector3();
+  const push = (v) => { pos.push(v.x, v.y, v.z); };
+  const ringPt = (Ti, Bi, cx, sy) => tmpDir.copy(Ti).multiplyScalar(cx).addScaledVector(Bi, sy);
+  for (let i = 0; i < sites.length; i++) {
+    const S = sites[i], Pi = S.pos, Ni = S.nrm;
+    const topR = Math.max(0.2, S.topR), reach = S.reach, wI = S.weight, L = S.len;
+    // tangent basis (Ti, Bi) spanning the surface plane at this site
+    const helper = Math.abs(Ni.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0);
+    const Ti = new THREE.Vector3().crossVectors(helper, Ni).normalize();
+    const Bi = new THREE.Vector3().crossVectors(Ni, Ti).normalize();
+    tipC.copy(Pi).addScaledVector(Ni, L);   // flat tip centre, L above the surface point
+    // neighbours (projected onto the tangent plane); skip any too far to ever clip
+    const nb = [];
+    for (let j = 0; j < sites.length; j++) {
+      if (j === i) continue;
+      tmpV.subVectors(sites[j].pos, Pi);
+      tmpV.addScaledVector(Ni, -tmpV.dot(Ni));        // drop the normal component
+      const wl = tmpV.length();
+      if (wl < 1e-6 || wl > 2 * reach + 2 * maxW) continue;
+      nb.push({ wx: tmpV.dot(Ti) / wl, wy: tmpV.dot(Bi) / wl, wl, wj: sites[j].weight });
+    }
+    // per-azimuth cell radius (weighted power-diagram clip)
+    const rad = [], cxs = [], sys = []; let maxR = topR;
+    for (let k = 0; k < K; k++) {
+      const th = 2 * Math.PI * k / K, cx = Math.cos(th), sy = Math.sin(th);
+      let R = reach;
+      for (const m of nb) {
+        const cosang = cx * m.wx + sy * m.wy;
+        if (cosang > 1e-3) {
+          const pln = m.wl / 2 + (wI * wI - m.wj * m.wj) / (2 * m.wl);   // power-diagram plane offset
+          const rl = pln / cosang;
+          if (rl < R) R = rl;
+        }
+      }
+      if (R < topR) R = topR;                                            // never invert the funnel
+      rad.push(R); cxs.push(cx); sys.push(sy); if (R > maxR) maxR = R;
+    }
+    const sink = maxR * maxR / (2 * a) + 0.4;      // tuck the cell base under the curved body
+    const bi = base;
+    let vc = 0;
+    for (let k = 0; k < K; k++) { push(tmpV.copy(tipC).addScaledVector(ringPt(Ti, Bi, cxs[k], sys[k]), topR)); }   // ring 0: flat-top rim
+    for (let k = 0; k < K; k++) { push(tmpV.copy(Pi).addScaledVector(ringPt(Ti, Bi, cxs[k], sys[k]), rad[k]).addScaledVector(Ni, -sink)); } // ring 1: cell base
+    vc = 2 * K;
+    for (let k = 0; k < K; k++) {                  // funnel walls
+      const k2 = (k + 1) % K, t0 = bi + k, t1 = bi + k2, b0 = bi + K + k, b1 = bi + K + k2;
+      idx.push(t0, b0, b1, t0, b1, t1);
+    }
+    if (!S.screen) {                               // plain flat-top disc
+      const c = bi + vc; push(tipC); vc++;
+      for (let k = 0; k < K; k++) idx.push(c, bi + (k + 1) % K, bi + k);
+    } else {                                       // recessed screen top: annulus + recess wall + floor
+      const rScr = Math.max(0.2, Math.min(S.screen.rScr, topR - 0.2)), depth = Math.max(0, S.screen.depth);
+      const inT = bi + vc, inF = inT + K, fc = inF + K;
+      for (let k = 0; k < K; k++) push(tmpV.copy(tipC).addScaledVector(ringPt(Ti, Bi, cxs[k], sys[k]), rScr));                       // inner rim @ top
+      for (let k = 0; k < K; k++) push(tmpV.copy(tipC).addScaledVector(ringPt(Ti, Bi, cxs[k], sys[k]), rScr).addScaledVector(Ni, -depth)); // inner rim @ floor
+      push(tmpV.copy(tipC).addScaledVector(Ni, -depth));                                                                            // recess floor centre
+      vc += 2 * K + 1;
+      for (let k = 0; k < K; k++) {
+        const k2 = (k + 1) % K;
+        idx.push(bi + k, inT + k, inT + k2, bi + k, inT + k2, bi + k2);   // flat-top annulus
+        idx.push(inT + k, inF + k, inF + k2, inT + k, inF + k2, inT + k2); // recess wall
+        idx.push(fc, inF + k2, inF + k);                                   // recess floor
+      }
+    }
+    base += vc;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
 // ---- instanced needles placed on the ellipsoid by Lloyd relaxation, feet sunk in ----
 // In screen-needle mode one needle (counted from the top-most / last relaxed point)
 // becomes the screen mount: its instance is hidden here and its transform handed to
@@ -415,8 +509,13 @@ function buildNeedles() {
   // needle rides the top-most point (last after the sort); idx counts down from there.
   const pts = lloydLayout(n, P.BAND_LOW, bandHigh, P.RELAX_ITERS);
   const screenIdx = screenMode ? n - 1 - Math.min(Math.max(0, Math.round(P.SCREEN_NEEDLE_IDX)), n - 1) : -1;
-  const geo = needleGeometry();
+  const webMode = P.BASE_MODE === "web";
+  const geo = needleGeometry();              // in web mode the solid needle is hidden (scale 0)
   const mesh = new THREE.InstancedMesh(geo, mat, n);
+  // per-needle surface point / normal / radii, gathered for the membrane web spikes
+  const rb0 = P.NEEDLE_BASE_DIA / 2, rt0 = P.NEEDLE_TIP_DIA / 2;
+  const bf = Math.max(0, P.NEEDLE_BASE_FILLET), mf = Math.max(0, P.NEEDLE_MERGE_FILLET);
+  const sites = [];                          // web-mode per-site descriptors (needles + screen)
   const up = new THREE.Vector3(0, 1, 0);
   const pos = new THREE.Vector3(), nrm = new THREE.Vector3(), q = new THREE.Quaternion(),
         s = new THREE.Vector3(1, 1, 1), m = new THREE.Matrix4();
@@ -434,17 +533,30 @@ function buildNeedles() {
     nrm.set(x / a ** 2, y / c ** 2, z / a ** 2).normalize();   // outward ellipsoid normal
     q.setFromUnitVectors(up, nrm);
     pos.set(x, y, z);                          // profile's y=0 sits on the surface
-    if (i === screenIdx) {                      // hide this needle; it becomes the screen mount
-      s.set(0, 0, 0); m.compose(pos, q, s); mesh.setMatrixAt(i, m);
-      screenXform = { pos: pos.clone(), quat: q.clone() };
-      const sl = P.SCREEN_NEEDLE_LEN;
+    if (i === screenIdx) {                      // this needle carries the screen
+      s.set(0, 0, 0); m.compose(pos, q, s); mesh.setMatrixAt(i, m);   // hide the instanced needle
+      const sl = P.SCREEN_NEEDLE_LEN, rScreen = P.SCREEN_DIA / 2 + P.SCREEN_MARGIN;
+      if (webMode) {                            // screen is a web cell: big weight pushes neighbours out
+        const depth = Math.max(0, Math.min(P.SCREEN_DEPTH, sl - 1));
+        sites.push({ pos: pos.clone(), nrm: nrm.clone(), topR: rScreen,
+          reach: P.SCREEN_NEEDLE_BASE_DIA / 2 + bf + mf, weight: rScreen, len: sl,
+          screen: { rScr: P.SCREEN_DIA / 2, depth } });
+      } else {
+        screenXform = { pos: pos.clone(), quat: q.clone() };   // cone mode: separate solid pillar
+      }
       maxR = Math.max(maxR, Math.hypot(x + nrm.x * sl, z + nrm.z * sl),
-        P.SCREEN_DIA / 2 + P.SCREEN_MARGIN, P.SCREEN_NEEDLE_BASE_DIA / 2);
+        rScreen, P.SCREEN_NEEDLE_BASE_DIA / 2);
       const ty = y + nrm.y * sl; minY = Math.min(minY, ty); maxY = Math.max(maxY, ty);
       continue;
     }
     const sc = n > 1 ? s0 + (s1 - s0) * i / (n - 1) : s0;  // ramp first -> last
-    s.set(sc, 1, sc);                          // scale radially (dia), keep length
+    if (webMode) {
+      s.set(0, 0, 0);                          // hide the solid needle; the web spike replaces it
+      sites.push({ pos: pos.clone(), nrm: nrm.clone(), topR: rt0 * sc,
+        reach: (rb0 + bf + mf) * sc, weight: rt0 * sc, len: L, screen: null });
+    } else {
+      s.set(sc, 1, sc);                        // scale radially (dia), keep length
+    }
     m.compose(pos, q, s); mesh.setMatrixAt(i, m);
     // envelope from the needle tip (surface point + normal * length)
     const tx = x + nrm.x * L, ty = y + nrm.y * L, tz = z + nrm.z * L;
@@ -454,6 +566,7 @@ function buildNeedles() {
   mesh.instanceMatrix.needsUpdate = true;
   mesh.userData.env = { maxR, minY, maxY };
   mesh.userData.screenXform = screenXform;
+  mesh.userData.webMesh = webMode ? new THREE.Mesh(buildWeb(sites), matWeb) : null;
   return mesh;
 }
 
@@ -461,8 +574,10 @@ function rebuild() {
   if (bulbMesh) { scene.remove(bulbMesh); bulbMesh.geometry.dispose(); }
   if (needleMesh) { scene.remove(needleMesh); needleMesh.geometry.dispose(); }
   if (screenMesh) { scene.remove(screenMesh); screenMesh.geometry.dispose(); screenMesh = null; }
+  if (webMesh) { scene.remove(webMesh); webMesh.geometry.dispose(); webMesh = null; }
   bulbMesh = new THREE.Mesh(bulbGeometry(), mat); scene.add(bulbMesh);
   needleMesh = buildNeedles(); scene.add(needleMesh);
+  webMesh = needleMesh.userData.webMesh; if (webMesh) scene.add(webMesh);
   const e = needleMesh.userData.env;
   let maxR = e.maxR, minY = e.minY, maxY = e.maxY;
   const xf = needleMesh.userData.screenXform;             // set when a needle is the screen mount
@@ -472,7 +587,8 @@ function rebuild() {
     scene.add(screenMesh);
   }
   document.getElementById("tris").textContent =
-    Math.round(P.N_NEEDLES) + " needles (Lloyd)" + (screenMesh ? " + screen" : "");
+    Math.round(P.N_NEEDLES) + " needles (Lloyd" + (P.BASE_MODE === "web" ? ", web base" : "") + ")"
+    + ((screenMesh || (P.BASE_MODE === "web" && P.SCREEN_MODE === "needle" && P.SCREEN_DIA > 0)) ? " + screen" : "");
   document.getElementById("dims").innerHTML =
     `≈ <b>${(2 * maxR).toFixed(0)} × ${(2 * maxR).toFixed(0)} × ${(maxY - minY).toFixed(0)}</b> mm` +
     `<div class="tgt">target ~ 220 × 220 × 100 mm (footprint = radius + needle length)</div>`;
@@ -496,6 +612,7 @@ SCREEN_MARGIN     = ${f("SCREEN_MARGIN",1)}        # ring of material around the
 SCREEN_DEPTH      = ${f("SCREEN_DEPTH",1)}
 SCREEN_NEEDLE_LEN = ${f("SCREEN_NEEDLE_LEN",1)}       # height of the screen pillar (used when SCREEN_MODE = "needle")
 SCREEN_NEEDLE_BASE_DIA = ${f("SCREEN_NEEDLE_BASE_DIA",1)}  # base width of the screen needle where it meets the bulb (mm)
+BASE_MODE         = "${P.BASE_MODE}"  # "cone" = flared foot per needle; "web" = bases reach out & merge with nearest neighbours
 N_NEEDLES         = ${Math.round(P.N_NEEDLES)}
 NEEDLE_BASE_DIA   = ${f("NEEDLE_BASE_DIA",1)}
 NEEDLE_LEN        = ${f("NEEDLE_LEN",1)}
