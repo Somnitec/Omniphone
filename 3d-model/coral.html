@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Coral — reaction-diffusion enclosure — live preview</title>
+<style>
+  :root { --bg:#0f141a; --panel:#171e26; --ink:#e6eef5; --muted:#93a3b4; --accent:#e8916f; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
+    font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #app { display:flex; height:100%; }
+  #view { flex:1; position:relative; }
+  #panel { width:340px; background:var(--panel); padding:14px 16px; overflow-y:auto;
+    border-left:1px solid #26303b; }
+  h1 { font-size:15px; margin:0 0 2px; }
+  .sub { color:var(--muted); font-size:11px; margin:0 0 12px; }
+  .grp { margin:14px 0 4px; color:var(--accent); font-size:11px; text-transform:uppercase;
+    letter-spacing:.06em; border-bottom:1px solid #26303b; padding-bottom:3px; }
+  .row { display:grid; grid-template-columns:1fr 1.3fr 62px; align-items:center; gap:8px; margin:7px 0; }
+  .row label { color:var(--muted); }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  input[type=number] { width:100%; background:#0b1015; color:var(--ink); border:1px solid #26303b;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif;
+    font-variant-numeric:tabular-nums; text-align:right; }
+  input[type=number]:focus { outline:none; border-color:var(--accent); }
+  select { width:100%; background:#0b1015; color:var(--ink); border:1px solid #26303b;
+    border-radius:5px; padding:4px 6px; font:12px/1 system-ui, sans-serif; }
+  select:focus { outline:none; border-color:var(--accent); }
+  input:disabled, select:disabled { opacity:.35; }
+  #dims { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:8px 10px;
+    font-size:12px; margin:2px 0 4px; }
+  #dims b { color:var(--accent); font-variant-numeric:tabular-nums; }
+  #dims .tgt { color:var(--muted); font-size:11px; }
+  pre { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:10px;
+    font-size:11px; color:#f0cbb9; overflow-x:auto; margin:6px 0; }
+  button { background:var(--accent); color:#2a0f06; border:0; border-radius:6px;
+    padding:7px 10px; font-weight:600; cursor:pointer; width:100%; }
+  button:hover { filter:brightness(1.08); }
+  #hint { position:absolute; left:12px; bottom:10px; color:var(--muted); font-size:11px; }
+  #tris { position:absolute; right:12px; top:10px; color:var(--muted); font-size:11px; }
+  #busy { position:absolute; left:12px; top:10px; color:var(--accent); font-size:11px; display:none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <div id="tris"></div>
+    <div id="busy">simulating reaction-diffusion…</div>
+    <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
+  </div>
+  <div id="panel">
+    <h1>Coral — reaction-diffusion</h1>
+    <p class="sub">A coral body grown by a <b>Gray-Scott</b> field, seeded at the pads so ridges
+      radiate from each one. Same math as <b>coral.py</b> — dial it here, hit
+      <b>Copy params</b>, paste, then <code>python3 coral.py</code> for the STL.</p>
+    <div class="grp">Envelope</div>
+    <div id="dims"></div>
+    <div id="controls"></div>
+    <div class="grp">coral.py params</div>
+    <pre id="params"></pre>
+    <button id="copy">Copy params</button>
+  </div>
+</div>
+
+<script src="vendor/three.min.js"></script>
+<script src="vendor/OrbitControls.js"></script>
+<script>
+// ---- parameter definitions: [key, label, min, max, step, default] ----
+const DEFS = [
+  ["__g_form", "Form"],
+  ["FORM", "Coral form", "select", ["dome", "bulb", "fingers"],
+      ["Brain-coral dome", "Bulb + coral branches", "Finger-coral tubes"], "dome"],
+  ["__g_body", "Body"],
+  ["BODY_RADIUS", "Radius R (mm)",     40, 160, 0.5, 90],
+  ["BODY_HEIGHT", "Height H (mm)",      0, 140, 0.5, 55],
+  ["DOME_PROFILE", "Dome profile", "select", ["ellipse", "parabola", "cosine", "flat"],
+      ["Ellipsoid", "Parabolic", "Bell (cosine)", "Flat plate"], "ellipse"],
+  ["BULB_BOT_CUT", "Bulb base cut",   0.05, 0.6, 0.01, 0.28],
+  ["BASE_HEIGHT",  "Foot height (mm)",   0, 20, 0.5, 4],
+  ["PLATE_HEIGHT", "Fingers plate (mm)", 2, 30, 0.5, 8],
+  ["__g_pads", "Pads (loops)"],
+  ["N_PADS",      "Pad count",         1, 40, 1, 12],
+  ["PAD_DIA",     "Seat dia (mm)",     4, 60, 0.5, 20],
+  ["PAD_HEIGHT",  "Protrusion len (mm)", 0, 50, 0.5, 12],
+  ["PAD_SKIRT",   "Skirt blend (mm)",  0, 40, 0.5, 10],
+  ["PAD_BAND_LO", "Band low (r/R)",    0, 1, 0.01, 0.10],
+  ["PAD_BAND_HI", "Band high (r/R)",   0, 1, 0.01, 0.92],
+  ["PAD_LAYOUT",  "Layout", "select", ["phyllotaxis", "ring"],
+      ["Golden-angle", "Single ring"], "phyllotaxis"],
+  ["PAD_STYLE",   "Pad style (dome)", "select", ["raised", "flat"],
+      ["Raised seats", "Flat — pure brain coral"], "raised"],
+  ["__g_rd", "Reaction-diffusion"],
+  ["RD_AMOUNT",  "Ridge height (mm)",  0, 25, 0.2, 6],
+  ["RD_FEED",    "Feed F",         0.010, 0.090, 0.001, 0.055],
+  ["RD_KILL",    "Kill k",         0.030, 0.075, 0.001, 0.062],
+  ["RD_STEPS",   "Sim steps",       200, 6000, 100, 4000],
+  ["RD_GRID",    "Sim grid",         80, 220, 4, 170],
+  ["RD_NOISE",   "Seed noise",        0, 0.2, 0.005, 0.06],
+  ["RD_SEED",    "RNG seed",          0, 60, 1, 7],
+  ["RD_RECTIFY", "Field", "select", ["signed", "absolute"],
+      ["Ridges + grooves", "All-positive welts"], "signed"],
+  ["__g_ridge", "Ridge shaping (break / wiggle)"],
+  ["RIDGE_BREAK",  "Broken-ness",       0, 1, 0.02, 0],
+  ["RIDGE_LENGTH", "Loop length (mm)",  4, 80, 1, 22],
+  ["RIDGE_WIGGLE", "Wigglyness",        0, 1, 0.02, 0],
+  ["__g_screen", "Screen"],
+  ["SCREEN_MODE", "Mount", "select", ["center", "pad", "none"],
+      ["Recess in top", "Recess in a pad", "None"], "center"],
+  ["SCREEN_DIA",    "Screen dia (mm)",   5, 90, 0.5, 32],
+  ["SCREEN_MARGIN", "Bezel margin (mm)", 0, 20, 0.5, 4],
+  ["SCREEN_DEPTH",  "Recess depth (mm)", 0, 25, 0.5, 6],
+  ["SCREEN_PAD_IDX", "Which pad (idx)",  0, 60, 1, 0],
+  ["__g_mesh", "Mesh"],
+  ["RES_RADIAL",  "Dome rings",     24, 220, 1, 150],
+  ["RES_ANGULAR", "Segments",       24, 360, 1, 220],
+  ["BRANCH_SEG",  "Branch rings",    4, 40, 1, 14],
+];
+const P = {}, STEPS = {};
+DEFS.forEach(d => {
+  if (d[0].startsWith("__")) return;
+  if (d[2] === "select") { P[d[0]] = d[d.length - 1]; return; }
+  P[d[0]] = d[5]; STEPS[d[0]] = d[4];
+});
+
+// ---- build sliders + editable number fields (dropdowns for the "select" rows) ----
+const controls = document.getElementById("controls");
+const widgets = {};
+DEFS.forEach(d => {
+  if (d[0].startsWith("__g")) {
+    const h = document.createElement("div"); h.className = "grp"; h.textContent = d[1];
+    controls.appendChild(h); return;
+  }
+  if (d[2] === "select") {
+    const [key, label, , vals, labels, def] = d;
+    const row = document.createElement("div"); row.className = "row";
+    row.style.gridTemplateColumns = "1fr 2fr";
+    const lab = document.createElement("label"); lab.textContent = label;
+    const sel = document.createElement("select");
+    vals.forEach((v, i) => {
+      const op = document.createElement("option"); op.value = v; op.textContent = labels[i]; sel.appendChild(op);
+    });
+    sel.value = def;
+    sel.addEventListener("change", () => { P[key] = sel.value; schedule(); });
+    row.append(lab, sel); controls.appendChild(row);
+    widgets[key] = { row, sel }; return;
+  }
+  const [key, label, min, max, step, def] = d;
+  const row = document.createElement("div"); row.className = "row";
+  const lab = document.createElement("label"); lab.textContent = label;
+  const rng = document.createElement("input");
+  rng.type = "range"; rng.min = min; rng.max = max; rng.step = step; rng.value = def;
+  const num = document.createElement("input");
+  num.type = "number"; num.step = step; num.value = def;
+  rng.addEventListener("input", () => { P[key] = parseFloat(rng.value); num.value = fmt(key, P[key]); schedule(); });
+  num.addEventListener("input", () => {
+    const v = parseFloat(num.value); if (Number.isNaN(v)) return;
+    P[key] = v; rng.value = v; schedule();
+  });
+  row.append(lab, rng, num); controls.appendChild(row);
+  widgets[key] = { row, rng, num };
+});
+function fmt(key, v) { return STEPS[key] < 1 ? +v.toFixed(STEPS[key] < 0.01 ? 3 : 2) : Math.round(v); }
+
+// grey out controls that don't apply to the current form
+function syncEnabled() {
+  const set = (k, on) => { const w = widgets[k]; if (!w) return;
+    [w.rng, w.num, w.sel].forEach(e => { if (e) e.disabled = !on; }); w.row.style.opacity = on ? 1 : 0.4; };
+  const form = P.FORM;
+  set("DOME_PROFILE", form === "dome");
+  set("BULB_BOT_CUT", form === "bulb");
+  set("PLATE_HEIGHT", form === "fingers");
+  set("RES_RADIAL", form === "dome");
+  set("BRANCH_SEG", form !== "dome");
+  set("PAD_STYLE", form === "dome");
+  const domeFlat = form === "dome" && P.PAD_STYLE === "flat";
+  set("PAD_HEIGHT", !domeFlat);
+  set("PAD_DIA", !domeFlat);
+  set("PAD_SKIRT", !domeFlat);
+  const screenPad = P.SCREEN_MODE === "pad";
+  set("SCREEN_PAD_IDX", screenPad);
+}
+
+function smoothstep(t) { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); }
+
+// ================= pad layout (disc coords in [-1,1]) — identical to coral.py =================
+function padDiscPositions() {
+  const n = Math.round(P.N_PADS), out = [], lo = P.PAD_BAND_LO, hi = P.PAD_BAND_HI;
+  if (P.PAD_LAYOUT === "ring") {
+    const u = 0.5 * (lo + hi);
+    for (let i = 0; i < n; i++) { const th = 2 * Math.PI * i / Math.max(1, n); out.push([u * Math.cos(th), u * Math.sin(th)]); }
+  } else {
+    const ga = Math.PI * (3 - Math.sqrt(5));
+    for (let i = 0; i < n; i++) {
+      let u = Math.sqrt((i + 0.5) / n); u = lo + (hi - lo) * u;
+      const th = i * ga; out.push([u * Math.cos(th), u * Math.sin(th)]);
+    }
+  }
+  return out;
+}
+
+// ================= Gray-Scott reaction-diffusion (CPU, cached) =================
+// Mirrors coral.py.run_reaction_diffusion. Only re-run when an RD-affecting param
+// changes; geometry sliders reuse the cached field so orbiting/tuning stays smooth.
+function mulberry32(a) { return function () {
+  a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a);
+  t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+let rdField = null, rdN = 0, rdSig = "";
+function rdSignature() {
+  return [P.N_PADS, P.PAD_BAND_LO, P.PAD_BAND_HI, P.PAD_LAYOUT,
+    P.RD_FEED, P.RD_KILL, Math.round(P.RD_STEPS), Math.round(P.RD_GRID),
+    Math.round(P.RD_SEED), P.RD_NOISE].join(",");
+}
+function runRD() {
+  const N = Math.round(P.RD_GRID); rdN = N;
+  const U = new Float32Array(N * N).fill(1), V = new Float32Array(N * N);
+  const stamp = (cx, cy, rad, uv, vv) => {
+    const gi = (cx * 0.5 + 0.5) * (N - 1), gj = (cy * 0.5 + 0.5) * (N - 1), r = Math.max(1, Math.round(rad * N));
+    for (let j = Math.max(0, (gj | 0) - r); j < Math.min(N, (gj | 0) + r + 1); j++)
+      for (let i = Math.max(0, (gi | 0) - r); i < Math.min(N, (gi | 0) + r + 1); i++) { U[j * N + i] = uv; V[j * N + i] = vv; }
+  };
+  padDiscPositions().forEach(([sx, sy]) => stamp(sx, sy, 0.045, 0.25, 0.5));
+  if (P.RD_NOISE > 0) {
+    const rng = mulberry32((Math.round(P.RD_SEED) * 2654435761) >>> 0 || 1);
+    for (let i = 0; i < N * N; i++) V[i] = Math.min(1, V[i] + P.RD_NOISE * rng());
+  }
+  const Du = 0.16, Dv = 0.08, F = P.RD_FEED, k = P.RD_KILL;
+  let cU = U, cV = V, Un = new Float32Array(N * N), Vn = new Float32Array(N * N);
+  const steps = Math.round(P.RD_STEPS);
+  for (let s = 0; s < steps; s++) {
+    for (let r = 0; r < N; r++) {
+      const rm = (r - 1 + N) % N, rp = (r + 1) % N, ro = r * N, rom = rm * N, rop = rp * N;
+      for (let c = 0; c < N; c++) {
+        const cm = c === 0 ? N - 1 : c - 1, cp = c === N - 1 ? 0 : c + 1, i = ro + c;
+        const u = cU[i], v = cV[i];
+        const lapU = cU[ro + cm] + cU[ro + cp] + cU[rom + c] + cU[rop + c] - 4 * u;
+        const lapV = cV[ro + cm] + cV[ro + cp] + cV[rom + c] + cV[rop + c] - 4 * v;
+        const uvv = u * v * v;
+        Un[i] = u + (Du * lapU - uvv + F * (1 - u));
+        Vn[i] = v + (Dv * lapV + uvv - (F + k) * v);
+      }
+    }
+    const tU = cU; cU = Un; Un = tU;               // ping-pong the buffers
+    const tV = cV; cV = Vn; Vn = tV;
+  }
+  const Vfin = cV;
+  let vmin = Infinity, vmax = -Infinity;
+  for (let i = 0; i < N * N; i++) { if (Vfin[i] < vmin) vmin = Vfin[i]; if (Vfin[i] > vmax) vmax = Vfin[i]; }
+  const span = (vmax - vmin) < 1e-9 ? 1 : (vmax - vmin);
+  rdField = new Float32Array(N * N);
+  for (let i = 0; i < N * N; i++) rdField[i] = (Vfin[i] - vmin) / span;
+}
+function sampleRD(x, y) {
+  const N = rdN, f = rdField;
+  const col = Math.min(N - 1, Math.max(0, (x * 0.5 + 0.5) * (N - 1)));
+  const row = Math.min(N - 1, Math.max(0, (y * 0.5 + 0.5) * (N - 1)));
+  const c0 = col | 0, r0 = row | 0, c1 = Math.min(N - 1, c0 + 1), r1 = Math.min(N - 1, r0 + 1);
+  const fc = col - c0, fr = row - r0;
+  return f[r0 * N + c0] * (1 - fc) * (1 - fr) + f[r0 * N + c1] * fc * (1 - fr)
+    + f[r1 * N + c0] * (1 - fc) * fr + f[r1 * N + c1] * fc * fr;
+}
+
+// broken-ridge + wiggle post-process (mirrors coral.py.vnoise / apply_ridge_effects)
+function vnoise(x, y) {
+  const s = Math.sin(x * 1.00 + 1.7) * Math.cos(y * 1.13 - 0.9)
+    + Math.sin(x * 1.97 - 2.3) * Math.cos(y * 2.09 + 1.4) * 0.6
+    + Math.sin(x * 3.71 + 0.5) * Math.cos(y * 3.31 - 1.9) * 0.35;
+  return 0.5 + 0.5 * s / 1.95;
+}
+function coralAt(x, y) {
+  const brk = P.RIDGE_BREAK, wig = P.RIDGE_WIGGLE;
+  if (brk <= 0 && wig <= 0) return sampleRD(x, y);
+  const R = P.BODY_RADIUS, twoPi = 2 * Math.PI;
+  if (wig > 0) {
+    const gw = twoPi * R / Math.max(1e-6, P.RIDGE_LENGTH * 1.6);
+    x += 0.18 * wig * (vnoise(x * gw + 11.2, y * gw + 3.7) - 0.5);
+    y += 0.18 * wig * (vnoise(x * gw - 5.1, y * gw + 8.9) - 0.5);
+  }
+  let v = sampleRD(x, y);
+  if (brk > 0) {
+    const gb = twoPi * R / Math.max(1e-6, P.RIDGE_LENGTH), thr = 0.35 + 0.45 * brk;
+    const n = vnoise(x * gb + 2.3, y * gb - 1.1);
+    v *= smoothstep((n - (thr - 0.15)) / 0.30);
+  }
+  return v;
+}
+
+// ================= three.js scene =================
+const view = document.getElementById("view");
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+view.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0f141a);
+const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 3000);
+camera.position.set(150, 130, 200);
+const controlsO = new THREE.OrbitControls(camera, renderer.domElement);
+controlsO.enableDamping = true;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x20303a, 0.9));
+const keyL = new THREE.DirectionalLight(0xffffff, 0.85); keyL.position.set(0.8, 1.4, 0.7); scene.add(keyL);
+const fill = new THREE.DirectionalLight(0xffd9c2, 0.3); fill.position.set(-1, 0.4, -0.6); scene.add(fill);
+const mat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.62, metalness: 0.05 });
+let mesh = null;
+const C_LOW = new THREE.Color(0x5c2b25), C_HIGH = new THREE.Color(0xffc0a6);  // groove -> ridge/pad
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h); camera.aspect = w / h; camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+
+// ================= geometry builders (mirror coral.py) =================
+let POS, IDX, MAXR, MAXZ;
+function beginMesh() { POS = []; IDX = []; MAXR = 0; MAXZ = 0; }
+function pushXYZ(x, y, z) {                         // model (z-up) -> three.js (Y-up)
+  const i = POS.length / 3; POS.push(x, z, y);
+  const rr = Math.hypot(x, y); if (rr > MAXR) MAXR = rr; if (z > MAXZ) MAXZ = z;
+  return i;
+}
+function quad(a, b, na) { for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(a + i, a + i1, b + i1, a + i, b + i1, b + i); } }
+
+function domeProfile(u, R, H) {
+  if (P.DOME_PROFILE === "ellipse")  return H * Math.sqrt(Math.max(0, 1 - u * u));
+  if (P.DOME_PROFILE === "parabola") return H * (1 - u * u);
+  if (P.DOME_PROFILE === "cosine")   return H * Math.cos(0.5 * Math.PI * u);
+  return 0;
+}
+
+function buildDome(pads) {
+  const R = P.BODY_RADIUS, C = P.BODY_HEIGHT, na = Math.round(P.RES_ANGULAR), nr = Math.round(P.RES_RADIAL);
+  const rect = P.RD_RECTIFY === "absolute", delta = 1e-3 * R;
+  const thetas = []; for (let i = 0; i < na; i++) thetas.push(2 * Math.PI * i / na);
+  const scrPad = ((Math.round(P.SCREEN_PAD_IDX) % Math.max(1, pads.length)) + pads.length) % Math.max(1, pads.length);
+  const rScrPad = P.SCREEN_DIA / 2;
+
+  const raised = P.PAD_STYLE === "raised";
+  function padField(x, y) {
+    let padH = 0, seat = 0, recess = 0; const rs = P.PAD_DIA / 2, rf = P.PAD_DIA / 2 + P.PAD_SKIRT;
+    for (let idx = 0; idx < pads.length; idx++) {
+      const d = Math.hypot(x - pads[idx][0], y - pads[idx][1]) * R;
+      if (d >= rf) continue;
+      if (raised) {
+        const pl = d <= rs ? 1 : (1 - smoothstep((d - rs) / (rf - rs)));
+        if (P.PAD_HEIGHT * pl > padH) padH = P.PAD_HEIGHT * pl;
+        if (d <= rs) seat = 1;
+      }
+      if (P.SCREEN_MODE === "pad" && idx === scrPad && d <= rScrPad) { recess = -P.SCREEN_DEPTH; seat = 1; }
+    }
+    return [padH + recess, seat];
+  }
+  function fieldMM(u, theta) {
+    const x = u * Math.cos(theta), y = u * Math.sin(theta);
+    const [padH, seat] = padField(x, y), v = coralAt(x, y);
+    const ripple = rect ? P.RD_AMOUNT * v : P.RD_AMOUNT * (v - 0.5) * 2;
+    return padH + ripple * (1 - seat);
+  }
+  function surf(r, theta) {
+    const u = r / R, disp = fieldMM(u, theta), h0 = domeProfile(u, R, C);
+    const dh = (domeProfile((r + delta) / R, R, C) - domeProfile((r - delta) / R, R, C)) / (2 * delta), inv = 1 / Math.hypot(1, dh);
+    const rr = r + disp * (-dh) * inv; let z = P.BASE_HEIGHT + h0 + disp * inv; if (z < 0.4) z = 0.4;
+    return [rr * Math.cos(theta), rr * Math.sin(theta), z];
+  }
+  const dispRing = r => thetas.map(t => surf(r, t));
+  const flatRing = (r, z) => thetas.map(t => [r * Math.cos(t), r * Math.sin(t), z]);
+
+  const screen = (P.SCREEN_DIA > 0 && P.SCREEN_MODE === "center") ? "center" : "none";
+  const rBez = Math.min(P.SCREEN_DIA / 2 + P.SCREEN_MARGIN, R * 0.9);
+  const rScrC = Math.min(P.SCREEN_DIA / 2, rBez - 0.5);
+  const shelfZ = P.BASE_HEIGHT + domeProfile(rBez / R, R, C), floorZ = Math.max(P.BASE_HEIGHT + 0.5, shelfZ - P.SCREEN_DEPTH);
+
+  let centerPt, stations;
+  if (screen === "center") {
+    centerPt = [0, 0, floorZ];
+    stations = [flatRing(rScrC, floorZ), flatRing(rScrC, shelfZ), flatRing(rBez, shelfZ), dispRing(rBez)];
+    for (let j = 1; j <= nr; j++) { const r = R * j / nr; if (r > rBez + 1e-6) stations.push(dispRing(r)); }
+    const last = stations[stations.length - 1][0];
+    if (Math.hypot(last[0], last[1]) < R - 1e-6) stations.push(dispRing(R));
+  } else {
+    centerPt = surf(0, 0); stations = [];
+    for (let j = 1; j <= nr; j++) stations.push(dispRing(R * j / nr));
+  }
+
+  const centerIdx = pushXYZ(centerPt[0], centerPt[1], centerPt[2]);
+  const ringBases = stations.map(st => { const b = POS.length / 3; for (const v of st) pushXYZ(v[0], v[1], v[2]); return b; });
+  const b0 = ringBases[0];
+  for (let i = 0; i < na; i++) IDX.push(centerIdx, b0 + i, b0 + (i + 1) % na);
+  for (let kk = 0; kk < ringBases.length - 1; kk++) quad(ringBases[kk], ringBases[kk + 1], na);
+  const rim = ringBases[ringBases.length - 1], botBase = POS.length / 3;
+  for (let i = 0; i < na; i++) { const kk = rim + i; POS.push(POS[kk * 3], 0, POS[kk * 3 + 2]); }
+  const bc = POS.length / 3; POS.push(0, 0, 0);
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(rim + i, botBase + i, botBase + i1, rim + i, botBase + i1, rim + i1); }
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(bc, botBase + i1, botBase + i); }
+}
+
+// wavy branch tube (shared by bulb + fingers) — mirrors coral.py.add_wavy_branch
+function addWavyBranch(origin, zdir, padXY, recess) {
+  const na = Math.round(P.RES_ANGULAR), nl = Math.round(P.BRANCH_SEG), L = P.PAD_HEIGHT;
+  const rBase = P.PAD_DIA / 2 + P.PAD_SKIRT * 0.5, rTop = P.PAD_DIA / 2, sink = 5.0;
+  const [px, py] = padXY, discR = rBase / P.BODY_RADIUS, rScr = P.SCREEN_DIA / 2;
+  // frame
+  let L0 = Math.hypot(zdir[0], zdir[1], zdir[2]) || 1; const Z = [zdir[0] / L0, zdir[1] / L0, zdir[2] / L0];
+  const ax = Math.abs(Z[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
+  let Ux = ax[1] * Z[2] - ax[2] * Z[1], Uy = ax[2] * Z[0] - ax[0] * Z[2], Uz = ax[0] * Z[1] - ax[1] * Z[0];
+  const ul = Math.hypot(Ux, Uy, Uz) || 1; const U = [Ux / ul, Uy / ul, Uz / ul];
+  const Vv = [Z[1] * U[2] - Z[2] * U[1], Z[2] * U[0] - Z[0] * U[2], Z[0] * U[1] - Z[1] * U[0]];
+  const wob = (th, t) => {
+    const q = discR * (0.35 + 0.65 * t), v = coralAt(px + q * Math.cos(th), py + q * Math.sin(th));
+    const amp = P.RD_AMOUNT * (1 - smoothstep((t - 0.75) / 0.25));
+    return amp * (v - 0.5) * 2;
+  };
+  const ptAt = (h, rad, wavy, t, th) => {
+    const rr = rad + (wavy ? wob(th, t) : 0), cx = rr * Math.cos(th), sy = rr * Math.sin(th);
+    return [origin[0] + cx * U[0] + sy * Vv[0] + h * Z[0],
+            origin[1] + cx * U[1] + sy * Vv[1] + h * Z[1],
+            origin[2] + cx * U[2] + sy * Vv[2] + h * Z[2]];
+  };
+  const ringPush = (h, rad, wavy, t) => { const b = POS.length / 3; for (let i = 0; i < na; i++) { const p = ptAt(h, rad, wavy, t, 2 * Math.PI * i / na); pushXYZ(p[0], p[1], p[2]); } return b; };
+
+  const stations = [[-sink, rBase + 2, false, 0], [0, rBase, true, 0]];
+  for (let l = 1; l < nl; l++) { const t = l / nl; stations.push([L * t, rBase + (rTop - rBase) * smoothstep(t), true, t]); }
+  stations.push([L, rTop, false, 1]);
+  const bases = stations.map(s => ringPush(s[0], s[1], s[2], s[3]));
+  for (let kk = 0; kk < bases.length - 1; kk++) quad(bases[kk], bases[kk + 1], na);
+
+  const bcen = pushXYZ(origin[0] - sink * Z[0], origin[1] - sink * Z[1], origin[2] - sink * Z[2]);
+  const bb = bases[0];
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(bcen, bb + i1, bb + i); }
+
+  const top = bases[bases.length - 1];
+  if (recess && rScr > 0.5) {
+    const depth = Math.min(P.SCREEN_DEPTH, L - 1);
+    const ib = POS.length / 3;
+    for (let i = 0; i < na; i++) { const p = ptAt(L, rScr, false, 1, 2 * Math.PI * i / na); pushXYZ(p[0], p[1], p[2]); }
+    const fb = POS.length / 3;
+    for (let i = 0; i < na; i++) { const p = ptAt(L - depth, rScr, false, 1, 2 * Math.PI * i / na); pushXYZ(p[0], p[1], p[2]); }
+    quad(top, ib, na); quad(ib, fb, na);
+    const fcen = pushXYZ(origin[0] + (L - depth) * Z[0], origin[1] + (L - depth) * Z[1], origin[2] + (L - depth) * Z[2]);
+    for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(fcen, fb + i, fb + i1); }
+  } else {
+    const tcen = pushXYZ(origin[0] + L * Z[0], origin[1] + L * Z[1], origin[2] + L * Z[2]);
+    for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(tcen, top + i, top + i1); }
+  }
+}
+
+function buildBulb(pads) {
+  const a = P.BODY_RADIUS, c = P.BODY_HEIGHT, na = Math.round(P.RES_ANGULAR), nlat = Math.max(24, Math.round(P.RES_RADIAL / 3));
+  const zCut = -c * (1 - 2 * P.BULB_BOT_CUT);
+  const latLo = Math.acos(Math.max(-1, Math.min(1, zCut / c)));
+  const dispAt = (nx, ny) => 0.45 * P.RD_AMOUNT * (coralAt(nx, ny) - 0.5) * 2;
+
+  const rings = [];
+  for (let j = 0; j <= nlat; j++) {
+    const phi = latLo * j / nlat, ring = [];
+    for (let i = 0; i < na; i++) {
+      const th = 2 * Math.PI * i / na;
+      const sx = Math.sin(phi) * Math.cos(th), sy = Math.sin(phi) * Math.sin(th), sz = Math.cos(phi);
+      const x = a * sx, y = a * sy, z = c * sz;
+      let nx = x / (a * a), ny = y / (a * a), nz = z / (c * c); const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+      const d = dispAt(sx, sy);
+      ring.push([x + nx * d, y + ny * d, P.BASE_HEIGHT + (z - zCut) + nz * d]);
+    }
+    rings.push(ring);
+  }
+  const pole = [0, 0, P.BASE_HEIGHT + (c - zCut) + dispAt(0, 0)];
+  const poleIdx = pushXYZ(pole[0], pole[1], pole[2]);
+  const ringBases = rings.map(ring => { const b = POS.length / 3; for (const v of ring) pushXYZ(v[0], v[1], v[2]); return b; });
+  const b0 = ringBases[0];
+  for (let i = 0; i < na; i++) IDX.push(poleIdx, b0 + i, b0 + (i + 1) % na);
+  for (let kk = 0; kk < ringBases.length - 1; kk++) quad(ringBases[kk], ringBases[kk + 1], na);
+  const rim = ringBases[ringBases.length - 1], botBase = POS.length / 3;
+  for (let i = 0; i < na; i++) { const kk = rim + i; POS.push(POS[kk * 3], 0, POS[kk * 3 + 2]); }
+  const bc = POS.length / 3; POS.push(0, 0, 0);
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(rim + i, botBase + i, botBase + i1, rim + i, botBase + i1, rim + i1); }
+  for (let i = 0; i < na; i++) { const i1 = (i + 1) % na; IDX.push(bc, botBase + i1, botBase + i); }
+
+  const lo = P.PAD_BAND_LO, hi = P.PAD_BAND_HI, scrPad = ((Math.round(P.SCREEN_PAD_IDX) % Math.max(1, pads.length)) + pads.length) % Math.max(1, pads.length);
+  pads.forEach(([px, py], idx) => {
+    const rr = Math.hypot(px, py), u = hi - (hi - lo) * rr, phi = latLo * (1 - u), th = Math.atan2(py, px);
+    const sx = Math.sin(phi) * Math.cos(th), sy = Math.sin(phi) * Math.sin(th), sz = Math.cos(phi);
+    const x = a * sx, y = a * sy, z = c * sz;
+    let nx = x / (a * a), ny = y / (a * a), nz = z / (c * c); const nl = Math.hypot(nx, ny, nz) || 1; nx /= nl; ny /= nl; nz /= nl;
+    addWavyBranch([x, y, P.BASE_HEIGHT + (z - zCut)], [nx, ny, nz], [px, py], P.SCREEN_MODE === "pad" && idx === scrPad);
+  });
+}
+
+function buildFingers(pads) {
+  const R = P.BODY_RADIUS, na = Math.round(P.RES_ANGULAR), ph = P.PLATE_HEIGHT;
+  const topc = pushXYZ(0, 0, ph); const tb = POS.length / 3;
+  for (let i = 0; i < na; i++) { const th = 2 * Math.PI * i / na; pushXYZ(R * Math.cos(th), R * Math.sin(th), ph); }
+  const botc = pushXYZ(0, 0, 0); const bb = POS.length / 3;
+  for (let i = 0; i < na; i++) { const th = 2 * Math.PI * i / na; pushXYZ(R * Math.cos(th), R * Math.sin(th), 0); }
+  for (let i = 0; i < na; i++) {
+    const i1 = (i + 1) % na;
+    IDX.push(topc, tb + i, tb + i1);
+    IDX.push(botc, bb + i1, bb + i);
+    IDX.push(tb + i, bb + i, bb + i1, tb + i, bb + i1, tb + i1);
+  }
+  const scrPad = ((Math.round(P.SCREEN_PAD_IDX) % Math.max(1, pads.length)) + pads.length) % Math.max(1, pads.length);
+  pads.forEach(([px, py], idx) => addWavyBranch([px * R, py * R, ph], [0, 0, 1], [px, py], P.SCREEN_MODE === "pad" && idx === scrPad));
+}
+
+function buildGeometry() {
+  beginMesh();
+  const pads = padDiscPositions();
+  if (P.FORM === "bulb") buildBulb(pads);
+  else if (P.FORM === "fingers") buildFingers(pads);
+  else buildDome(pads);
+
+  // colour by height (groove -> ridge/pad), computed once over the final buffer
+  const n = POS.length / 3; const col = new Float32Array(POS.length);
+  let zmin = Infinity, zmax = -Infinity;
+  for (let i = 0; i < n; i++) { const z = POS[i * 3 + 1]; if (z < zmin) zmin = z; if (z > zmax) zmax = z; }
+  const span = (zmax - zmin) < 1e-6 ? 1 : (zmax - zmin); const tmp = new THREE.Color();
+  for (let i = 0; i < n; i++) { const t = (POS[i * 3 + 1] - zmin) / span; tmp.copy(C_LOW).lerp(C_HIGH, Math.pow(t, 0.8)); col[i * 3] = tmp.r; col[i * 3 + 1] = tmp.g; col[i * 3 + 2] = tmp.b; }
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(new Float32Array(POS), 3));
+  g.setAttribute("color", new THREE.BufferAttribute(col, 3));
+  g.setIndex(new THREE.BufferAttribute(new Uint32Array(IDX), 1));
+  g.computeVertexNormals();
+  g.userData = { maxR: MAXR, maxZ: MAXZ, tris: IDX.length / 3 };
+  return g;
+}
+
+// ================= rebuild / scheduling =================
+function rebuildMesh() {
+  if (mesh) { scene.remove(mesh); mesh.geometry.dispose(); }
+  const g = buildGeometry();
+  mesh = new THREE.Mesh(g, mat); scene.add(mesh);
+  const { maxR, maxZ, tris } = g.userData;
+  document.getElementById("tris").textContent =
+    `${P.FORM} · ${Math.round(P.N_PADS)} pads · ${tris.toLocaleString()} tris`;
+  const formTxt = P.FORM === "dome" ? "one watertight mesh"
+    : "body + overlapping branch solids (slicer unions on import)";
+  document.getElementById("dims").innerHTML =
+    `≈ <b>${(2 * maxR).toFixed(0)} × ${(2 * maxR).toFixed(0)} × ${maxZ.toFixed(0)}</b> mm` +
+    ` · <b>${Math.round(P.N_PADS)}</b> pads` +
+    `<div class="tgt">${P.FORM} coral · F=${(+P.RD_FEED).toFixed(3)} k=${(+P.RD_KILL).toFixed(3)} · ${formTxt}</div>`;
+  updateParams();
+}
+
+let pending = null;
+function schedule() {
+  syncEnabled();
+  const sig = rdSignature();
+  if (sig !== rdSig || !rdField) {                 // RD-affecting change -> re-simulate (debounced)
+    rdSig = sig;
+    document.getElementById("busy").style.display = "block";
+    clearTimeout(pending);
+    pending = setTimeout(() => { runRD(); document.getElementById("busy").style.display = "none"; rebuildMesh(); }, 60);
+  } else {
+    rebuildMesh();                                  // cheap: geometry only, reuse cached field
+  }
+}
+
+function updateParams() {
+  const f = (k, d) => { const v = P[k]; return Number.isInteger(v) && d === undefined ? v : (+v).toFixed(d === undefined ? 1 : d); };
+  document.getElementById("params").textContent =
+`FORM          = "${P.FORM}"
+BODY_RADIUS   = ${f("BODY_RADIUS")}
+BODY_HEIGHT   = ${f("BODY_HEIGHT")}
+DOME_PROFILE  = "${P.DOME_PROFILE}"
+BULB_BOT_CUT  = ${f("BULB_BOT_CUT", 2)}
+BASE_HEIGHT   = ${f("BASE_HEIGHT")}
+PLATE_HEIGHT  = ${f("PLATE_HEIGHT")}
+N_PADS        = ${Math.round(P.N_PADS)}
+PAD_DIA       = ${f("PAD_DIA")}
+PAD_HEIGHT    = ${f("PAD_HEIGHT")}
+PAD_SKIRT     = ${f("PAD_SKIRT")}
+PAD_BAND_LO   = ${f("PAD_BAND_LO", 2)}
+PAD_BAND_HI   = ${f("PAD_BAND_HI", 2)}
+PAD_LAYOUT    = "${P.PAD_LAYOUT}"
+PAD_STYLE     = "${P.PAD_STYLE}"
+RD_AMOUNT     = ${f("RD_AMOUNT")}
+RD_FEED       = ${f("RD_FEED", 3)}
+RD_KILL       = ${f("RD_KILL", 3)}
+RD_STEPS      = ${Math.round(P.RD_STEPS)}
+RD_GRID       = ${Math.round(P.RD_GRID)}
+RD_SEED_AT_PADS = True
+RD_NOISE      = ${f("RD_NOISE", 3)}
+RD_SEED       = ${Math.round(P.RD_SEED)}
+RD_RECTIFY    = "${P.RD_RECTIFY}"
+RIDGE_BREAK   = ${f("RIDGE_BREAK", 2)}
+RIDGE_LENGTH  = ${Math.round(P.RIDGE_LENGTH)}
+RIDGE_WIGGLE  = ${f("RIDGE_WIGGLE", 2)}
+SCREEN_MODE   = "${P.SCREEN_MODE}"
+SCREEN_DIA    = ${f("SCREEN_DIA")}
+SCREEN_MARGIN = ${f("SCREEN_MARGIN")}
+SCREEN_DEPTH  = ${f("SCREEN_DEPTH")}
+SCREEN_PAD_IDX = ${Math.round(P.SCREEN_PAD_IDX)}
+RES_RADIAL    = ${Math.round(P.RES_RADIAL)}
+RES_ANGULAR   = ${Math.round(P.RES_ANGULAR)}
+BRANCH_SEG    = ${Math.round(P.BRANCH_SEG)}`;
+}
+
+document.getElementById("copy").addEventListener("click", () => {
+  navigator.clipboard.writeText(document.getElementById("params").textContent);
+});
+
+resize(); syncEnabled(); runRD(); rebuildMesh();
+(function loop() { requestAnimationFrame(loop); controlsO.update(); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>

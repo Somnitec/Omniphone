@@ -10,12 +10,14 @@ parameter block:
 | [`thistle_lloyd.py`](thistle_lloyd.py) | [`viewer_lloyd.html`](viewer_lloyd.html) | same bulb, needles spread by **Lloyd's relaxation** (organic teasel/burr) |
 | [`cymatics.py`](cymatics.py) | [`cymatics.html`](cymatics.html) | dome sculpted by a cymatics standing-wave field |
 | [`mandelbulb.py`](mandelbulb.py) | [`mandelbulb.html`](mandelbulb.html) | simplified power-8 Mandelbulb fractal solid |
+| [`coral.py`](coral.py) | [`coral.html`](coral.html) | coral body grown by a **reaction-diffusion** field; three forms |
 
 > **Note (venv):** the local `.venv` was built against Python 3.13; a system
 > upgrade to 3.14 orphaned it, so `build123d` (used by `thistle.py` and
 > `thistle_lloyd.py`) currently won't import. Rebuild it with `./setup.sh`
 > before running those two. `cymatics.py` and `mandelbulb.py` are pure standard
-> library and run under any `python3` with no venv.
+> library and run under any `python3` with no venv. `coral.py` needs only
+> **numpy** (already installed system-wide — `python3 coral.py`, no venv).
 
 ---
 
@@ -180,3 +182,64 @@ Key parameters:
 
 Dial `POWER` / `ITERATIONS` / `LEVEL` live in [`mandelbulb.html`](mandelbulb.html)
 (a raymarched preview), then **Copy params** into the script.
+
+---
+
+## coral — reaction-diffusion enclosure
+
+[`coral.py`](coral.py) grows a coral-like body from a **Gray-Scott
+reaction-diffusion** field — the same maths behind the labyrinthine ridges of
+brain coral and Turing patterns generally. The simulation is **seeded at the pad
+centres**, so the wavy ridges radiate out from every pad (RD *grows* the
+protrusions) while the same field displaces the whole surface into coral grooves
+(RD *textures* it). Each of the `N_PADS` "loops" is a raised, **flat-topped seat**
+sized for copper tape.
+
+```bash
+cd 3d-model
+python3 coral.py               # -> coral.stl   (~2 s; needs numpy, no venv)
+```
+
+Output is a mesh STL — import into Fusion 360 / FreeCAD as a **mesh body** (like
+`mandelbulb.stl`) and shell it / add connector cutouts there. A STEP path can
+follow later.
+
+**Three forms**, all from the one script — set `FORM`:
+
+| `FORM` | Look |
+|--------|------|
+| `"dome"` (default) | a low **brain-coral dome** carpeted in ridges; pads are flat seats raised on the bumps. One continuous watertight mesh. |
+| `"bulb"` | an ellipsoid body (thistle-style) with `N_PADS` **wavy coral branches** = pads. |
+| `"fingers"` | a base plate with `N_PADS` **upright wavy finger-coral tubes** = pads. |
+
+For `bulb` / `fingers` the branches are separate watertight solids that *overlap*
+the body (the slicer / Fusion unions them on import) — the same trick as thistle's
+needles.
+
+Key parameters:
+
+- **Pads ("loops")** — `N_PADS` (= your electrode count), `PAD_DIA` (flat seat
+  size), `PAD_HEIGHT` (how far each protrusion rises — the "length"), `PAD_SKIRT`
+  (blend back to the body), `PAD_BAND_LO` / `PAD_BAND_HI` (keep pads off the
+  rim/pole), `PAD_LAYOUT` (`"phyllotaxis"` or `"ring"`).
+- **`PAD_STYLE`** (dome only) — `"raised"` puts a flat copper seat on a bump per
+  pad; `"flat"` gives a **pure brain-coral dome** with no raised seats — the
+  surface is unbroken ridges and the pads are just marked positions (RD still
+  seeds them, so you get N organized coral zones — stick the copper on the ridges).
+- **Coral pattern** — `RD_AMOUNT` (ridge height in mm; `0` = smooth body + bare
+  pads), `RD_FEED` / `RD_KILL` (the pattern character — presets in the script
+  header: coral/worms/spots/maze/mitosis), `RD_STEPS` / `RD_GRID` (sim
+  quality/speed), `RD_SEED` (reshuffle into a different coral), `RD_RECTIFY`
+  (`"signed"` ridges+grooves vs `"absolute"` all-positive welts).
+- **Broken ridges** — `RIDGE_BREAK` (`0` = continuous coral, higher chops the
+  ridges into segments), `RIDGE_LENGTH` (approximate segment / loop length in mm),
+  `RIDGE_WIGGLE` (`0` = smooth, higher makes the ridges meander / wiggle). These
+  are a cheap post-process on the field — in the viewer they update instantly
+  without re-running the simulation, and they apply to all three forms.
+- **Body** — `BODY_RADIUS`, `BODY_HEIGHT`, `DOME_PROFILE` (`ellipse` / `parabola`
+  / `cosine` / `flat`), `BULB_BOT_CUT` (bulb stand), `PLATE_HEIGHT` (fingers base).
+- **Screen** — `SCREEN_MODE = "center"` (round recess in the top), `"pad"` (recess
+  carved into pad `SCREEN_PAD_IDX`), or `"none"`; `SCREEN_DIA` / `SCREEN_MARGIN` /
+  `SCREEN_DEPTH`.
+
+Print is a **solid** — hollow it after import, like the others.
