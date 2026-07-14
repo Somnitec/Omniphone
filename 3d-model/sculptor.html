@@ -119,13 +119,16 @@ function rrect2(x,y,hx,hy,rr){ const qx=Math.abs(x)-(hx-rr),qy=Math.abs(y)-(hy-r
 // ---- cached reaction-diffusion (brain coral) — ported from v1 ----
 let _rd={sig:'',f:null,N:0};
 function getRD(P){
-  const sig=[P.RES,P.SEED,P.RD_FEED,P.RD_KILL,P.RD_STEPS].join(',');
+  const sig=[P.RES,P.SEED,P.N_PADS,P.RD_FEED,P.RD_KILL,P.RD_STEPS].join(',');
   if(sig===_rd.sig&&_rd.f) return _rd;
   const N=Math.max(60,Math.min(150,Math.round(P.RES*2)));
   const U=new Float32Array(N*N).fill(1),V=new Float32Array(N*N);
   const rnd=rng(P.SEED);
   for(let i=0;i<N*N;i++) V[i]=0.06*rnd();
-  for(let s=0;s<6;s++){ const cx=(0.3+0.4*rnd())*N|0,cy=(0.3+0.4*rnd())*N|0;
+  // nucleate one blob per pad (golden-angle phyllotaxis on the disc) so lump count tracks N_PADS
+  const nSeed=Math.max(1,Math.round(P.N_PADS)),ga=Math.PI*(3-Math.sqrt(5)),lo=0.10,hi=0.92;
+  for(let i=0;i<nSeed;i++){ const u=lo+(hi-lo)*Math.sqrt((i+0.5)/nSeed),th=i*ga;
+    const cx=((0.5*u*Math.cos(th)+0.5)*N)|0,cy=((0.5*u*Math.sin(th)+0.5)*N)|0;
     for(let yy=-3;yy<=3;yy++)for(let xx=-3;xx<=3;xx++){ const r=(cy+yy)*N+(cx+xx); if(r>=0&&r<N*N){V[r]=0.5;U[r]=0.25;} } }
   const F=P.RD_FEED,k=P.RD_KILL; let cU=U,cV=V,Un=new Float32Array(N*N),Vn=new Float32Array(N*N);
   for(let s=0;s<Math.round(P.RD_STEPS);s++){

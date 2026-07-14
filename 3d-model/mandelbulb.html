@@ -75,9 +75,11 @@ const DEFS = [
   ["LEVEL",      "Iso level",     "fslider", 0.5, 6, 0.05, 3.6],   // max re-clamped to ITERATIONS
   ["__g_mesh", "Mesh / output"],
   ["GRID",         "Grid (samples/axis)", "inum", 32, 256, 1, 96],
-  ["BOX",          "Sample box (half)",   "fnum", 0.5, 3, 0.05, 1.25],
+  ["BOX",          "Sample box (half)",   "fnum", 0.5, 6, 0.05, 1.25],   // must clear the iso-surface's natural radius on every side, or it gets clipped flat by the box wall
   ["SIZE_MM",      "Size (mm span)",      "inum", 20, 400, 1, 120],
-  ["BASE_FLATTEN", "Base flatten",        "fslider", 0, 0.8, 0.01, 0.0],
+  ["FLATTEN_ALL",  "Flatten (all)",       "fslider", 0.3, 1, 0.01, 1.0],
+  ["FLATTEN_BASE", "Flatten (base extra)", "fslider", 0.1, 1, 0.01, 1.0],
+  ["FLATTEN_ZONE", "Flatten base reach",  "fslider", 0.05, 1, 0.01, 0.35],
   ["SMOOTH_ITERS", "Smooth passes",       "islider", 0, 3, 1, 1],
   ["__g_screen", "Screen"],
   ["SCREEN_MODE",  "Mount", "select", ["none", "bulb"], ["None", "Recess in top lobe"], "none"],
@@ -167,7 +169,7 @@ view.appendChild(renderer.domElement);
 
 // --- perspective orbit camera (shared by raymarch rays + the screen marker) ---
 const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 100);
-camera.up.set(0, 0, 1);                 // fractal Z is "up" (matches BASE_FLATTEN plane)
+camera.up.set(0, 0, 1);                 // fractal Z is "up" (matches the flatten axis)
 camera.position.set(2.7, 2.3, 2.0);
 const controlsO = new THREE.OrbitControls(camera, renderer.domElement);
 controlsO.enableDamping = true;
@@ -190,7 +192,10 @@ const uniforms = {
   uIterations: { value: 6.0 },
   uBailout:    { value: 2.0 },
   uInflate:    { value: 0.07 },
-  uZcut:       { value: -1.25 },
+  uBox:         { value: 1.25 },
+  uFlattenAll:  { value: 1.0 },
+  uFlattenBase: { value: 1.0 },
+  uFlattenZone: { value: 0.35 },
   uBound:      { value: 1.5 },
 };
 
@@ -204,7 +209,8 @@ const FRAG = `
   varying vec2 vNdc;
   uniform vec3 uCamPos, uCamRight, uCamUp, uCamFwd;
   uniform float uTanFov, uAspect;
-  uniform float uPower, uIterations, uBailout, uInflate, uZcut, uBound;
+  uniform float uPower, uIterations, uBailout, uInflate, uBound;
+  uniform float uBox, uFlattenAll, uFlattenBase, uFlattenZone;
 
   const int   MAX_ITER  = 12;
   const int   MAX_STEPS = 140;
@@ -232,11 +238,23 @@ const FRAG = `
     return 0.5 * log(max(r, 1e-9)) * r / max(dr, 1e-9);
   }
 
-  // scene = inflated bulb  ∩  half-space { z >= uZcut }   (BASE_FLATTEN cut plane)
+  // scene = inflated bulb, vertically squashed (mirrors squash_verts() in mandelbulb.py):
+  // uFlattenAll compresses the whole ball toward z=0; within uFlattenZone of the
+  // bottom that blends (smoothstep) into the stronger uFlattenBase squash. Warping
+  // the query point and re-scaling the returned distance by the same factor keeps
+  // this a conservative (never-overestimating) distance bound, so the raymarch
+  // stays stable. No cutting plane -> one continuous skin, same as the .py mesh.
+  float squashAt(float z) {
+    float ramp = max(1e-4, uBox * uFlattenZone);
+    float t = clamp(-z / ramp, 0.0, 1.0);
+    t = t * t * (3.0 - 2.0 * t);
+    float bottom = mix(1.0, uFlattenBase, t);
+    return max(0.05, uFlattenAll * bottom);
+  }
   float mapScene(vec3 p) {
-    float db = bulbDE(p) - uInflate;
-    float dp = uZcut - p.z;
-    return max(db, dp);
+    float s = (p.z <= 0.0) ? squashAt(p.z) : uFlattenAll;
+    vec3 q = vec3(p.x, p.y, p.z / s);
+    return (bulbDE(q) - uInflate) * s;
   }
 
   vec3 calcNormal(vec3 p) {
@@ -340,7 +358,10 @@ function syncUniforms() {
   uniforms.uBailout.value    = P.BAILOUT;
   const inflate = Math.max(0, (P.ITERATIONS - P.LEVEL)) * 0.03;   // lower LEVEL -> puffier
   uniforms.uInflate.value    = inflate;
-  uniforms.uZcut.value       = -P.BOX + P.BASE_FLATTEN * 2.0 * P.BOX;
+  uniforms.uBox.value          = P.BOX;
+  uniforms.uFlattenAll.value   = P.FLATTEN_ALL;
+  uniforms.uFlattenBase.value  = P.FLATTEN_BASE;
+  uniforms.uFlattenZone.value  = P.FLATTEN_ZONE;
   uniforms.uBound.value      = Math.max(1.4, P.BOX + inflate + 0.2);
 
   // screen marker
@@ -395,7 +416,9 @@ function updateParams() {
     line("GRID",         Math.round(P.GRID)),
     line("BOX",          pyf(P.BOX)),
     line("SIZE_MM",      Math.round(P.SIZE_MM)),
-    line("BASE_FLATTEN", pyf(P.BASE_FLATTEN)),
+    line("FLATTEN_ALL",  pyf(P.FLATTEN_ALL)),
+    line("FLATTEN_BASE", pyf(P.FLATTEN_BASE)),
+    line("FLATTEN_ZONE", pyf(P.FLATTEN_ZONE)),
     line("SMOOTH_ITERS", Math.round(P.SMOOTH_ITERS)),
     line("SCREEN_MODE",  '"' + P.SCREEN_MODE + '"'),
     line("SCREEN_DIA",   pynum(P.SCREEN_DIA)),

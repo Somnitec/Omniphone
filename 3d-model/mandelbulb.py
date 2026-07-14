@@ -32,19 +32,55 @@ from array import array
 HERE = os.path.dirname(os.path.abspath(__file__))  # write next to this script
 
 # ---------- PARAMETERS (edit these — or dial them in mandelbulb.html and paste) ----------
-POWER        = 6
-ITERATIONS   = 5
-BAILOUT      = 2.0
-LEVEL        = 4.8
+POWER        = 7
+ITERATIONS   = 3
+BAILOUT      = 1.95
+LEVEL        = 1.8
 GRID         = 96
-BOX          = 1.25
+BOX          = 3.0          # must clear the natural iso-surface radius (~2.7 at these POWER/LEVEL) on every side
 SIZE_MM      = 120
-BASE_FLATTEN = 0.54
+FLATTEN_ALL  = 0.78        # uniform vertical squash of the whole ball (1 = untouched sphere)
+FLATTEN_BASE = 0.4         # extra squash at the very bottom pole, on top of FLATTEN_ALL (1 = no extra squash)
+FLATTEN_ZONE = 0.35        # fraction of the lower hemisphere's height over which that extra squash ramps in
+                            #   (small = only the base itself flattens; 1.0 = ramps across the whole lower half)
 SMOOTH_ITERS = 2
 SCREEN_MODE  = "none"
-SCREEN_DIA   = 0
-SCREEN_DEPTH = 8
+SCREEN_DIA   = 34.5
+SCREEN_DEPTH = 0
 # ----------------------------------------------------------------------------------------
+
+
+def squash_verts(verts):
+    """Post-process vertical squash: FLATTEN_ALL contracts every vertex toward the
+    mesh's own mid-height; within FLATTEN_ZONE of the lowest point, that contraction
+    blends smoothly (smoothstep, zero slope at both ends of the ramp) into the
+    stronger FLATTEN_BASE squash, so just the base flattens more than the rest.
+    Keeping the ramp confined near the pole (rather than spanning the whole lower
+    hemisphere) matters — a sphere's cross-section stays wide for most of its
+    height and only tapers sharply near the pole, so ramping the extra squash in
+    too early over-compresses those still-wide cross-sections into a thin band
+    and reads as a flat shelf, the same "plate" look this is meant to avoid.
+    Applied to the already-extracted, already-watertight mesh (not the sampled
+    field) — moving vertices can only change their positions, never the mesh's
+    edge topology, so this can't open up the surface the way clipping the field
+    with a cutting plane did. The result is one continuous skin (no base-plate
+    seam), so overlays like the RD coral ridge field can wrap all the way around
+    it."""
+    if not verts:
+        return
+    zmin = min(v[2] for v in verts)
+    zmax = max(v[2] for v in verts)
+    zmid = 0.5 * (zmin + zmax)
+    ramp = max(1e-9, (zmid - zmin) * FLATTEN_ZONE)
+    for v in verts:
+        z = v[2]
+        if z >= zmid:
+            s = FLATTEN_ALL
+        else:
+            t = min(1.0, (zmid - z) / ramp)          # 0 above the ramp zone -> 1 at the lowest point
+            t = t * t * (3.0 - 2.0 * t)               # smoothstep
+            s = FLATTEN_ALL * (1.0 - (1.0 - FLATTEN_BASE) * t)
+        v[2] = zmid + (z - zmid) * s
 
 
 # ---------- shared mandelbulb math (identical in mandelbulb.html) ----------
@@ -142,7 +178,6 @@ def build():
     # 1) sample the scalar field on the full N^3 grid (this is the slow part) --------
     field = array('d', bytes(8 * N * N * N))
     def IDX(i, j, k): return (k * N + j) * N + i
-    zcut = -BOX + BASE_FLATTEN * (2.0 * BOX)      # flat-base cutting plane (fractal units)
     for k in range(N):
         zc = -BOX + k * h
         base = k * N * N
@@ -151,10 +186,7 @@ def build():
             row = base + j * N
             for i in range(N):
                 xc = -BOX + i * h
-                if BASE_FLATTEN > 0.0 and zc < zcut:
-                    field[row + i] = -1.0e9       # force "outside" below the base plane
-                else:
-                    field[row + i] = escape_field(xc, yc, zc)
+                field[row + i] = escape_field(xc, yc, zc)
         if k % 8 == 0 or k == N - 1:
             print(f"  field {k + 1}/{N} slabs")
 
@@ -226,11 +258,14 @@ def build():
         if k % 8 == 0 or k == N - 2:
             print(f"  mesh  {k + 1}/{N - 1} slabs  ({len(tris)} tris)")
 
-    # 3) optional Laplacian smoothing (softens the tetra faceting) ------------------
+    # 3) vertical squash (continuous — see squash_verts docstring) ------------------
+    squash_verts(verts)
+
+    # 4) optional Laplacian smoothing (softens the tetra faceting) ------------------
     for _ in range(int(SMOOTH_ITERS)):
         smooth(verts, tris)
 
-    # 4) scale to millimetres --------------------------------------------------------
+    # 5) scale to millimetres --------------------------------------------------------
     scale_to_mm(verts)
     return verts, tris
 

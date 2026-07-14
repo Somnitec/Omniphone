@@ -212,7 +212,14 @@ Key parameters:
 - **`GRID`** — samples per axis (64 quick, 96 good, 128+ fine/slow). Sets mesh
   density.
 - **`SIZE_MM`** — scales the finished solid so its largest span is this many mm.
-- **`BASE_FLATTEN`** — slice a fraction off the bottom for a flat, standable base.
+- **`BOX`** — half-width of the sampling box (fractal units). Must clear the
+  iso-surface's natural radius on every side, or the shape gets clipped flat by
+  the box wall.
+- **`FLATTEN_ALL`** / **`FLATTEN_BASE`** / **`FLATTEN_ZONE`** — vertical squash for
+  a standable base, applied as a smooth post-process warp (not a cutting plane) so
+  the surface stays one continuous skin. `FLATTEN_ALL` compresses the whole shape;
+  `FLATTEN_BASE` adds extra compression near the bottom pole, ramped in over the
+  bottom `FLATTEN_ZONE` fraction of the lower half.
 - **`SMOOTH_ITERS`** — Laplacian smoothing passes to soften the tetra faceting.
 - **Screen** — `SCREEN_MODE = "bulb"` + `SCREEN_DIA` / `SCREEN_DEPTH` carves a round
   flat recess into the top lobe (voxel-resolution — raise `GRID` for crisper walls,
