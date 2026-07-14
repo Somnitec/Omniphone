@@ -3,15 +3,15 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Omniphone Sculptor — organic-shape playground</title>
+<title>Omniphone Sculptor 2 — generative enclosure tool</title>
 <style>
-  :root { --bg:#0f141a; --panel:#171e26; --ink:#e6eef5; --muted:#93a3b4; --accent:#e8916f; }
+  :root { --bg:#0f141a; --panel:#171e26; --ink:#e6eef5; --muted:#93a3b4; --accent:#e8916f; --warn:#ff6b6b; }
   * { box-sizing: border-box; }
   html, body { margin:0; height:100%; background:var(--bg); color:var(--ink);
     font:13px/1.4 system-ui, sans-serif; overflow:hidden; }
   #app { display:flex; height:100%; }
   #view { flex:1; position:relative; }
-  #panel { width:340px; background:var(--panel); padding:14px 16px; overflow-y:auto; border-left:1px solid #26303b; }
+  #panel { width:360px; background:var(--panel); padding:14px 16px; overflow-y:auto; border-left:1px solid #26303b; }
   h1 { font-size:15px; margin:0 0 2px; }
   .sub { color:var(--muted); font-size:11px; margin:0 0 12px; }
   .grp { margin:14px 0 4px; color:var(--accent); font-size:11px; text-transform:uppercase; letter-spacing:.06em; border-bottom:1px solid #26303b; padding-bottom:3px; }
@@ -25,7 +25,8 @@
   #dims { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:8px 10px; font-size:12px; margin:2px 0 4px; }
   #dims b { color:var(--accent); font-variant-numeric:tabular-nums; }
   #dims .tgt { color:var(--muted); font-size:11px; }
-  pre { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:10px; font-size:11px; color:#f0cbb9; overflow-x:auto; margin:6px 0; }
+  #dims .bad { color:var(--warn); font-weight:600; }
+  pre { background:#0b1015; border:1px solid #26303b; border-radius:6px; padding:10px; font-size:11px; color:#f0cbb9; overflow-x:auto; margin:6px 0; max-height:180px; }
   button { background:var(--accent); color:#2a0f06; border:0; border-radius:6px; padding:7px 10px; font-weight:600; cursor:pointer; width:100%; }
   button:hover { filter:brightness(1.08); }
   #hint { position:absolute; left:12px; bottom:10px; color:var(--muted); font-size:11px; }
@@ -41,27 +42,25 @@
     <div id="hint">drag to orbit · scroll to zoom · right-drag to pan</div>
   </div>
   <div id="panel">
-    <h1>Omniphone Sculptor</h1>
-    <p class="sub">A playground of natural-shape algorithms for Omniphone enclosures — every shape here
-      is one connected shell you can wall-hollow for electronics, with distinct convex touch pads.
-      Pick a shape, play; shared knobs persist across shapes, shape-specific ones swap in.</p>
-    <div class="grp">Favorites</div>
+    <h1>Omniphone Sculptor 2</h1>
+    <p class="sub">One implicit-surface pipeline: pick a body, layer an exact number of touch pads on it,
+      subtract the 1.28″ round screen seat + USB-C / jack ports, hollow to a shell and cut a flat open bottom.
+      Every seed prints a unique instrument.</p>
+    <div class="grp">Presets &amp; favourites</div>
     <div class="row sel"><label>Saved</label><select id="favSel"></select></div>
     <div class="row" style="grid-template-columns:1fr auto;gap:6px;">
       <button id="favSave">★ Save current</button>
       <button id="favDel" style="background:#3a4653;color:#e6eef5;padding:7px 12px;width:auto;">🗑</button>
     </div>
-    <div class="grp">Shape</div>
-    <div class="row sel"><label>Shape</label><select id="shapeSel"></select></div>
-    <div class="grp">Envelope</div>
+    <div class="grp">Body</div>
+    <div class="row sel"><label>Algorithm</label><select id="shapeSel"></select></div>
+    <div id="modeparams"></div>
     <div id="dims"></div>
     <div id="shared"></div>
-    <div class="grp" id="mhdr">Shape controls</div>
-    <div id="modeparams"></div>
     <div class="grp">Params</div>
     <pre id="params"></pre>
-    <button id="copy">Copy params</button>
-    <button id="stl" style="margin-top:6px;background:#3a4653;color:#e6eef5;">⬇ Download STL</button>
+    <button id="copy">Copy params (JSON)</button>
+    <button id="stl" style="margin-top:6px;background:#3a4653;color:#e6eef5;">⬇ Download STL (high-res rebuild)</button>
   </div>
 </div>
 
@@ -69,427 +68,604 @@
 <script src="vendor/OrbitControls.js"></script>
 <script>
 // ============================================================================
-//  Shared mesh toolkit — every builder works in MODEL space (z up, base ~ z=0)
-//  and appends to flat arrays pos=[x,y,z,...], idx=[i,j,k,...]. The framework
-//  swaps to three.js Y-up, centres, adds the screen, and computes normals.
+//  Omniphone Sculptor 2 — everything is a scalar field f(x,y,z) in mm,
+//  f > 0 means solid. The composer unions body + overlay + pads, adds the
+//  screen platform, hollows to a shell, carves screen seat / pad recesses /
+//  ports, and always intersects with the z>0 half-space (flat bottom).
+//  Marching tetrahedra + vertex weld + Taubin smoothing → preview & STL.
 // ============================================================================
-const H = (() => {
-  const TAU = Math.PI * 2;
-  function sphere(pos, idx, cx, cy, cz, r, na, nl, disp) {
-    const north = pos.length / 3; pos.push(cx, cy, cz + r + (disp ? disp(0, 0) : 0));
-    const rings = [];
-    for (let i = 1; i < nl; i++) { const phi = Math.PI * i / nl, sp = Math.sin(phi), cp = Math.cos(phi); const b = pos.length / 3;
-      for (let j = 0; j < na; j++) { const th = TAU * j / na, rr = r + (disp ? disp(th, phi) : 0);
-        pos.push(cx + rr * sp * Math.cos(th), cy + rr * sp * Math.sin(th), cz + rr * cp); } rings.push(b); }
-    const south = pos.length / 3; pos.push(cx, cy, cz - r - (disp ? disp(0, Math.PI) : 0));
-    const b0 = rings[0]; for (let j = 0; j < na; j++) idx.push(north, b0 + j, b0 + (j + 1) % na);
-    for (let k = 0; k < rings.length - 1; k++) { const a = rings[k], b = rings[k + 1]; for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(a + j, a + j1, b + j1, a + j, b + j1, b + j); } }
-    const bl = rings[rings.length - 1]; for (let j = 0; j < na; j++) idx.push(south, bl + (j + 1) % na, bl + j);
+const TAU = Math.PI * 2;
+const clamp = (v,a,b)=> v<a?a:(v>b?b:v);
+
+// deterministic rng (mulberry32)
+function rng(seed){ let a=(Math.round(seed)*2654435761)>>>0||1;
+  return ()=>{ a=a+0x6D2B79F5|0; let t=Math.imul(a^a>>>15,1|a); t=t+Math.imul(t^t>>>7,61|t)^t; return ((t^t>>>14)>>>0)/4294967296; }; }
+
+// smooth max: union of two solid-positive fields with fillet radius ~k (mm)
+function smax(a,b,k){ if(k<=0.001) return Math.max(a,b);
+  const h=clamp(0.5+0.5*(a-b)/k,0,1); return b+(a-b)*h+k*h*(1-h); }
+
+// value noise (ported from v1 so cactus/mushroom keep their look)
+function vnoise(x,y){ const s=Math.sin(x*1.0+1.7)*Math.cos(y*1.13-0.9)+Math.sin(x*1.97-2.3)*Math.cos(y*2.09+1.4)*0.6+Math.sin(x*3.71+0.5)*Math.cos(y*3.31-1.9)*0.35; return 0.5+0.5*s/1.95; }
+
+// fibonacci directions on the unit sphere / on a z-band
+function fib(n){ const out=[],ga=Math.PI*(3-Math.sqrt(5));
+  for(let i=0;i<n;i++){ const z=1-2*(i+0.5)/n,r=Math.sqrt(Math.max(0,1-z*z)),th=i*ga;
+    out.push([r*Math.cos(th),r*Math.sin(th),z]); } return out; }
+function fibBand(n,lo,hi){ const out=[],ga=Math.PI*(3-Math.sqrt(5));
+  for(let i=0;i<n;i++){ const u=hi-(hi-lo)*((i+0.5)/n),r=Math.sqrt(Math.max(0,1-u*u)),th=i*ga;
+    out.push([r*Math.cos(th),r*Math.sin(th),u]); } return out; }
+
+// orthonormal frame perpendicular to unit n
+function frame(n){ const a=Math.abs(n[2])<0.9?[0,0,1]:[1,0,0];
+  let ux=a[1]*n[2]-a[2]*n[1],uy=a[2]*n[0]-a[0]*n[2],uz=a[0]*n[1]-a[1]*n[0];
+  const l=Math.hypot(ux,uy,uz)||1; const u=[ux/l,uy/l,uz/l];
+  return [u,[n[1]*u[2]-n[2]*u[1],n[2]*u[0]-n[0]*u[2],n[0]*u[1]-n[1]*u[0]]]; }
+
+// ---- solid-positive primitives (approx metric, mm) ----
+function ellip(px,py,pz,cx,cy,cz,rx,ry,rz){        // iq's ellipsoid bound
+  const x=(px-cx)/rx,y=(py-cy)/ry,z=(pz-cz)/rz;
+  const k0=Math.hypot(x,y,z),k1=Math.hypot(x/rx,y/ry,z/rz)||1e-9;
+  return -(k0*(k0-1))/k1; }
+function sphereF(px,py,pz,cx,cy,cz,r){ return r-Math.hypot(px-cx,py-cy,pz-cz); }
+// capped cone in local (radial rad, axial al): radius r1 at al=0 → r2 at al=L
+function coneF(rad,al,r1,r2,L){ const cs=L/Math.hypot(L,r1-r2);
+  return Math.min(al, L-al, ((r1+(r2-r1)*clamp(al/L,0,1))-rad)*cs); }
+function cylF(rad,al,r,a0,a1){ return Math.min(r-rad, al-a0, a1-al); }
+// 2D rounded-rect, solid-positive (half extents hx,hy, corner radius rr)
+function rrect2(x,y,hx,hy,rr){ const qx=Math.abs(x)-(hx-rr),qy=Math.abs(y)-(hy-rr);
+  return (qx>0&&qy>0) ? rr-Math.hypot(qx,qy) : rr-Math.max(qx,qy); }
+
+// ---- cached reaction-diffusion (brain coral) — ported from v1 ----
+let _rd={sig:'',f:null,N:0};
+function getRD(P){
+  const sig=[P.RES,P.SEED,P.RD_FEED,P.RD_KILL,P.RD_STEPS].join(',');
+  if(sig===_rd.sig&&_rd.f) return _rd;
+  const N=Math.max(60,Math.min(150,Math.round(P.RES*2)));
+  const U=new Float32Array(N*N).fill(1),V=new Float32Array(N*N);
+  const rnd=rng(P.SEED);
+  for(let i=0;i<N*N;i++) V[i]=0.06*rnd();
+  for(let s=0;s<6;s++){ const cx=(0.3+0.4*rnd())*N|0,cy=(0.3+0.4*rnd())*N|0;
+    for(let yy=-3;yy<=3;yy++)for(let xx=-3;xx<=3;xx++){ const r=(cy+yy)*N+(cx+xx); if(r>=0&&r<N*N){V[r]=0.5;U[r]=0.25;} } }
+  const F=P.RD_FEED,k=P.RD_KILL; let cU=U,cV=V,Un=new Float32Array(N*N),Vn=new Float32Array(N*N);
+  for(let s=0;s<Math.round(P.RD_STEPS);s++){
+    for(let r=0;r<N;r++){ const rm=(r-1+N)%N,rp=(r+1)%N,ro=r*N,rom=rm*N,rop=rp*N;
+      for(let c=0;c<N;c++){ const cm=c===0?N-1:c-1,cp=c===N-1?0:c+1,i=ro+c;
+        const u=cU[i],v=cV[i],lu=cU[ro+cm]+cU[ro+cp]+cU[rom+c]+cU[rop+c]-4*u,lv=cV[ro+cm]+cV[ro+cp]+cV[rom+c]+cV[rop+c]-4*v,uvv=u*v*v;
+        Un[i]=u+(0.16*lu-uvv+F*(1-u)); Vn[i]=v+(0.08*lv+uvv-(F+k)*v); } }
+    const tU=cU;cU=Un;Un=tU; const tV=cV;cV=Vn;Vn=tV; }
+  let mn=1e9,mx=-1e9; for(let i=0;i<N*N;i++){ if(cV[i]<mn)mn=cV[i]; if(cV[i]>mx)mx=cV[i]; }
+  const sp=(mx-mn)||1,f=new Float32Array(N*N); for(let i=0;i<N*N;i++) f[i]=(cV[i]-mn)/sp;
+  _rd={sig,f,N}; return _rd; }
+function sampleRD(rd,x,y){ const N=rd.N,f=rd.f;
+  const c=clamp((x*0.5+0.5)*(N-1),0,N-1),r=clamp((y*0.5+0.5)*(N-1),0,N-1);
+  const c0=c|0,r0=r|0,c1=Math.min(N-1,c0+1),r1=Math.min(N-1,r0+1),fc=c-c0,fr=r-r0;
+  return f[r0*N+c0]*(1-fc)*(1-fr)+f[r0*N+c1]*fc*(1-fr)+f[r1*N+c0]*(1-fc)*fr+f[r1*N+c1]*fc*fr; }
+
+// ---- cached Bessel radial profile (cymatics) ----
+function besselJ(m,x){ const K=48,h=Math.PI/K; let s=0;
+  for(let i=0;i<=K;i++){ const t=i*h,w=(i===0||i===K)?1:(i%2?4:2); s+=w*Math.cos(m*t-x*Math.sin(t)); }
+  return (s*h/3)/Math.PI; }
+function besselZero(m,n){ let px=1e-4,pf=besselJ(m,px),found=0,x=px;
+  while(x<200){ x+=0.05; const f=besselJ(m,x);
+    if(pf===0||(f<0)!==(pf<0)){ let lo=px,hi=x,flo=pf;
+      for(let k=0;k<50;k++){ const mid=0.5*(lo+hi),fm=besselJ(m,mid); if((fm<0)===(flo<0)){lo=mid;flo=fm;}else hi=mid; }
+      if(++found===n) return 0.5*(lo+hi); } px=x;pf=f; } return x; }
+let _cy={sig:'',prof:null,m:0};
+function getCy(P){ const m=Math.round(P.CY_M),n=Math.round(P.CY_N),sig=m+','+n;
+  if(sig===_cy.sig) return _cy;
+  const z1=besselZero(m,n),prof=new Float32Array(257); let peak=1e-9;
+  for(let i=0;i<257;i++){ prof[i]=besselJ(m,z1*i/256); peak=Math.max(peak,Math.abs(prof[i])); }
+  for(let i=0;i<257;i++) prof[i]/=peak;
+  _cy={sig,prof,m}; return _cy; }
+
+// nearest-2 dot products (voronoi cells / morel texture)
+function nearest2(d,pts){ let b1=-2,b2=-2;
+  for(const q of pts){ const dot=d[0]*q[0]+d[1]*q[1]+d[2]*q[2]; if(dot>b1){b2=b1;b1=dot;} else if(dot>b2)b2=dot; }
+  return [b1,b2]; }
+
+// ============================================================================
+//  BODY REGISTRY — each body: {key,label,params,mk(P)=>{f(x,y,z), zc, zTop}}
+//  f is solid-positive in body space (bottom at z≈0, before base-trim shift).
+//  zc = ray-march centre height, zTop = generous height bound for the grid.
+// ============================================================================
+const BODIES = [
+{ key:'blob', label:'Blob (plain dome — pads make the shape)', params:[],
+  mk(P){ const R=P.SIZE/2,Hh=P.HEIGHT,cz=Hh*0.5,rz=Hh*0.52;
+    return { f:(x,y,z)=>ellip(x,y,z,0,0,cz,R,R,rz), zc:cz, zTop:Hh*1.1 }; } },
+
+{ key:'coral_rd', label:'Brain coral (reaction-diffusion)',
+  params:[['RD_AMOUNT','Ridge height',0,20,0.5,7],['RD_FEED','Feed F',0.02,0.09,0.001,0.055],
+          ['RD_KILL','Kill k',0.03,0.075,0.001,0.062],['RD_STEPS','Sim steps',400,5000,100,2500]],
+  mk(P){ const R=P.SIZE/2,Hz=P.HEIGHT*0.62,rd=getRD(P);
+    return { f:(x,y,z)=>{ const wx=x/R,wy=y/R,wz=z/Hz,wl=Math.hypot(wx,wy,wz)||1e-9;
+        const phi=Math.acos(clamp(wz/wl,-1,1)),u=Math.min(1.15,phi/(0.5*Math.PI)),th=Math.atan2(y,x);
+        return ellip(x,y,z,0,0,0,R,R,Hz)+P.RD_AMOUNT*(sampleRD(rd,u*Math.cos(th),u*Math.sin(th))-0.5)*2; },
+      zc:Hz*0.35, zTop:Hz+P.RD_AMOUNT+6 }; } },
+
+{ key:'voronoi', label:'Puffed Voronoi cells (cells = pads)',
+  params:[['CELL_AMP','Cell puff',2,26,0.5,12],['GROOVE','Groove width',0.02,0.4,0.01,0.13]],
+  mk(P,dirs){ const R=P.SIZE/2,Hz=P.HEIGHT*0.72,pts=dirs&&dirs.length?dirs:fib(Math.max(4,Math.round(P.N_PADS)));
+    return { f:(x,y,z)=>{ const wx=x/R,wy=y/R,wz=z/Hz,wl=Math.hypot(wx,wy,wz)||1e-9;
+        const [b1,b2]=nearest2([wx/wl,wy/wl,wz/wl],pts);
+        return ellip(x,y,z,0,0,0,R,R,Hz)+P.CELL_AMP*Math.tanh((b1-b2)/P.GROOVE); },
+      zc:Hz*0.35, zTop:Hz+P.CELL_AMP+6 }; } },
+
+{ key:'crystal', label:'Crystal / faceted (Wulff)',
+  params:[['FACET_D','Facet dist',0.5,1.1,0.01,0.85],['JITTER','Jitter',0,0.4,0.01,0.09]],
+  mk(P){ const R=P.SIZE/2,dirs=fib(Math.max(6,Math.round(P.N_PADS))),rnd=rng(P.SEED);
+    const dd=dirs.map(()=>R*P.FACET_D*(1+P.JITTER*(rnd()-0.5)*2));
+    return { f:(x,y,z)=>{ let m=1e9; for(let i=0;i<dirs.length;i++){ const n=dirs[i],v=dd[i]-(x*n[0]+y*n[1]+z*n[2]); if(v<m)m=v; } return m; },
+      zc:R*P.FACET_D*0.35, zTop:R*(P.FACET_D+P.JITTER)+4 }; } },
+
+{ key:'cactus', label:'Cactus (ribbed / powder puff)',
+  params:[['CSPEC','Species','select',['echinopsis','bishopcap','powderpuff'],['Echinopsis','Bishop cap','Powder puff'],'powderpuff'],
+          ['RIB_DEPTH','Rib depth',0.02,0.4,0.01,0.16]],
+  mk(P){ const R=P.SIZE/2*0.9,sp=P.CSPEC,Hz=P.HEIGHT*(sp==='echinopsis'?0.75:1.05);
+    const ribs=sp==='bishopcap'?5:12, pts=sp==='powderpuff'?fib(Math.max(40,Math.round(P.N_PADS*5))):null;
+    return { f:(x,y,z)=>{ const wx=x/R,wy=y/R,wz=z/Hz,wl=Math.hypot(wx,wy,wz)||1e-9;
+        const phi=Math.acos(clamp(wz/wl,-1,1)),th=Math.atan2(y,x),fade=Math.sin(Math.min(phi,Math.PI*0.5));
+        let d;
+        if(pts){ const [b1]=nearest2([wx/wl,wy/wl,wz/wl],pts); const ang=Math.acos(clamp(b1,-1,1)); d=R*0.14*Math.max(0,1-ang/0.34); }
+        else { const s=0.5+0.5*Math.cos(ribs*th); d=-R*P.RIB_DEPTH*Math.pow(s,1.4)*fade; }
+        return ellip(x,y,z,0,0,0,R,R,Hz)+d; },
+      zc:Hz*0.35, zTop:Hz+R*0.15+6 }; } },
+
+{ key:'mushroom', label:'Mushroom (cap + stem)',
+  params:[['MSPEC','Species','select',['amanita','morel'],['Amanita','Morel'],'amanita'],
+          ['CAP','Cap dia',0.4,1.0,0.02,0.8],['MTEX','Texture cells',0,80,1,40]],
+  mk(P){ const R=P.SIZE/2,Hh=P.HEIGHT,capR=R*P.CAP;
+    if(P.MSPEC==='morel'){ const nc=Math.max(8,Math.round(P.MTEX)),pts=fib(nc),hz=Hh*0.46,cz=Hh*0.5;
+      return { f:(x,y,z)=>{ const wx=x/(capR*0.72),wy=y/(capR*0.72),wz=(z-cz)/hz,wl=Math.hypot(wx,wy,wz)||1e-9;
+          const [b1,b2]=nearest2([wx/wl,wy/wl,wz/wl],pts);
+          const head=ellip(x,y,z,0,0,cz,capR*0.72,capR*0.72,hz)+capR*0.16*(Math.tanh((b1-b2)/0.1)-0.5);
+          const rad=Math.hypot(x,y),stem=coneF(rad,z,R*0.3,R*0.26,Hh*0.24);
+          return smax(head,stem,5); },
+        zc:cz, zTop:Hh+capR*0.1+6 }; }
+    const capZ=Hh*0.56;
+    return { f:(x,y,z)=>{ const rad=Math.hypot(x,y);
+        const stem=coneF(rad,z,R*0.34,R*0.2,capZ+4);
+        const dz=z-capZ, rz=dz>0?Hh*0.44:Hh*0.16;
+        const cap=ellip(x,y,z,0,0,capZ,capR,capR,rz);
+        return smax(cap,stem,6); },
+      zc:capZ, zTop:capZ+Hh*0.44+6 }; } },
+
+{ key:'cymatics', label:'Cymatics dome (standing wave)',
+  params:[['CY_M','Angular m',0,10,1,5],['CY_N','Radial n',1,6,1,3],['CY_AMP','Ripple height',2,30,0.5,12]],
+  mk(P){ const R=P.SIZE/2,Hz=P.HEIGHT*0.62,cy=getCy(P);
+    return { f:(x,y,z)=>{ const wx=x/R,wy=y/R,wz=z/Hz,wl=Math.hypot(wx,wy,wz)||1e-9;
+        const phi=Math.acos(clamp(wz/wl,-1,1)),u=clamp(phi/(0.5*Math.PI),0,1),th=Math.atan2(y,x);
+        return ellip(x,y,z,0,0,0,R,R,Hz)+P.CY_AMP*cy.prof[Math.round(u*256)]*Math.cos(cy.m*th); },
+      zc:Hz*0.35, zTop:Hz+P.CY_AMP+6 }; } },
+
+// fractal bodies use a distance-estimator field (smooth, ~mm) so hollowing,
+// pad blending and Taubin smoothing behave; Inflate fattens the surface.
+{ key:'mandelbulb', label:'Mandelbulb (fractal)',
+  params:[['MB_POWER','Power',3,10,1,6],['MB_ITER','Iterations',3,12,1,6],['MB_LEVEL','Inflate (mm)',0,14,0.5,4]],
+  mk(P){ const R=P.SIZE/2,cz=P.HEIGHT*0.5,sc=R/1.2,zsc=(P.HEIGHT*0.5)/1.2,it=Math.round(P.MB_ITER),pw=P.MB_POWER;
+    return { f:(x,y,z)=>{ const cx=x/sc,cy=y/sc,c2=(z-cz)/zsc; let zx=cx,zy=cy,zz=c2,dr=1,r=Math.hypot(cx,cy,c2);
+        for(let i=0;i<it;i++){ r=Math.hypot(zx,zy,zz); if(r>2)break;
+          dr=pw*Math.pow(Math.max(r,1e-9),pw-1)*dr+1;
+          let th=Math.acos(clamp(zz/(r||1e-9),-1,1)),ph=Math.atan2(zy,zx),zr=Math.pow(r,pw); th*=pw;ph*=pw;
+          zx=cx+zr*Math.sin(th)*Math.cos(ph); zy=cy+zr*Math.sin(th)*Math.sin(ph); zz=c2+zr*Math.cos(th); }
+        return -0.5*Math.log(Math.max(r,1e-9))*r/dr*sc+P.MB_LEVEL; },
+      zc:cz, zTop:P.HEIGHT*1.15+P.MB_LEVEL+6 }; } },
+
+{ key:'juliabulb', label:'Juliabulb (fractal)',
+  params:[['JB_POWER','Power',3,10,1,8],['JB_ITER','Iterations',3,12,1,6],['JB_LEVEL','Inflate (mm)',0,14,0.5,4]],
+  mk(P){ const R=P.SIZE/2,cz=P.HEIGHT*0.5,sc=R/1.2,zsc=(P.HEIGHT*0.5)/1.2,it=Math.round(P.JB_ITER),pw=P.JB_POWER;
+    const kx=0.35,ky=0.5,kz=0.15;
+    return { f:(x,y,z)=>{ let zx=x/sc,zy=y/sc,zz=(z-cz)/zsc,dr=1,r=Math.hypot(zx,zy,zz);
+        for(let i=0;i<it;i++){ r=Math.hypot(zx,zy,zz); if(r>2)break;
+          dr=pw*Math.pow(Math.max(r,1e-9),pw-1)*dr+1;
+          let th=Math.acos(clamp(zz/(r||1e-9),-1,1)),ph=Math.atan2(zy,zx),zr=Math.pow(r,pw); th*=pw;ph*=pw;
+          zx=kx+zr*Math.sin(th)*Math.cos(ph); zy=ky+zr*Math.sin(th)*Math.sin(ph); zz=kz+zr*Math.cos(th); }
+        return -0.5*Math.log(Math.max(r,1e-9))*r/dr*sc+P.JB_LEVEL; },
+      zc:cz, zTop:P.HEIGHT*1.15+P.JB_LEVEL+6 }; } },
+];
+
+// ============================================================================
+//  OVERLAY textures — decorate the body surface, not tied to pad count.
+//  bubbles: vesicle pile pushed onto the surface; apollonian: interior sphere
+//  packing whose outermost spheres bulge through the skin.
+// ============================================================================
+function makeOverlay(P,body){
+  if(P.OVERLAY==='none') return null;
+  const R=P.SIZE/2,k=P.OV_BLEND,spheres=[];
+  if(P.OVERLAY==='bubbles'){
+    const n=Math.round(P.OV_COUNT),dirs=fibBand(n,0.05,0.98),rnd=rng(P.SEED+7);
+    for(let i=0;i<n;i++){ const d=dirs[i],u=1-(i+0.5)/n;
+      const hit=raySurface(body.f,d,body.zc,R*1.6+P.HEIGHT);
+      if(!hit) continue;
+      const br=P.OV_MIN+(P.OV_MAX-P.OV_MIN)*u*(0.7+0.4*rnd());
+      spheres.push([hit.p[0],hit.p[1],hit.p[2],br,br+k+2]); }
+  } else { // apollonian
+    const rnd=rng(P.SEED+1),K=Math.round(P.AP_COUNT),rmin=R*0.09,ov=R*0.03,cz=body.zc;
+    const sp=[[0,0,cz,R*0.5]];
+    for(let t=0;t<K*20&&sp.length<K;t++){ const u=2*rnd()-1,th=TAU*rnd(),rr=Math.cbrt(rnd())*R*0.95,s=Math.sqrt(Math.max(0,1-u*u));
+      const px=rr*s*Math.cos(th),py=rr*s*Math.sin(th),pz=cz+rr*u*0.8; let mr=R*0.95-Math.hypot(px,py,pz-cz);
+      for(const q of sp){ const d=Math.hypot(px-q[0],py-q[1],pz-q[2])-q[3]; if(d<mr)mr=d; }
+      if(mr>rmin && body.f(px,py,pz)>-mr*0.3) sp.push([px,py,pz,mr+ov]); }
+    for(const q of sp) spheres.push([q[0],q[1],q[2],q[3],q[3]+k+2]);
   }
-  function ball(pos, idx, cx, cy, cz, rx, ry, rz, na, nl, disp) {
-    const north = pos.length / 3; pos.push(cx, cy, cz + rz + (disp ? disp(0, 0) : 0));
-    const rings = [];
-    for (let i = 1; i < nl; i++) { const phi = Math.PI * i / nl, sp = Math.sin(phi), cp = Math.cos(phi); const b = pos.length / 3;
-      for (let j = 0; j < na; j++) { const th = TAU * j / na, d = disp ? disp(th, phi) : 0;
-        pos.push(cx + (rx + d) * sp * Math.cos(th), cy + (ry + d) * sp * Math.sin(th), cz + (rz + d) * cp); } rings.push(b); }
-    const south = pos.length / 3; pos.push(cx, cy, cz - rz - (disp ? disp(0, Math.PI) : 0));
-    const b0 = rings[0]; for (let j = 0; j < na; j++) idx.push(north, b0 + j, b0 + (j + 1) % na);
-    for (let k = 0; k < rings.length - 1; k++) { const a = rings[k], b = rings[k + 1]; for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(a + j, a + j1, b + j1, a + j, b + j1, b + j); } }
-    const bl = rings[rings.length - 1]; for (let j = 0; j < na; j++) idx.push(south, bl + (j + 1) % na, bl + j);
+  if(!spheres.length) return null;
+  return (x,y,z,b)=>{ let m=b;
+    for(const s of spheres){ const dx=x-s[0],dy=y-s[1],dz=z-s[2];
+      if(dx*dx+dy*dy+dz*dz>s[4]*s[4]) continue;
+      m=smax(m,s[3]-Math.sqrt(dx*dx+dy*dy+dz*dz),k); }
+    return m; };
+}
+
+// ============================================================================
+//  RAY / PLACEMENT — outermost surface crossing along a direction from centre
+// ============================================================================
+function raySurface(f,dir,zc,tMax){
+  const STEPS=200,dt=tMax/STEPS; let tIn=-1;
+  for(let i=STEPS;i>=0;i--){ const t=i*dt;
+    if(f(dir[0]*t,dir[1]*t,zc+dir[2]*t)>=0){ tIn=t; break; } }
+  if(tIn<0) return null;
+  let lo=tIn,hi=Math.min(tMax,tIn+dt);
+  for(let k=0;k<22;k++){ const mid=0.5*(lo+hi);
+    if(f(dir[0]*mid,dir[1]*mid,zc+dir[2]*mid)>=0) lo=mid; else hi=mid; }
+  const t=0.5*(lo+hi),p=[dir[0]*t,dir[1]*t,zc+dir[2]*t],h=0.8;
+  let gx=f(p[0]+h,p[1],p[2])-f(p[0]-h,p[1],p[2]),
+      gy=f(p[0],p[1]+h,p[2])-f(p[0],p[1]-h,p[2]),
+      gz=f(p[0],p[1],p[2]+h)-f(p[0],p[1],p[2]-h);
+  const L=Math.hypot(gx,gy,gz)||1;                 // f grows inward → outward normal = -grad
+  return { p, t, n:[-gx/L,-gy/L,-gz/L] };
+}
+
+// pad directions: fibonacci band + optional relaxation + screen-cone repel.
+// Exact count always — pads inside the screen cone get pushed to its rim.
+function padDirs(P,screenDir,minAng){
+  const n=Math.max(0,Math.round(P.N_PADS)); if(!n) return [];
+  const lo=P.BAND_LO,hi=P.BAND_HI,dirs=fibBand(n,lo,hi);
+  const relax=Math.round(P.RELAX);
+  for(let it=0;it<relax;it++){
+    const force=dirs.map(()=>[0,0,0]);
+    for(let i=0;i<n;i++)for(let j=i+1;j<n;j++){
+      const a=dirs[i],b=dirs[j];
+      let dx=a[0]-b[0],dy=a[1]-b[1],dz=a[2]-b[2];
+      const d2=dx*dx+dy*dy+dz*dz+1e-6,w=1/(d2*Math.sqrt(d2));
+      force[i][0]+=dx*w;force[i][1]+=dy*w;force[i][2]+=dz*w;
+      force[j][0]-=dx*w;force[j][1]-=dy*w;force[j][2]-=dz*w; }
+    const step=0.35/n;
+    for(let i=0;i<n;i++){ const d=dirs[i];
+      let x=d[0]+force[i][0]*step,y=d[1]+force[i][1]*step,z=d[2]+force[i][2]*step;
+      const L=Math.hypot(x,y,z)||1; x/=L;y/=L;z/=L;
+      z=clamp(z,lo,hi); const r=Math.sqrt(Math.max(1e-9,1-z*z)),rl=Math.hypot(x,y)||1e-9;
+      dirs[i]=[x/rl*r,y/rl*r,z]; } }
+  if(screenDir&&minAng>0){
+    for(let i=0;i<n;i++){ const d=dirs[i];
+      const c=clamp(d[0]*screenDir[0]+d[1]*screenDir[1]+d[2]*screenDir[2],-1,1);
+      const ang=Math.acos(c);
+      if(ang<minAng){ // rotate away from the screen axis to the cone rim
+        let px=d[0]-c*screenDir[0],py=d[1]-c*screenDir[1],pz=d[2]-c*screenDir[2];
+        let L=Math.hypot(px,py,pz);
+        if(L<1e-6){ const [u]=frame(screenDir); px=u[0];py=u[1];pz=u[2]; L=1; }
+        px/=L;py/=L;pz/=L;
+        const ca=Math.cos(minAng),sa=Math.sin(minAng);
+        dirs[i]=[screenDir[0]*ca+px*sa,screenDir[1]*ca+py*sa,screenDir[2]*ca+pz*sa]; } } }
+  return dirs;
+}
+
+// ============================================================================
+//  COMPOSER — assemble the final field:
+//  body ∪ overlay ∪ pads ∪ screen-platform → hollow → carve seat/aperture,
+//  pad recesses/holes, ports → intersect z>0 (flat, open bottom).
+// ============================================================================
+function makeField(P){
+  const R=P.SIZE/2, TRIM=P.BASE_TRIM, WALL=P.WALL, hollow=P.HOLLOW==='on';
+  // screen direction (tilt from vertical, azimuth) — pure params, no body needed
+  const scrOn=P.SCREEN_MODE==='on';
+  const st=P.SCREEN_TILT*Math.PI/180, sa=P.SCREEN_AZ*Math.PI/180;
+  const ds=[Math.sin(st)*Math.cos(sa),Math.sin(st)*Math.sin(sa),Math.cos(st)];
+  const seatR=P.SCREEN_SEAT/2, apR=P.SCREEN_DIA/2, platR=seatR+P.SCREEN_MARGIN;
+  const minAng=scrOn ? Math.asin(clamp((platR+P.PAD_DIA*0.55)/(R*0.85),0,0.95)) : 0;
+
+  // pad directions first (voronoi's cells reuse them so seats land on cells)
+  const dirs=padDirs(P, scrOn?ds:null, minAng);
+
+  const BODY=BODIES.find(b=>b.key===P.BODY)||BODIES[0];
+  const body=BODY.mk(P,dirs);
+  const tMax=R*1.7+P.HEIGHT;
+
+  const ov=makeOverlay(P,body);
+  const fBase = ov ? (x,y,z)=>ov(x,y,z,body.f(x,y,z)) : body.f;
+
+  // ---- place pads on the composed surface ----
+  const style=P.PAD_STYLE, flat=P.FLAT==='on';
+  const dia=P.PAD_DIA, r1=dia/2, hgt=P.PAD_H, seatD=Math.min(P.SEAT_DIA,dia-1);
+  const pads=[]; let missed=0;
+  if(style!=='none') for(const d of dirs){
+    const hit=raySurface(fBase,d,body.zc,tMax);
+    if(!hit){ missed++; continue; }
+    const n=hit.n, pt=hit.p;
+    let cut;                                        // flat-seat plane height (local al)
+    if(style==='lobe')      cut=(hgt-r1)+Math.sqrt(Math.max(0,r1*r1-seatD*seatD/4));
+    else if(style==='bump') cut=hgt*Math.sqrt(Math.max(0,1-(seatD*seatD)/(dia*dia)));
+    else if(style==='spike')cut=hgt;
+    else                    cut=3;                  // 'seat' puck proud height
+    const cull=Math.hypot(hgt,r1)+P.PAD_BLEND+6;
+    pads.push({pt,n,cut,cx:pt[0]+n[0]*hgt*0.5,cy:pt[1]+n[1]*hgt*0.5,cz:pt[2]+n[2]*hgt*0.5,cull2:cull*cull});
   }
-  function dome(pos, idx, R, Hh, na, nr, baseZ, disp) {   // flat-bottomed half-ellipsoid, closed
-    const apex = pos.length / 3; pos.push(0, 0, baseZ + Hh + (disp ? disp(0, 0) : 0));
-    const rings = [];
-    for (let i = 1; i <= nr; i++) { const phi = 0.5 * Math.PI * i / nr, sp = Math.sin(phi), cp = Math.cos(phi); const b = pos.length / 3;
-      for (let j = 0; j < na; j++) { const th = TAU * j / na, d = disp ? disp(th, phi) : 0, rr = R * sp + d * sp;
-        pos.push(rr * Math.cos(th), rr * Math.sin(th), baseZ + Hh * cp + d * cp); } rings.push(b); }
-    const b0 = rings[0]; for (let j = 0; j < na; j++) idx.push(apex, b0 + j, b0 + (j + 1) % na);
-    for (let k = 0; k < rings.length - 1; k++) { const a = rings[k], b = rings[k + 1]; for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(a + j, a + j1, b + j1, a + j, b + j1, b + j); } }
-    const rim = rings[rings.length - 1], bot = pos.length / 3;
-    for (let j = 0; j < na; j++) { const kk = (rim + j) * 3; pos.push(pos[kk], pos[kk + 1], 0); }
-    const bc = pos.length / 3; pos.push(0, 0, 0);
-    for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(rim + j, bot + j, bot + j1, rim + j, bot + j1, rim + j1); }
-    for (let j = 0; j < na; j++) idx.push(bc, bot + (j + 1) % na, bot + j);
-  }
-  function disc(pos, idx, r, z0, z1, seg) {
-    const tc = pos.length / 3; pos.push(0, 0, z1); const tb = pos.length / 3;
-    for (let j = 0; j < seg; j++) { const th = TAU * j / seg; pos.push(r * Math.cos(th), r * Math.sin(th), z1); }
-    const bc = pos.length / 3; pos.push(0, 0, z0); const bb = pos.length / 3;
-    for (let j = 0; j < seg; j++) { const th = TAU * j / seg; pos.push(r * Math.cos(th), r * Math.sin(th), z0); }
-    for (let j = 0; j < seg; j++) { const j1 = (j + 1) % seg; idx.push(tc, tb + j, tb + j1); idx.push(bc, bb + j1, bb + j); idx.push(tb + j, bb + j, bb + j1, tb + j, bb + j1, tb + j1); }
-  }
-  function revolve(pos, idx, profile, origin, zdir, seg) {
-    const L = Math.hypot(zdir[0], zdir[1], zdir[2]) || 1, Z = [zdir[0] / L, zdir[1] / L, zdir[2] / L];
-    const ax = Math.abs(Z[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0];
-    let Ux = ax[1] * Z[2] - ax[2] * Z[1], Uy = ax[2] * Z[0] - ax[0] * Z[2], Uz = ax[0] * Z[1] - ax[1] * Z[0];
-    const ul = Math.hypot(Ux, Uy, Uz) || 1, U = [Ux / ul, Uy / ul, Uz / ul];
-    const V = [Z[1] * U[2] - Z[2] * U[1], Z[2] * U[0] - Z[0] * U[2], Z[0] * U[1] - Z[1] * U[0]];
-    const pt = (rad, h, phi) => { const cr = rad * Math.cos(phi), sr = rad * Math.sin(phi);
-      return [origin[0] + cr * U[0] + sr * V[0] + h * Z[0], origin[1] + cr * U[1] + sr * V[1] + h * Z[1], origin[2] + cr * U[2] + sr * V[2] + h * Z[2]]; };
-    const rows = [];
-    for (const [rad, h] of profile) {
-      if (rad < 1e-6) { rows.push(['apex', pos.length / 3]); const p = pt(0, h, 0); pos.push(p[0], p[1], p[2]); }
-      else { const b = pos.length / 3; for (let k = 0; k < seg; k++) { const p = pt(rad, h, TAU * k / seg); pos.push(p[0], p[1], p[2]); } rows.push(['ring', b]); }
+  function padF(x,y,z){                             // union of all pads (hard max)
+    let m=-1e9;
+    for(const q of pads){
+      const ddx=x-q.cx,ddy=y-q.cy,ddz=z-q.cz;
+      if(ddx*ddx+ddy*ddy+ddz*ddz>q.cull2) continue;
+      const dx=x-q.pt[0],dy=y-q.pt[1],dz=z-q.pt[2];
+      const al=dx*q.n[0]+dy*q.n[1]+dz*q.n[2];
+      const rad=Math.sqrt(Math.max(0,dx*dx+dy*dy+dz*dz-al*al));
+      let v;
+      if(style==='lobe'){ v=r1-Math.hypot(rad,al-(hgt-r1)); if(flat)v=Math.min(v,q.cut-al); }
+      else if(style==='bump'){ const rx=r1,rz=hgt,k0=Math.hypot(rad/rx,al/rz),k1=Math.hypot(rad/(rx*rx),al/(rz*rz))||1e-9;
+        v=-(k0*(k0-1))/k1; if(flat)v=Math.min(v,q.cut-al); }
+      else if(style==='spike'){ v=coneF(rad,al+5,r1,flat?seatD/2:r1*0.4,hgt+5); }
+      else { v=cylF(rad,al,seatD/2+1.5,-6,q.cut); }
+      if(v>m)m=v;
     }
-    for (let k = 0; k < rows.length - 1; k++) { const [ka, ia] = rows[k], [kb, ib] = rows[k + 1];
-      if (ka === 'apex' && kb === 'ring') for (let i = 0; i < seg; i++) idx.push(ia, ib + i, ib + (i + 1) % seg);
-      else if (ka === 'ring' && kb === 'apex') for (let i = 0; i < seg; i++) idx.push(ia + i, ib, ia + (i + 1) % seg);
-      else for (let i = 0; i < seg; i++) { const i1 = (i + 1) % seg; idx.push(ia + i, ia + i1, ib + i1, ia + i, ib + i1, ib + i); }
-    }
+    return m;
   }
-  function cone(pos, idx, origin, zdir, baseR, tipR, len, seg) {
-    revolve(pos, idx, [[0, 0], [baseR, 0], [tipR, len], [0, len]], origin, zdir, seg);
+  const hasRecess=(flat||style==='seat')&&style!=='none';
+
+  // ---- screen platform (before hollow) + carve geometry ----
+  let scr=null;
+  if(scrOn){
+    const hit=raySurface(fBase,ds,body.zc,tMax);
+    if(hit){ const ps=hit.p,PROUD=1.5;
+      scr={ps,PROUD,cull2:Math.pow(platR+P.SCREEN_BLEND+50,2)}; }
   }
-  function padSeat(pos, idx, point, normal, dia, height, seg) {
-    const r = dia / 2; revolve(pos, idx, [[0, -3], [r + 2, -3], [r + 2, 0], [r, height], [0, height]], point, normal, seg || 40);
+
+  const padBlend=P.PAD_BLEND;
+  function solid(x,y,z){
+    let f=fBase(x,y,z);
+    if(pads.length) f=smax(f,padF(x,y,z),padBlend);
+    if(scr){ const dx=x-scr.ps[0],dy=y-scr.ps[1],dz=z-scr.ps[2];
+      if(dx*dx+dy*dy+dz*dz<scr.cull2){
+        const al=dx*ds[0]+dy*ds[1]+dz*ds[2];
+        const rad=Math.sqrt(Math.max(0,dx*dx+dy*dy+dz*dz-al*al));
+        f=smax(f,cylF(rad,al,platR,-30,scr.PROUD),P.SCREEN_BLEND); } }
+    return f;
   }
-  function fib(n) { const out = [], ga = Math.PI * (3 - Math.sqrt(5));
-    for (let i = 0; i < n; i++) { const z = 1 - 2 * (i + 0.5) / n, r = Math.sqrt(Math.max(0, 1 - z * z)), th = i * ga;
-      out.push([r * Math.cos(th), r * Math.sin(th), z]); } return out; }
-  function vnoise(x, y) { const s = Math.sin(x * 1.0 + 1.7) * Math.cos(y * 1.13 - 0.9) + Math.sin(x * 1.97 - 2.3) * Math.cos(y * 2.09 + 1.4) * 0.6 + Math.sin(x * 3.71 + 0.5) * Math.cos(y * 3.31 - 1.9) * 0.35; return 0.5 + 0.5 * s / 1.95; }
-  function noise3(x, y, z) { return vnoise(x + z * 0.7, y - z * 0.4) * 0.6 + vnoise(y * 1.3 - x * 0.5, z * 1.1 + x * 0.3) * 0.4; }
-  function smin(a, b, k) { const h = Math.max(0, Math.min(1, 0.5 + 0.5 * (b - a) / k)); return a * h + b * (1 - h) - k * h * (1 - h); }
-  // marching tetrahedra: fn(x,y,z) > 0 is solid; closed surface over box [lo..hi], N cells/axis
-  function mt(pos, idx, fn, N, lo, hi) {
-    const dx = (hi[0] - lo[0]) / N, dy = (hi[1] - lo[1]) / N, dz = (hi[2] - lo[2]) / N;
-    const corn = [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [0, 0, 1], [1, 0, 1], [0, 1, 1], [1, 1, 1]];
-    const tets = [[0, 7, 1, 3], [0, 7, 3, 2], [0, 7, 2, 6], [0, 7, 6, 4], [0, 7, 4, 5], [0, 7, 5, 1]];
-    // reuse a plane of samples to cut fn calls
-    let prev = null;
-    for (let z = 0; z <= N; z++) {
-      const cur = new Float32Array((N + 1) * (N + 1));
-      for (let y = 0; y <= N; y++) for (let x = 0; x <= N; x++)
-        cur[y * (N + 1) + x] = fn(lo[0] + x * dx, lo[1] + y * dy, lo[2] + z * dz);
-      if (prev) {
-        const val = (cx, cy, cz) => (cz === 0 ? prev : cur)[cy * (N + 1) + cx];
-        for (let y = 0; y < N; y++) for (let x = 0; x < N; x++) {
-          const cp = [], cv = [];
-          for (let c = 0; c < 8; c++) { const o = corn[c]; cp.push([lo[0] + (x + o[0]) * dx, lo[1] + (y + o[1]) * dy, lo[2] + (z - 1 + o[2]) * dz]); cv.push(val(x + o[0], y + o[1], o[2])); }
-          for (const t of tets) {
-            const va = [cv[t[0]], cv[t[1]], cv[t[2]], cv[t[3]]], pa = [cp[t[0]], cp[t[1]], cp[t[2]], cp[t[3]]];
-            const inV = [], outV = [];
-            for (let i = 0; i < 4; i++) (va[i] > 0 ? inV : outV).push(i);
-            if (inV.length === 0 || inV.length === 4) continue;
-            const ip = (a, b) => { const tt = va[a] / (va[a] - va[b]); return [pa[a][0] + tt * (pa[b][0] - pa[a][0]), pa[a][1] + tt * (pa[b][1] - pa[a][1]), pa[a][2] + tt * (pa[b][2] - pa[a][2])]; };
-            const emit = (A, B, C) => { const b = pos.length / 3; pos.push(A[0], A[1], A[2], B[0], B[1], B[2], C[0], C[1], C[2]); idx.push(b, b + 1, b + 2); };
-            if (inV.length === 1) { const a = inV[0]; emit(ip(a, outV[0]), ip(a, outV[1]), ip(a, outV[2])); }
-            else if (inV.length === 3) { const a = outV[0]; emit(ip(a, inV[0]), ip(a, inV[1]), ip(a, inV[2])); }
-            else { const [i0, i1] = inV, [o0, o1] = outV; const p00 = ip(i0, o0), p01 = ip(i0, o1), p10 = ip(i1, o0), p11 = ip(i1, o1); emit(p00, p01, p11); emit(p00, p11, p10); }
-          }
+
+  // recess/hole depths must reference the REAL composed surface (smax blending
+  // inflates it above the analytic seat plane) — measure each pad's true top
+  if(hasRecess&&(P.RECESS>0||P.PAD_HOLE>0)){
+    const salong=(q,a)=>solid(q.pt[0]+q.n[0]*a,q.pt[1]+q.n[1]*a,q.pt[2]+q.n[2]*a);
+    for(const q of pads){ q.top=q.cut;
+      const hi=Math.max(q.cut,hgt)+padBlend*0.5+6;
+      for(let a=hi;a>=-2;a-=0.5){ if(salong(q,a)>0){
+        let l=a,h2=a+0.5;
+        for(let k=0;k<16;k++){ const mid=0.5*(l+h2); if(salong(q,mid)>0)l=mid; else h2=mid; }
+        q.top=0.5*(l+h2); break; } } } }
+
+  // port carve setup (world space)
+  const ports=[];
+  if(P.PORT_USB==='on'){ const az=P.USB_AZ*Math.PI/180;
+    ports.push({type:'usb',c:Math.cos(az),s:Math.sin(az),z0:P.USB_Z}); }
+  if(P.PORT_JACK==='on'){ const az=P.JACK_AZ*Math.PI/180;
+    ports.push({type:'jack',c:Math.cos(az),s:Math.sin(az),z0:P.JACK_Z}); }
+
+  const bossD=P.SCREEN_DEPTH+WALL+1.5;              // seat floor stays WALL+1.5 thick
+  function F(x,y,zw){
+    if(zw<-1.5) return -2;                          // everything below the floor is air
+    const z=zw+TRIM;                                // body space is shifted down by the trim
+    const s0=solid(x,y,z);
+    let f=hollow?Math.min(s0,WALL-s0):s0;
+    if(scr){ const dx=x-scr.ps[0],dy=y-scr.ps[1],dz=z-scr.ps[2];
+      if(dx*dx+dy*dy+dz*dz<scr.cull2){
+        const al=dx*ds[0]+dy*ds[1]+dz*ds[2];
+        const rad=Math.sqrt(Math.max(0,dx*dx+dy*dy+dz*dz-al*al));
+        if(hollow) f=Math.max(f,Math.min(cylF(rad,al,platR,scr.PROUD-bossD,scr.PROUD),s0)); // solid boss under the seat
+        f=Math.min(f,-cylF(rad,al,seatR,scr.PROUD-P.SCREEN_DEPTH,scr.PROUD+50));   // module seat
+        f=Math.min(f,-cylF(rad,al,apR,scr.PROUD-P.SCREEN_DEPTH-120,scr.PROUD+50)); // through aperture
+      } }
+    if(hasRecess&&(P.RECESS>0||P.PAD_HOLE>0)){
+      for(const q of pads){
+        const ddx=x-q.cx,ddy=y-q.cy,ddz=z-q.cz;
+        if(ddx*ddx+ddy*ddy+ddz*ddz>q.cull2+400) continue;
+        const dx=x-q.pt[0],dy=y-q.pt[1],dz=z-q.pt[2];
+        const al=dx*q.n[0]+dy*q.n[1]+dz*q.n[2];
+        const rad=Math.sqrt(Math.max(0,dx*dx+dy*dy+dz*dz-al*al));
+        if(P.RECESS>0)  f=Math.min(f,-cylF(rad,al,seatD/2-1.2,q.top-P.RECESS,q.top+30));
+        if(P.PAD_HOLE>0)f=Math.min(f,-cylF(rad,al,P.PAD_HOLE/2,q.top-120,q.top+30)); } }
+    for(const pt of ports){
+      const al=x*pt.c+y*pt.s, lh=-x*pt.s+y*pt.c, lv=zw-pt.z0;
+      if(al>3){
+        if(pt.type==='usb') f=Math.min(f,-Math.min(rrect2(lh,lv,4.7,1.75,1.4),al-3,R+60-al));
+        else                f=Math.min(f,-Math.min(3.3-Math.hypot(lh,lv),al-3,R+60-al)); } }
+    return Math.min(f,zw);                          // flat bottom, always
+  }
+
+  const margin=Math.max(hgt+r1,P.OVERLAY==='bubbles'?P.OV_MAX:0,scrOn?12:0)+10;
+  const bounds={ lo:[-R-margin,-R-margin,-2],
+                 hi:[ R+margin, R+margin, Math.max(20,body.zTop+Math.max(hgt,0)+10-TRIM)] };
+  return { F, bounds, meta:{ nPads:pads.length, missed, body:BODY } };
+}
+
+// ============================================================================
+//  MESHER — marching tetrahedra (from v1) → weld → Taubin smoothing
+// ============================================================================
+function mt(pos,idx,fn,N,lo,hi){
+  const dx=(hi[0]-lo[0])/N,dy=(hi[1]-lo[1])/N,dz=(hi[2]-lo[2])/N;
+  const corn=[[0,0,0],[1,0,0],[0,1,0],[1,1,0],[0,0,1],[1,0,1],[0,1,1],[1,1,1]];
+  const tets=[[0,7,1,3],[0,7,3,2],[0,7,2,6],[0,7,6,4],[0,7,4,5],[0,7,5,1]];
+  let prev=null;
+  for(let z=0;z<=N;z++){
+    const cur=new Float32Array((N+1)*(N+1));
+    for(let y=0;y<=N;y++)for(let x=0;x<=N;x++)
+      cur[y*(N+1)+x]=fn(lo[0]+x*dx,lo[1]+y*dy,lo[2]+z*dz);
+    if(prev){
+      const val=(cx,cy,cz)=>(cz===0?prev:cur)[cy*(N+1)+cx];
+      for(let y=0;y<N;y++)for(let x=0;x<N;x++){
+        const cp=[],cv=[];
+        for(let c=0;c<8;c++){ const o=corn[c]; cp.push([lo[0]+(x+o[0])*dx,lo[1]+(y+o[1])*dy,lo[2]+(z-1+o[2])*dz]); cv.push(val(x+o[0],y+o[1],o[2])); }
+        for(const t of tets){
+          const va=[cv[t[0]],cv[t[1]],cv[t[2]],cv[t[3]]],pa=[cp[t[0]],cp[t[1]],cp[t[2]],cp[t[3]]];
+          const inV=[],outV=[];
+          for(let i=0;i<4;i++)(va[i]>0?inV:outV).push(i);
+          if(inV.length===0||inV.length===4) continue;
+          const ip=(a,b)=>{ const tt=va[a]/(va[a]-va[b]); return [pa[a][0]+tt*(pa[b][0]-pa[a][0]),pa[a][1]+tt*(pa[b][1]-pa[a][1]),pa[a][2]+tt*(pa[b][2]-pa[a][2])]; };
+          const emit=(A,B,C)=>{ const b=pos.length/3; pos.push(A[0],A[1],A[2],B[0],B[1],B[2],C[0],C[1],C[2]); idx.push(b,b+1,b+2); };
+          if(inV.length===1){ const a=inV[0]; emit(ip(a,outV[0]),ip(a,outV[1]),ip(a,outV[2])); }
+          else if(inV.length===3){ const a=outV[0]; emit(ip(a,inV[0]),ip(a,inV[1]),ip(a,inV[2])); }
+          else { const [i0,i1]=inV,[o0,o1]=outV; const p00=ip(i0,o0),p01=ip(i0,o1),p10=ip(i1,o0),p11=ip(i1,o1); emit(p00,p01,p11); emit(p00,p11,p10); }
         }
       }
-      prev = cur;
     }
+    prev=cur;
   }
-  return { sphere, ball, dome, disc, revolve, cone, padSeat, fib, vnoise, noise3, smin, mt, TAU };
-})();
-
-// small helpers for builders
-const clampA = v => Math.max(24, Math.round(v));
-function nearest2(d, pts) { let b1 = -2, b2 = -2; for (const q of pts) { const dot = d[0] * q[0] + d[1] * q[1] + d[2] * q[2]; if (dot > b1) { b2 = b1; b1 = dot; } else if (dot > b2) b2 = dot; } return [b1, b2]; }
-function dir(th, phi) { const sp = Math.sin(phi); return [sp * Math.cos(th), sp * Math.sin(th), Math.cos(phi)]; }
-
-// cached reaction-diffusion for the coral mode
-let _rd = { sig: '', f: null, N: 0 };
-function getRD(P) {
-  const sig = [P.RES, P.SEED, P.RD_FEED, P.RD_KILL, P.RD_STEPS].join(',');
-  if (sig === _rd.sig && _rd.f) return _rd;
-  const N = Math.max(60, Math.min(150, Math.round(P.RES * 2)));
-  const U = new Float32Array(N * N).fill(1), V = new Float32Array(N * N);
-  let a = (Math.round(P.SEED) * 2654435761) >>> 0 || 1;
-  const rnd = () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
-  for (let i = 0; i < N * N; i++) V[i] = 0.06 * rnd();
-  for (let s = 0; s < 6; s++) { const cx = (0.3 + 0.4 * rnd()) * N | 0, cy = (0.3 + 0.4 * rnd()) * N | 0; for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) { const r = (cy + yy) * N + (cx + xx); if (r >= 0 && r < N * N) { V[r] = 0.5; U[r] = 0.25; } } }
-  const F = P.RD_FEED, k = P.RD_KILL; let cU = U, cV = V, Un = new Float32Array(N * N), Vn = new Float32Array(N * N);
-  for (let s = 0; s < Math.round(P.RD_STEPS); s++) {
-    for (let r = 0; r < N; r++) { const rm = (r - 1 + N) % N, rp = (r + 1) % N, ro = r * N, rom = rm * N, rop = rp * N;
-      for (let c = 0; c < N; c++) { const cm = c === 0 ? N - 1 : c - 1, cp = c === N - 1 ? 0 : c + 1, i = ro + c;
-        const u = cU[i], v = cV[i], lu = cU[ro + cm] + cU[ro + cp] + cU[rom + c] + cU[rop + c] - 4 * u, lv = cV[ro + cm] + cV[ro + cp] + cV[rom + c] + cV[rop + c] - 4 * v, uvv = u * v * v;
-        Un[i] = u + (0.16 * lu - uvv + F * (1 - u)); Vn[i] = v + (0.08 * lv + uvv - (F + k) * v); } }
-    const tU = cU; cU = Un; Un = tU; const tV = cV; cV = Vn; Vn = tV;
-  }
-  let mn = 1e9, mx = -1e9; for (let i = 0; i < N * N; i++) { if (cV[i] < mn) mn = cV[i]; if (cV[i] > mx) mx = cV[i]; }
-  const sp = (mx - mn) || 1, f = new Float32Array(N * N); for (let i = 0; i < N * N; i++) f[i] = (cV[i] - mn) / sp;
-  _rd = { sig, f, N }; return _rd;
 }
-function sampleRD(rd, x, y) { const N = rd.N, f = rd.f; const c = Math.min(N - 1, Math.max(0, (x * 0.5 + 0.5) * (N - 1))), r = Math.min(N - 1, Math.max(0, (y * 0.5 + 0.5) * (N - 1)));
-  const c0 = c | 0, r0 = r | 0, c1 = Math.min(N - 1, c0 + 1), r1 = Math.min(N - 1, r0 + 1), fc = c - c0, fr = r - r0;
-  return f[r0 * N + c0] * (1 - fc) * (1 - fr) + f[r0 * N + c1] * fc * (1 - fr) + f[r1 * N + c0] * (1 - fc) * fr + f[r1 * N + c1] * fc * fr; }
 
-// ---- helpers for the classic generators ----
-function besselJ(m, x) { const K = 48, h = Math.PI / K; let s = 0;
-  for (let i = 0; i <= K; i++) { const t = i * h, w = (i === 0 || i === K) ? 1 : (i % 2 ? 4 : 2); s += w * Math.cos(m * t - x * Math.sin(t)); }
-  return (s * h / 3) / Math.PI; }
-function besselZero(m, n) { let px = 1e-4, pf = besselJ(m, px), found = 0, x = px;
-  while (x < 200) { x += 0.05; const f = besselJ(m, x);
-    if (pf === 0 || (f < 0) !== (pf < 0)) { let lo = px, hi = x, flo = pf;
-      for (let k = 0; k < 50; k++) { const mid = 0.5 * (lo + hi), fm = besselJ(m, mid); if ((fm < 0) === (flo < 0)) { lo = mid; flo = fm; } else hi = mid; }
-      if (++found === n) return 0.5 * (lo + hi); } px = x; pf = f; } return x; }
-function lloydBand(n, uLo, uHi, iters, seed) {           // centroidal-Voronoi points on a latitude band
-  let a = (seed * 2654435761) >>> 0 || 1; const rnd = () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
-  const rand = () => { const u = uLo + (uHi - uLo) * rnd(), t = 2 * Math.PI * rnd(), r = Math.sqrt(Math.max(0, 1 - u * u)); return [r * Math.cos(t), r * Math.sin(t), u]; };
-  let seeds = []; for (let i = 0; i < n; i++) seeds.push(rand());
-  const S = Math.max(600, n * 100);
-  for (let it = 0; it < iters; it++) { const acc = seeds.map(() => [0, 0, 0, 0]);
-    for (let s = 0; s < S; s++) { const p = rand(); let bi = 0, bd = 1e9; for (let i = 0; i < n; i++) { const dx = p[0] - seeds[i][0], dy = p[1] - seeds[i][1], dz = p[2] - seeds[i][2], d = dx * dx + dy * dy + dz * dz; if (d < bd) { bd = d; bi = i; } } const A = acc[bi]; A[0] += p[0]; A[1] += p[1]; A[2] += p[2]; A[3]++; }
-    for (let i = 0; i < n; i++) { const A = acc[i]; if (A[3] === 0) { seeds[i] = rand(); continue; } let x = A[0] / A[3], y = A[1] / A[3], z = Math.min(uHi, Math.max(uLo, A[2] / A[3])); const r = Math.hypot(x, y), ss = Math.sqrt(Math.max(0, 1 - z * z)); seeds[i] = r < 1e-9 ? rand() : [x / r * ss, y / r * ss, z]; } }
-  return seeds; }
-function apollonianPack(bigR, seed, K, rmin, overlap) {   // greedy nested-sphere packing (Apollonian-ish)
-  let a = (seed * 2654435761) >>> 0 || 1; const rnd = () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
-  const sp = [[0, 0, 0, bigR * 0.5]];
-  for (let k = 0; k < K; k++) { const u = 2 * rnd() - 1, th = 2 * Math.PI * rnd(), rr = Math.cbrt(rnd()) * bigR, s = Math.sqrt(Math.max(0, 1 - u * u));
-    const px = rr * s * Math.cos(th), py = rr * s * Math.sin(th), pz = rr * u; let mr = bigR - Math.hypot(px, py, pz);
-    for (const q of sp) { const d = Math.hypot(px - q[0], py - q[1], pz - q[2]) - q[3]; if (d < mr) mr = d; }
-    if (mr > rmin) sp.push([px, py, pz, mr + overlap]); }
-  return sp; }
-function mengerInside(u, v, w, level) { for (let l = 0; l < level; l++) { u *= 3; v *= 3; w *= 3; const iu = Math.floor(u) % 3, iv = Math.floor(v) % 3, iw = Math.floor(w) % 3; if (((iu === 1) + (iv === 1) + (iw === 1)) >= 2) return false; u -= Math.floor(u); v -= Math.floor(v); w -= Math.floor(w); } return true; }
-function buildThistle(P, H, placement) {                 // ellipsoid bulb + flat-tipped needle pads
-  const pos = [], idx = [], R = P.SIZE / 2, C = P.HEIGHT, cz = C * 0.5 + 4, rz = C * 0.5;
-  H.ball(pos, idx, 0, 0, cz, R, R, rz, clampA(P.RES * 2.4), clampA(P.RES * 1.8), null);
-  const n = Math.max(3, Math.round(P.N_PADS)), bandLo = -0.35, bandHi = 0.95; let pts;
-  if (placement === 'lloyd') pts = lloydBand(n, bandLo, bandHi, 9, Math.round(P.SEED) + 1);
-  else { pts = []; const ga = Math.PI * (3 - Math.sqrt(5)); for (let i = 0; i < n; i++) { const u = bandLo + (bandHi - bandLo) * ((i + 0.5) / n), r = Math.sqrt(Math.max(0, 1 - u * u)), th = i * ga; pts.push([r * Math.cos(th), r * Math.sin(th), u]); } }
-  const baseR = R * P.SPIKE_BASE, tipR = baseR * 0.4, len = R * P.SPIKE_LEN;
-  for (const s of pts) { const x = R * s[0], y = R * s[1], z = cz + rz * s[2];
-    let nx = x / (R * R), ny = y / (R * R), nz = (z - cz) / (rz * rz), L = Math.hypot(nx, ny, nz) || 1;
-    H.revolve(pos, idx, [[0, -3], [baseR, -3], [baseR, 0], [tipR, len], [0, len]], [x, y, z], [nx / L, ny / L, nz / L], clampA(P.RES * 0.5)); }
-  return { pos, idx }; }
+function weld(pos,idx){                             // merge coincident soup verts (0.02 mm)
+  const map=new Map(),vp=[],remap=new Uint32Array(pos.length/3);
+  for(let i=0;i<pos.length/3;i++){
+    const key=Math.round(pos[i*3]*50)+'_'+Math.round(pos[i*3+1]*50)+'_'+Math.round(pos[i*3+2]*50);
+    let id=map.get(key);
+    if(id===undefined){ id=vp.length/3; map.set(key,id); vp.push(pos[i*3],pos[i*3+1],pos[i*3+2]); }
+    remap[i]=id; }
+  const out=[];
+  for(let t=0;t<idx.length;t+=3){
+    const a=remap[idx[t]],b=remap[idx[t+1]],c=remap[idx[t+2]];
+    if(a!==b&&b!==c&&a!==c) out.push(a,b,c); }
+  return { pos:vp, idx:out };
+}
+
+function taubin(vp,idx,iters){                      // λ|μ smoothing, keeps volume ~stable
+  if(iters<=0) return;
+  const n=vp.length/3, deg=new Uint32Array(n);
+  for(let t=0;t<idx.length;t+=3){ const a=idx[t],b=idx[t+1],c=idx[t+2];
+    deg[a]+=2; deg[b]+=2; deg[c]+=2; }
+  const off=new Uint32Array(n+1);
+  for(let i=0;i<n;i++) off[i+1]=off[i]+deg[i];
+  const nbr=new Uint32Array(off[n]),fill=new Uint32Array(n);
+  for(let t=0;t<idx.length;t+=3){ const a=idx[t],b=idx[t+1],c=idx[t+2];
+    nbr[off[a]+fill[a]++]=b; nbr[off[a]+fill[a]++]=c;
+    nbr[off[b]+fill[b]++]=a; nbr[off[b]+fill[b]++]=c;
+    nbr[off[c]+fill[c]++]=a; nbr[off[c]+fill[c]++]=b; }
+  const src=new Float32Array(vp), tmp=new Float32Array(vp.length);
+  const pass=(from,to,lam)=>{
+    for(let i=0;i<n;i++){
+      const a=off[i],b=off[i+1];
+      if(a===b){ to[i*3]=from[i*3]; to[i*3+1]=from[i*3+1]; to[i*3+2]=from[i*3+2]; continue; }
+      let sx=0,sy=0,sz=0;
+      for(let k=a;k<b;k++){ const j=nbr[k]; sx+=from[j*3]; sy+=from[j*3+1]; sz+=from[j*3+2]; }
+      const m=b-a;
+      to[i*3]=from[i*3]+lam*(sx/m-from[i*3]);
+      to[i*3+1]=from[i*3+1]+lam*(sy/m-from[i*3+1]);
+      to[i*3+2]=from[i*3+2]+lam*(sz/m-from[i*3+2]); } };
+  for(let it=0;it<iters;it++){ pass(src,tmp,0.5); pass(tmp,src,-0.53); }
+  for(let i=0;i<vp.length;i++) vp[i]=src[i];
+}
+
+// build final model-space mesh (z-up). quality>1 = export rebuild.
+function buildMesh(P,quality){
+  const field=makeField(P);
+  const N=clamp(Math.round(P.RES*1.5*quality),40,240);
+  const soupP=[],soupI=[];
+  mt(soupP,soupI,field.F,N,field.bounds.lo,field.bounds.hi);
+  const w=weld(soupP,soupI);
+  taubin(w.pos,w.idx,Math.round(P.SMOOTH));
+  let minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9,minZ=1e9,maxZ=-1e9;
+  for(let i=0;i<w.pos.length;i+=3){ const x=w.pos[i],y=w.pos[i+1],z=w.pos[i+2];
+    if(x<minX)minX=x; if(x>maxX)maxX=x; if(y<minY)minY=y; if(y>maxY)maxY=y; if(z<minZ)minZ=z; if(z>maxZ)maxZ=z; }
+  return { pos:w.pos, idx:w.idx, meta:field.meta,
+           dims:{ w:maxX-minX, d:maxY-minY, h:maxZ-minZ, cx:(minX+maxX)/2, cy:(minY+maxY)/2, mz:minZ, Mz:maxZ } };
+}
 
 // ============================================================================
-//  SHAPE REGISTRY — each: {key, family, label, params:[[k,label,min,max,step,def]|
-//  [k,label,'select',vals,labels,def]], build:(P,H)=>{pos,idx}}
+//  UI — shared sections, body params, presets, favourites, scene, export
 // ============================================================================
-const MODES = [
-// ---- Reaction-diffusion coral ----
-{ key:'coral_rd', family:'Coral', label:'Brain coral (reaction-diffusion)',
-  params:[['RD_AMOUNT','Ridge height',0,20,0.5,7],['RD_FEED','Feed F',0.02,0.09,0.001,0.055],['RD_KILL','Kill k',0.03,0.075,0.001,0.062],['RD_STEPS','Sim steps',400,5000,100,2500]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,rd=getRD(P);
-    H.dome(pos,idx,R,P.HEIGHT*0.6,clampA(P.RES*3),clampA(P.RES*2),4,(th,phi)=>{ const u=phi/(0.5*Math.PI); return P.RD_AMOUNT*(sampleRD(rd,u*Math.cos(th),u*Math.sin(th))-0.5)*2; });
-    return {pos,idx}; } },
-// ---- Sculpted corals ----
-{ key:'bubble', family:'Coral', label:'Bubble coral (vesicle pile)',
-  params:[['BUB_MIN','Min bubble',8,30,0.5,13],['BUB_MAX','Max bubble',12,40,0.5,26]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2*0.86,Hm=P.HEIGHT*0.55;
-    H.dome(pos,idx,R,Hm,clampA(P.RES*2),clampA(P.RES*1.4),4,null);
-    const n=Math.max(12,Math.round(P.N_PADS*3)),ga=Math.PI*(3-Math.sqrt(5));
-    let a=(Math.round(P.SEED)*40503)>>>0||1; const rnd=()=>{a=(a*1103515245+12345)>>>0;return a/4294967296;};
-    for(let i=0;i<n;i++){ const u=Math.sqrt((i+0.5)/n),th=i*ga,phi=0.5*Math.PI*u,sp=Math.sin(phi),cp=Math.cos(phi);
-      const px=R*sp*Math.cos(th),py=R*sp*Math.sin(th),pz=4+Hm*cp,br=P.BUB_MIN+(P.BUB_MAX-P.BUB_MIN)*(1-u)*(0.7+0.4*rnd());
-      H.sphere(pos,idx,px,py,pz+br*0.45,br,clampA(P.RES*0.6),clampA(P.RES*0.4)); }
-    return {pos,idx}; } },
-{ key:'cauliflower', family:'Coral', label:'Cauliflower coral (knobby)',
-  params:[['KNOB_AMP','Lump depth',2,30,0.5,16],['KNOB_FREQ','Lump freq',1,8,0.1,3.4]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2*0.9;
-    H.dome(pos,idx,R,P.HEIGHT,clampA(P.RES*2.6),clampA(P.RES*1.8),4,(th,phi)=>{ const d=dir(th,phi),f=P.KNOB_FREQ;
-      const n=H.vnoise(d[0]*f*3+1.1,d[1]*f*3-0.7)*0.6+H.vnoise(d[1]*f*6+3.2,d[2]*f*6+1.4)*0.3+H.vnoise(d[2]*f*11-2.1,d[0]*f*11+0.5)*0.1;
-      const fade=Math.max(0,Math.min(1,(0.5*Math.PI-phi)/0.3)); return P.KNOB_AMP*n*fade; });
-    return {pos,idx}; } },
-{ key:'greatstar', family:'Coral', label:'Great star coral (corallite cups)',
-  params:[['CUP_DIA','Cup dia',14,44,0.5,26],['CUP_H','Cup rise',3,16,0.5,7],['CUP_PIT','Pit depth',2,12,0.5,5]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,Hb=P.HEIGHT*0.72;
-    H.dome(pos,idx,R,Hb,clampA(P.RES*2),clampA(P.RES*1.3),4,null);
-    const ro=P.CUP_DIA/2,wall=Math.max(2,ro*0.28),ri=ro-wall,ga=Math.PI*(3-Math.sqrt(5));
-    for(let i=0;i<P.N_PADS;i++){ const u=0.15+0.7*Math.sqrt((i+0.5)/P.N_PADS),th=i*ga,phi=0.5*Math.PI*u,sp=Math.sin(phi),cp=Math.cos(phi);
-      const x=R*sp*Math.cos(th),y=R*sp*Math.sin(th),z=4+Hb*cp; let nx=x/(R*R),ny=y/(R*R),nz=(z-4)/(Hb*Hb),L=Math.hypot(nx,ny,nz)||1;
-      H.revolve(pos,idx,[[0,P.CUP_H-P.CUP_PIT],[ri,P.CUP_H-P.CUP_PIT],[ri,P.CUP_H],[ro,P.CUP_H],[ro,-4],[0,-4]],[x,y,z],[nx/L,ny/L,nz/L],clampA(P.RES*0.5)); }
-    return {pos,idx}; } },
-// ---- New algorithm playground ----
-{ key:'metaball', family:'New algorithms', label:'Metaball lobes (≈ the real device)',
-  params:[['LOBE_R','Lobe size',0.18,0.5,0.01,0.32],['BLEND','Valley blend',2,40,1,13],['CORE','Core size',0.2,0.6,0.01,0.4]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,rL=R*P.LOBE_R,rC=R*P.CORE,cz=P.HEIGHT*0.5,k=P.BLEND;
-    const cs=H.fib(P.N_PADS).map(v=>[v[0]*R*0.6,v[1]*R*0.6,cz+v[2]*P.HEIGHT*0.36]);
-    const lo=[-R*1.5,-R*1.5,-2],hi=[R*1.5,R*1.5,P.HEIGHT+R*0.4],N=Math.max(34,Math.min(96,Math.round(P.RES*1.4)));
-    const fn=(x,y,z)=>{ let d=Math.hypot(x,y,z-cz)-rC; for(const c of cs){ const dd=Math.hypot(x-c[0],y-c[1],z-c[2])-rL; d=H.smin(d,dd,k); } return Math.min(-d, z); };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'voronoi', family:'New algorithms', label:'Puffed Voronoi cells (scutes)',
-  params:[['CELL_AMP','Cell puff',2,26,0.5,12],['GROOVE','Groove width',0.02,0.4,0.01,0.13]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,pts=H.fib(P.N_PADS);
-    H.dome(pos,idx,R,P.HEIGHT*0.7,clampA(P.RES*3),clampA(P.RES*2),4,(th,phi)=>{ const [b1,b2]=nearest2(dir(th,phi),pts); return P.CELL_AMP*Math.tanh((b1-b2)/P.GROOVE); });
-    return {pos,idx}; } },
-{ key:'geodesic', family:'New algorithms', label:'Pollen / geodesic bumps',
-  params:[['BUMP_H','Bump height',2,26,0.5,11],['BUMP_W','Bump width',0.2,1.3,0.02,0.6]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,pts=H.fib(P.N_PADS);
-    H.ball(pos,idx,0,0,P.HEIGHT/2+4,R,R,P.HEIGHT/2,clampA(P.RES*2.4),clampA(P.RES*1.6),(th,phi)=>{ const d=dir(th,phi); let b=-2; for(const q of pts){const dot=d[0]*q[0]+d[1]*q[1]+d[2]*q[2];if(dot>b)b=dot;} const ang=Math.acos(Math.min(1,b)); const t=Math.max(0,1-ang/P.BUMP_W); return P.BUMP_H*t*t*(3-2*t); });
-    return {pos,idx}; } },
-{ key:'gourd', family:'New algorithms', label:'Gourd / pumpkin lobes',
-  params:[['RIB_DEPTH','Lobe depth',0.02,0.45,0.01,0.2],['SQUASH','Squash',0.5,1.4,0.02,1]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2;
-    H.dome(pos,idx,R,P.HEIGHT*P.SQUASH,clampA(P.RES*3),clampA(P.RES*2),4,(th,phi)=>{ const s=0.5+0.5*Math.cos(P.N_PADS*th),fade=Math.sin(phi); return R*P.RIB_DEPTH*Math.pow(s,1.5)*fade - R*P.RIB_DEPTH*0.4*fade; });
-    return {pos,idx}; } },
-{ key:'superformula', family:'New algorithms', label:'Superformula supershape',
-  params:[['SF_N1','n1',0.3,8,0.1,0.6],['SF_N2','n2',0.3,8,0.1,1.7],['SF_N3','n3',0.3,8,0.1,1.7]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,m=P.N_PADS;
-    const sf=(a)=>{ const t1=Math.pow(Math.abs(Math.cos(m*a/4)),P.SF_N2),t2=Math.pow(Math.abs(Math.sin(m*a/4)),P.SF_N3); return Math.pow(t1+t2,-1/P.SF_N1); };
-    const na=clampA(P.RES*3),nl=clampA(P.RES*2);
-    // build ellipsoid-ish with radius scaled by supershape in longitude, profile in latitude
-    H.ball(pos,idx,0,0,P.HEIGHT/2+4,R,R,P.HEIGHT/2,na,nl,(th,phi)=>{ const s=Math.min(2.2,sf(th)); return (s-1)*R*0.5*Math.sin(phi); });
-    return {pos,idx}; } },
-{ key:'crystal', family:'New algorithms', label:'Crystal / faceted (Wulff)',
-  params:[['FACET_D','Facet dist',0.5,1.1,0.01,0.85],['JITTER','Jitter',0,0.4,0.01,0]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,dirs=H.fib(P.N_PADS);
-    let a=(Math.round(P.SEED)*2246822519)>>>0||1; const rnd=()=>{a=(a*1103515245+12345)>>>0;return a/4294967296;};
-    const dd=dirs.map(n=>R*P.FACET_D*(1+P.JITTER*(rnd()-0.5)*2));
-    const lo=[-R*1.2,-R*1.2,-1],hi=[R*1.2,R*1.2,P.HEIGHT+2],N=Math.max(28,Math.min(84,Math.round(P.RES*1.1)));
-    const fn=(x,y,z)=>{ let mmin=1e9; for(let i=0;i<dirs.length;i++){const n=dirs[i],v=dd[i]-(x*n[0]+y*n[1]+z*n[2]);if(v<mmin)mmin=v;} return Math.min(mmin,z); };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-// ---- Cactus (basic) ----
-{ key:'cactus', family:'Cactus', label:'Cactus (ribbed globe)',
-  params:[['CSPEC','Species','select',['echinopsis','bishopcap','powderpuff'],['Echinopsis','Bishop cap','Powder puff'],'bishopcap'],['RIB_DEPTH','Rib depth',0.02,0.4,0.01,0.16]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2*0.9,ribs=P.CSPEC==='bishopcap'?5:(P.CSPEC==='echinopsis'?12:0);
-    const pts=P.CSPEC==='powderpuff'?H.fib(Math.max(40,Math.round(P.N_PADS*5))):null;
-    H.dome(pos,idx,R,P.HEIGHT*(P.CSPEC==='echinopsis'?0.75:1.05),clampA(P.RES*3),clampA(P.RES*2),4,(th,phi)=>{ const fade=Math.sin(phi);
-      if(pts){ const d=dir(th,phi); let b=-2; for(const q of pts){const dot=d[0]*q[0]+d[1]*q[1]+d[2]*q[2];if(dot>b)b=dot;} const ang=Math.acos(Math.min(1,b)); return R*0.14*Math.max(0,1-ang/0.34); }
-      const s=0.5+0.5*Math.cos(ribs*th); return -R*P.RIB_DEPTH*Math.pow(s,1.4)*fade; });
-    return {pos,idx}; } },
-// ---- Mushroom (basic) ----
-{ key:'mushroom', family:'Mushroom', label:'Mushroom (cap + stem)',
-  params:[['MSPEC','Species','select',['amanita','morel'],['Amanita','Morel'],'amanita'],['CAP','Cap dia',0.4,1.0,0.02,0.8]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,capR=R*P.CAP,sp=P.MSPEC;
-    if(sp==='morel'){ const pts=H.fib(Math.max(30,Math.round(P.N_PADS*4)));
-      H.ball(pos,idx,0,0,P.HEIGHT*0.5,capR*0.72,capR*0.72,P.HEIGHT*0.44,clampA(P.RES*2.6),clampA(P.RES*1.8),(th,phi)=>{ const [b1,b2]=nearest2(dir(th,phi),pts); return capR*0.16*(Math.tanh((b1-b2)/0.1)-0.5); });
-      H.revolve(pos,idx,[[0,0],[R*0.3,0],[R*0.26,P.HEIGHT*0.18],[0,P.HEIGHT*0.18]],[0,0,0],[0,0,1],clampA(P.RES*0.7));
-    } else { H.revolve(pos,idx,[[0,0],[R*0.34,0],[R*0.2,P.HEIGHT*0.55],[R*0.22,P.HEIGHT*0.6],[0,P.HEIGHT*0.6]],[0,0,0],[0,0,1],clampA(P.RES*0.7));
-      const pts=H.fib(Math.max(20,Math.round(P.N_PADS*3)));
-      H.dome(pos,idx,capR,P.HEIGHT*0.42,clampA(P.RES*2.4),clampA(P.RES*1.4),P.HEIGHT*0.55,(th,phi)=>{ const d=dir(th,phi);let b=-2;for(const q of pts){const dot=d[0]*q[0]+d[1]*q[1]+d[2]*q[2];if(dot>b)b=dot;}const ang=Math.acos(Math.min(1,b));return capR*0.06*Math.max(0,1-ang/0.28); }); }
-    return {pos,idx}; } },
-// ---- Classic Omniphone generators (thistle / lloyd / cymatics / mandelbulb) ----
-{ key:'thistle', family:'Classic', label:'Thistle bulb (phyllotaxis spikes)',
-  params:[['SPIKE_LEN','Spike length',0.1,0.5,0.01,0.26],['SPIKE_BASE','Spike base',0.06,0.3,0.01,0.15]],
-  build(P,H){ return buildThistle(P,H,'phyllotaxis'); } },
-{ key:'lloyd', family:'Classic', label:'Thistle bulb (Lloyd-relaxed spikes)',
-  params:[['SPIKE_LEN','Spike length',0.1,0.5,0.01,0.26],['SPIKE_BASE','Spike base',0.06,0.3,0.01,0.15]],
-  build(P,H){ return buildThistle(P,H,'lloyd'); } },
-{ key:'cymatics', family:'Classic', label:'Cymatics dome (standing wave)',
-  params:[['CY_M','Angular m',0,10,1,5],['CY_N','Radial n',1,6,1,3],['CY_AMP','Ripple height',2,30,0.5,12]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,z1=besselZero(Math.round(P.CY_M),Math.round(P.CY_N));
-    let peak=1e-9; for(let i=0;i<=60;i++) peak=Math.max(peak,Math.abs(besselJ(Math.round(P.CY_M),z1*i/60))); const sc=1/peak;
-    H.dome(pos,idx,R,P.HEIGHT*0.6,clampA(P.RES*3),clampA(P.RES*2),4,(th,phi)=>{ const u=phi/(0.5*Math.PI); return P.CY_AMP*besselJ(Math.round(P.CY_M),z1*u)*sc*Math.cos(Math.round(P.CY_M)*th); });
-    return {pos,idx}; } },
-{ key:'mandelbulb', family:'Classic', label:'Mandelbulb (fractal)',
-  params:[['MB_POWER','Power',3,10,1,8],['MB_ITER','Iterations',3,12,1,6],['MB_LEVEL','Level',2,10,0.5,4]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,cz=P.HEIGHT*0.5,sc=R/1.2,zsc=(P.HEIGHT*0.5)/1.2,it=Math.round(P.MB_ITER),pw=P.MB_POWER;
-    const lo=[-R*1.25,-R*1.25,cz-zsc*1.25],hi=[R*1.25,R*1.25,cz+zsc*1.25],N=Math.max(40,Math.min(92,Math.round(P.RES*1.5)));
-    const fn=(x,y,z)=>{ const cx=x/sc,cy=y/sc,c2=(z-cz)/zsc; let zx=cx,zy=cy,zz=c2,r=0,i;
-      for(i=0;i<it;i++){ r=Math.hypot(zx,zy,zz); if(r>2)break; let th=Math.acos(zz/(r||1)),ph=Math.atan2(zy,zx),zr=Math.pow(r,pw); th*=pw;ph*=pw;
-        zx=cx+zr*Math.sin(th)*Math.cos(ph); zy=cy+zr*Math.sin(th)*Math.sin(ph); zz=c2+zr*Math.cos(th); } return i-P.MB_LEVEL; };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-// ---- Fractals (taken at low order = printable chunky lobed blanks) ----
-{ key:'mandelbox', family:'Fractals', label:'Mandelbox',
-  params:[['MX_SCALE','Scale',1.5,3,0.05,2.2],['MX_ITER','Iterations',3,10,1,5],['MX_LEVEL','Level',2,9,0.5,4]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,cz=P.HEIGHT*0.5,dom=3.4,sc=R/dom,zsc=(P.HEIGHT*0.5)/dom,S=P.MX_SCALE,it=Math.round(P.MX_ITER);
-    const lo=[-R*1.2,-R*1.2,cz-zsc*1.2],hi=[R*1.2,R*1.2,cz+zsc*1.2],N=Math.max(34,Math.min(60,Math.round(P.RES*1.05)));
-    const fn=(x,y,z)=>{ const cx=x/sc,cy=y/sc,c2=(z-cz)/zsc; let zx=cx,zy=cy,zz=c2,i;
-      for(i=0;i<it;i++){ zx=zx>1?2-zx:(zx<-1?-2-zx:zx); zy=zy>1?2-zy:(zy<-1?-2-zy:zy); zz=zz>1?2-zz:(zz<-1?-2-zz:zz);
-        const r2=zx*zx+zy*zy+zz*zz; if(r2<0.25){zx*=4;zy*=4;zz*=4;} else if(r2<1){const m=1/r2;zx*=m;zy*=m;zz*=m;}
-        zx=S*zx+cx; zy=S*zy+cy; zz=S*zz+c2; if(zx*zx+zy*zy+zz*zz>36)break; }
-      return Math.min(i-P.MX_LEVEL, z*0.5); };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'qjulia', family:'Fractals', label:'Quaternion Julia',
-  params:[['QJ_ITER','Iterations',3,12,1,7],['QJ_LEVEL','Level',2,11,0.5,5]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,cz=P.HEIGHT*0.5,dom=1.4,sc=R/dom,zsc=(P.HEIGHT*0.5)/dom,it=Math.round(P.QJ_ITER);
-    const cA=-0.45,cB=0.6,cC=0.2,cD=0.0;
-    const lo=[-R*1.15,-R*1.15,cz-zsc*1.15],hi=[R*1.15,R*1.15,cz+zsc*1.15],N=Math.max(38,Math.min(74,Math.round(P.RES*1.2)));
-    const fn=(x,y,z)=>{ let a=x/sc,b=y/sc,c=(z-cz)/zsc,d=0,i;
-      for(i=0;i<it;i++){ const na=a*a-b*b-c*c-d*d+cA, nb=2*a*b+cB, nc=2*a*c+cC, nd=2*a*d+cD; a=na;b=nb;c=nc;d=nd; if(a*a+b*b+c*c+d*d>16)break; }
-      return i-P.QJ_LEVEL; };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'juliabulb', family:'Fractals', label:'Juliabulb',
-  params:[['JB_POWER','Power',3,10,1,8],['JB_ITER','Iterations',3,12,1,6],['JB_LEVEL','Level',2,11,0.5,4]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,cz=P.HEIGHT*0.5,dom=1.2,sc=R/dom,zsc=(P.HEIGHT*0.5)/dom,it=Math.round(P.JB_ITER),pw=P.JB_POWER;
-    const kx=0.35,ky=0.5,kz=0.15;
-    const lo=[-R*1.2,-R*1.2,cz-zsc*1.2],hi=[R*1.2,R*1.2,cz+zsc*1.2],N=Math.max(38,Math.min(74,Math.round(P.RES*1.15)));
-    const fn=(x,y,z)=>{ let zx=x/sc,zy=y/sc,zz=(z-cz)/zsc,r=0,i;
-      for(i=0;i<it;i++){ r=Math.hypot(zx,zy,zz); if(r>2)break; let th=Math.acos(zz/(r||1)),ph=Math.atan2(zy,zx),zr=Math.pow(r,pw); th*=pw;ph*=pw;
-        zx=kx+zr*Math.sin(th)*Math.cos(ph); zy=ky+zr*Math.sin(th)*Math.sin(ph); zz=kz+zr*Math.cos(th); } return i-P.JB_LEVEL; };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'menger', family:'Fractals', label:'Menger sponge',
-  params:[['MG_LEVEL','Recursion',1,3,1,2]],
-  build(P,H){ const pos=[],idx=[],L=Math.min(P.SIZE,P.HEIGHT*1.35),lv=Math.round(P.MG_LEVEL);
-    const lo=[-L*0.55,-L*0.55,-L*0.05],hi=[L*0.55,L*0.55,L*1.05],N=Math.max(42,Math.min(72,24*lv+12));
-    const fn=(x,y,z)=>{ const u=(x+L/2)/L,v=(y+L/2)/L,w=z/L; if(u<0||u>1||v<0||v>1||w<0||w>1)return -1; return mengerInside(u,v,w,lv)?1:-1; };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'sierpinski', family:'Fractals', label:'Sierpiński tetrahedron',
-  params:[['SP_ITER','Iterations',2,9,1,5],['SP_LEVEL','Level',1,8,0.5,3]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,cz=P.HEIGHT*0.5,dom=1.3,sc=R/dom,zsc=(P.HEIGHT*0.5)/dom,it=Math.round(P.SP_ITER);
-    const lo=[-R*1.2,-R*1.2,cz-zsc*1.2],hi=[R*1.2,R*1.2,cz+zsc*1.2],N=Math.max(40,Math.min(70,Math.round(P.RES*1.15)));
-    const fn=(x,y,z)=>{ let px=x/sc,py=y/sc,pz=(z-cz)/zsc,i;
-      for(i=0;i<it;i++){ if(px+py<0){const t=-py;py=-px;px=t;} if(px+pz<0){const t=-pz;pz=-px;px=t;} if(py+pz<0){const t=-pz;pz=-py;py=t;}
-        px=2*px-1; py=2*py-1; pz=2*pz-1; if(px*px+py*py+pz*pz>16)break; }
-      return Math.min(i-P.SP_LEVEL, z*0.5); };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'apollonian', family:'Fractals', label:'Apollonian sphere packing',
-  params:[['AP_COUNT','Sphere tries',20,300,5,120],['AP_BLEND','Blend',1,20,0.5,6]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,cz=P.HEIGHT*0.5;
-    const sp=apollonianPack(R*0.95,Math.round(P.SEED)+1,Math.round(P.AP_COUNT),R*0.09,R*0.03);
-    const lo=[-R*1.1,-R*1.1,-2],hi=[R*1.1,R*1.1,P.HEIGHT+R*0.2],N=Math.max(38,Math.min(76,Math.round(P.RES*1.2))),k=P.AP_BLEND;
-    const fn=(x,y,z)=>{ let d=1e9; for(const s of sp){ const dd=Math.hypot(x-s[0],y-s[1],z-cz-s[2])-s[3]; d=H.smin(d,dd,k); } return Math.min(-d,z); };
-    H.mt(pos,idx,fn,N,lo,hi); return {pos,idx}; } },
-{ key:'fbm', family:'Fractals', label:'Fractal-noise blob (fBm)',
-  params:[['FB_OCT','Octaves',1,6,1,3],['FB_AMP','Bump height',3,40,0.5,16],['FB_FREQ','Base freq',0.5,4,0.1,1.6]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2;
-    const disp=(th,phi)=>{ const d=dir(th,phi); let amp=1,freq=P.FB_FREQ,sum=0,norm=0;
-      for(let o=0;o<Math.round(P.FB_OCT);o++){ sum+=amp*(H.noise3(d[0]*freq+3.1,d[1]*freq-1.7,d[2]*freq+0.5)-0.5)*2; norm+=amp; amp*=0.5; freq*=2; }
-      const fade=Math.max(0,Math.min(1,(0.5*Math.PI-phi)/0.25+0.15)); return P.FB_AMP*(sum/(norm||1))*fade; };
-    H.dome(pos,idx,R,P.HEIGHT,clampA(P.RES*2.6),clampA(P.RES*1.8),4,disp); return {pos,idx}; } },
-{ key:'romanesco', family:'Fractals', label:'Romanesco (recursive florets)',
-  params:[['RO_FLORETS','Florets',10,60,1,28],['RO_CONE','Floret size',0.2,0.8,0.02,0.45]],
-  build(P,H){ const pos=[],idx=[],R=P.SIZE/2,C=P.HEIGHT;
-    H.revolve(pos,idx,[[0,0],[R,0],[0,C]],[0,0,0],[0,0,1],clampA(P.RES*1.5));   // central cone body
-    const n=Math.round(P.RO_FLORETS),ga=Math.PI*(3-Math.sqrt(5));
-    for(let i=0;i<n;i++){ const t=(i+0.5)/n,rr=R*(1-t)*0.94,z=C*t*0.98,th=i*ga,px=rr*Math.cos(th),py=rr*Math.sin(th);
-      const nx=Math.cos(th)*0.72,ny=Math.sin(th)*0.72,nz=0.7,fl=R*P.RO_CONE*(1-t*0.6);
-      H.cone(pos,idx,[px,py,z],[nx,ny,nz],fl*0.5,fl*0.14,fl,clampA(P.RES*0.4));
-      const L=Math.hypot(nx,ny,nz); H.sphere(pos,idx,px+nx/L*fl,py+ny/L*fl,z+nz/L*fl,fl*0.17,clampA(P.RES*0.4),clampA(P.RES*0.3)); }
-    return {pos,idx}; } },
+const P={}, STEPS={};
+const SECTIONS=[
+ {title:'Envelope', rows:[
+   ['SIZE','Width (mm)',60,220,1,150],
+   ['HEIGHT','Height (mm)',20,200,1,95],
+   ['SEED','Seed',0,60,1,3]]},
+ {title:'Pads', rows:[
+   ['N_PADS','Pad count',0,192,1,12],
+   ['PAD_STYLE','Style','select',['lobe','bump','spike','seat','none'],['Lobe (metaball)','Bump (soft)','Spike (thistle)','Seat only','None'],'lobe'],
+   ['PAD_DIA','Pad dia (mm)',8,80,0.5,34],
+   ['PAD_H','Pad height (mm)',2,50,0.5,16],
+   ['PAD_BLEND','Blend into body',0,30,0.5,10],
+   ['BAND_LO','Band low (z)',-0.6,0.8,0.01,-0.15],
+   ['BAND_HI','Band high (z)',0,1,0.01,0.95],
+   ['RELAX','Spacing relax',0,60,1,14]]},
+ {title:'Pad tops', rows:[
+   ['FLAT','Flat seat','select',['on','off'],['On','Off'],'on'],
+   ['SEAT_DIA','Seat dia (mm)',6,60,0.5,24],
+   ['RECESS','Cap recess (mm)',0,5,0.1,1.6],
+   ['PAD_HOLE','LED hole dia',0,30,0.5,0]]},
+ {title:'Screen — 1.28″ round (module Ø37.5, view Ø32.4)', rows:[
+   ['SCREEN_MODE','Screen','select',['on','none'],['On','Off'],'on'],
+   ['SCREEN_TILT','Tilt (° from top)',0,80,1,0],
+   ['SCREEN_AZ','Azimuth (°)',0,360,1,0],
+   ['SCREEN_SEAT','Module seat dia',30,46,0.1,38.5],
+   ['SCREEN_DIA','Aperture dia',24,40,0.1,33.5],
+   ['SCREEN_DEPTH','Seat depth',1,12,0.1,4.5],
+   ['SCREEN_MARGIN','Platform margin',0,16,0.5,4],
+   ['SCREEN_BLEND','Platform blend',1,25,0.5,9]]},
+ {title:'Shell & bottom', rows:[
+   ['HOLLOW','Hollow shell','select',['on','off'],['On (open bottom)','Off (solid)'],'on'],
+   ['WALL','Wall (mm)',1.5,8,0.1,3],
+   ['BASE_TRIM','Base trim (mm)',0,40,0.5,6]]},
+ {title:'Ports', rows:[
+   ['PORT_USB','USB-C slot','select',['on','off'],['On','Off'],'on'],
+   ['USB_AZ','USB azimuth (°)',0,360,1,180],
+   ['USB_Z','USB height (mm)',3,40,0.5,9],
+   ['PORT_JACK','Audio jack','select',['on','off'],['On','Off'],'on'],
+   ['JACK_AZ','Jack azimuth (°)',0,360,1,210],
+   ['JACK_Z','Jack height (mm)',3,40,0.5,9]]},
+ {title:'Overlay texture', rows:[
+   ['OVERLAY','Type','select',['none','bubbles','apollonian'],['None','Bubble pile','Apollonian bulges'],'none'],
+   ['OV_COUNT','Bubble count',6,120,1,40],
+   ['OV_MIN','Min size (mm)',3,30,0.5,10],
+   ['OV_MAX','Max size (mm)',6,45,0.5,24],
+   ['OV_BLEND','Blend',0,20,0.5,4],
+   ['AP_COUNT','Apollonian tries',20,400,5,150]]},
+ {title:'Quality', rows:[
+   ['RES','Resolution',24,110,1,46],
+   ['SMOOTH','Smoothing iters',0,60,1,4],
+   ['EXPQ','Export quality ×',1,2.5,0.1,1.6]]},
 ];
+function setDefault(d){ if(d[2]==='select'){ if(P[d[0]]===undefined)P[d[0]]=d[d.length-1]; return; }
+  if(P[d[0]]===undefined)P[d[0]]=d[5]; STEPS[d[0]]=d[4]; }
+SECTIONS.forEach(s=>s.rows.forEach(setDefault));
+BODIES.forEach(b=>b.params.forEach(setDefault));
+P.BODY='blob';
+const DEFAULTS=JSON.parse(JSON.stringify(P));
 
-// ============================================================================
-//  Framework — UI, scene, rebuild
-// ============================================================================
-const P = {}, STEPS = {};
-const SHARED = [
-  ['SIZE','Width (mm)',60,240,1,150],['HEIGHT','Height (mm)',20,220,1,95],
-  ['N_PADS','Feature count',1,24,1,10],['RES','Resolution',16,110,1,52],['SEED','Seed',0,60,1,3],
-  ['__scr','__screen'],
-  ['SCREEN_MODE','Screen','select',['top','base','none'],['Crown','Base','None'],'top'],
-  ['SCREEN_DIA','Screen dia',10,90,1,32],['SCREEN_MARGIN','Bezel',0,16,0.5,4],['SCREEN_DEPTH','Depth',1,20,0.5,6],
-];
-function setDefault(d){ if(d[2]==='select'){ if(P[d[0]]===undefined) P[d[0]]=d[d.length-1]; return; } if(P[d[0]]===undefined) P[d[0]]=d[5]; STEPS[d[0]]=d[4]; }
-SHARED.forEach(d=>{ if(d[0].startsWith('__'))return; setDefault(d); });
-
-function fmt(k,v){ return STEPS[k]<1 ? +v.toFixed(STEPS[k]<0.01?3:2) : Math.round(v); }
+function fmt(k,v){ const st=STEPS[k]; return (st&&st<1)?+v.toFixed(st<0.01?3:2):Math.round(v); }
 function makeRow(container,d,onChange){
   if(d[2]==='select'){ const [key,label,,vals,labels,def]=d; const row=document.createElement('div'); row.className='row sel';
     const lab=document.createElement('label'); lab.textContent=label; const sel=document.createElement('select');
-    vals.forEach((v,i)=>{const o=document.createElement('option');o.value=v;o.textContent=labels[i];sel.appendChild(o);}); sel.value=P[key]!==undefined?P[key]:def;
+    vals.forEach((v,i)=>{const o=document.createElement('option');o.value=v;o.textContent=labels[i];sel.appendChild(o);});
+    sel.value=P[key]!==undefined?P[key]:def;
     sel.addEventListener('change',()=>{P[key]=sel.value;onChange();}); row.append(lab,sel); container.appendChild(row); return; }
-  const [key,label,min,max,step,def]=d; const row=document.createElement('div'); row.className='row';
+  const [key,label,min,max,step]=d; const row=document.createElement('div'); row.className='row';
   const lab=document.createElement('label'); lab.textContent=label;
-  const rng=document.createElement('input'); rng.type='range'; rng.min=min; rng.max=max; rng.step=step; rng.value=P[key]!==undefined?P[key]:def;
+  const rng=document.createElement('input'); rng.type='range'; rng.min=min; rng.max=max; rng.step=step; rng.value=P[key];
   const num=document.createElement('input'); num.type='number'; num.step=step; num.value=fmt(key,+rng.value);
   rng.addEventListener('input',()=>{P[key]=parseFloat(rng.value);num.value=fmt(key,P[key]);onChange();});
   num.addEventListener('input',()=>{const v=parseFloat(num.value);if(Number.isNaN(v))return;P[key]=v;rng.value=v;onChange();});
   row.append(lab,rng,num); container.appendChild(row);
 }
 
-// shape dropdown grouped by family
 const shapeSel=document.getElementById('shapeSel');
-const fams={}; MODES.forEach(m=>{(fams[m.family]||(fams[m.family]=[])).push(m);});
-Object.keys(fams).forEach(f=>{ const og=document.createElement('optgroup'); og.label=f; fams[f].forEach(m=>{const o=document.createElement('option');o.value=m.key;o.textContent=m.label;og.appendChild(o);}); shapeSel.appendChild(og); });
-let currentKey=MODES[0].key;
-shapeSel.value=currentKey;
-shapeSel.addEventListener('change',()=>{ currentKey=shapeSel.value; renderModeParams(); schedule(); });
+BODIES.forEach(b=>{const o=document.createElement('option');o.value=b.key;o.textContent=b.label;shapeSel.appendChild(o);});
+shapeSel.value=P.BODY;
+shapeSel.addEventListener('change',()=>{P.BODY=shapeSel.value;renderModeParams();schedule();});
 
-// shared params (rebuildable so loading a favourite can refresh the inputs)
 const sharedC=document.getElementById('shared');
-function renderSharedParams(){ sharedC.innerHTML=''; SHARED.forEach(d=>{ if(d[0]==='__scr'){ const h=document.createElement('div'); h.className='grp'; h.textContent='Screen'; sharedC.appendChild(h); return; } makeRow(sharedC,d,schedule); }); }
-renderSharedParams();
-
+function renderSharedParams(){ sharedC.innerHTML='';
+  SECTIONS.forEach(s=>{ const h=document.createElement('div'); h.className='grp'; h.textContent=s.title; sharedC.appendChild(h);
+    s.rows.forEach(d=>makeRow(sharedC,d,schedule)); }); }
 const modeC=document.getElementById('modeparams');
-function renderModeParams(){ modeC.innerHTML=''; const m=MODES.find(x=>x.key===currentKey);
-  document.getElementById('mhdr').textContent=m.label; m.params.forEach(d=>{ setDefault(d); makeRow(modeC,d,schedule); }); }
+function renderModeParams(){ modeC.innerHTML=''; const b=BODIES.find(x=>x.key===P.BODY);
+  b.params.forEach(d=>{ setDefault(d); makeRow(modeC,d,schedule); }); }
 
-// ---- three.js ----
+// ---- three.js scene ----
 const view=document.getElementById('view');
 const renderer=new THREE.WebGLRenderer({antialias:true}); renderer.setPixelRatio(window.devicePixelRatio); view.appendChild(renderer.domElement);
 const scene=new THREE.Scene(); scene.background=new THREE.Color(0x0f141a);
@@ -498,99 +674,115 @@ const controls=new THREE.OrbitControls(camera,renderer.domElement); controls.ena
 scene.add(new THREE.HemisphereLight(0xffffff,0x20303a,0.95));
 const kL=new THREE.DirectionalLight(0xffffff,0.8); kL.position.set(0.7,1.3,0.6); scene.add(kL);
 const fL=new THREE.DirectionalLight(0xffd9c2,0.32); fL.position.set(-0.8,0.5,-0.6); scene.add(fL);
-const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.62,metalness:0.05,side:THREE.DoubleSide,flatShading:true});
+const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.62,metalness:0.05,side:THREE.DoubleSide});
 const C_LO=new THREE.Color(0x5c2b25),C_HI=new THREE.Color(0xffc0a6);
-let mesh=null, lastGeom=null;
+let mesh=null,lastModel=null;
 function resize(){ const w=view.clientWidth,h=view.clientHeight; renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix(); }
 window.addEventListener('resize',resize);
 
-function addScreen(pos,idx,maxZ){
-  if(P.SCREEN_MODE==='none'||P.SCREEN_DIA<=0) return;
-  const ri=P.SCREEN_DIA/2, ro=P.SCREEN_DIA/2+P.SCREEN_MARGIN;
-  if(P.SCREEN_MODE==='top'){ const hr=Math.max(4,P.SCREEN_DEPTH+2);
-    H.revolve(pos,idx,[[0,hr-P.SCREEN_DEPTH],[ri,hr-P.SCREEN_DEPTH],[ri,hr],[ro,hr],[ro,-3],[0,-3]],[0,0,maxZ],[0,0,1],48);
-  } else { H.revolve(pos,idx,[[0,P.SCREEN_DEPTH],[ri,P.SCREEN_DEPTH],[ri,0],[ro,0],[ro,-0.1],[0,-0.1]],[0,0,0],[0,0,1],48); }
-}
-
-function buildGeometry(){
-  const m=MODES.find(x=>x.key===currentKey);
-  const {pos,idx}=m.build(P,H);
-  let maxZ=-1e9,minZ=1e9,minX=1e9,maxX=-1e9,minY=1e9,maxY=-1e9;
-  for(let i=0;i<pos.length;i+=3){ const x=pos[i],y=pos[i+1],z=pos[i+2]; if(z>maxZ)maxZ=z; if(z<minZ)minZ=z; if(x<minX)minX=x; if(x>maxX)maxX=x; if(y<minY)minY=y; if(y>maxY)maxY=y; }
-  addScreen(pos,idx,maxZ);
-  lastGeom={pos,idx};                                  // model-space (z-up) for STL export
-  const cx=(minX+maxX)/2, cy=(minY+maxY)/2;
-  const n=pos.length/3, out=new Float32Array(pos.length), col=new Float32Array(pos.length), tmp=new THREE.Color();
-  let mz=1e9,Mz=-1e9;
-  for(let i=0;i<pos.length;i+=3){ const z=pos[i+2]; if(z<mz)mz=z; if(z>Mz)Mz=z; }
-  const span=(Mz-mz)||1;
-  for(let i=0;i<n;i++){ const x=pos[i*3]-cx,y=pos[i*3+1]-cy,z=pos[i*3+2]; out[i*3]=x; out[i*3+1]=z; out[i*3+2]=y; // z-up -> Y-up
-    tmp.copy(C_LO).lerp(C_HI,Math.pow((z-mz)/span,0.8)); col[i*3]=tmp.r; col[i*3+1]=tmp.g; col[i*3+2]=tmp.b; }
+function rebuild(){
+  const m=buildMesh(P,1); lastModel=m;
+  const {pos,idx,dims,meta}=m, n=pos.length/3;
+  const out=new Float32Array(pos.length),col=new Float32Array(pos.length),tmp=new THREE.Color();
+  const span=(dims.Mz-dims.mz)||1;
+  for(let i=0;i<n;i++){ const x=pos[i*3]-dims.cx,y=pos[i*3+1]-dims.cy,z=pos[i*3+2];
+    out[i*3]=x; out[i*3+1]=z; out[i*3+2]=y;         // z-up → three.js Y-up
+    tmp.copy(C_LO).lerp(C_HI,Math.pow((z-dims.mz)/span,0.8));
+    col[i*3]=tmp.r; col[i*3+1]=tmp.g; col[i*3+2]=tmp.b; }
   const g=new THREE.BufferGeometry();
   g.setAttribute('position',new THREE.BufferAttribute(out,3));
   g.setAttribute('color',new THREE.BufferAttribute(col,3));
   g.setIndex(new THREE.BufferAttribute(new Uint32Array(idx),1));
   g.computeVertexNormals();
-  g.userData={W:Math.max(maxX-minX,maxY-minY),Hh:maxZ,tris:idx.length/3};
-  return g;
-}
-
-function rebuild(){
   if(mesh){ scene.remove(mesh); mesh.geometry.dispose(); }
-  const g=buildGeometry(); mesh=new THREE.Mesh(g,mat); scene.add(mesh);
-  const u=g.userData; const m=MODES.find(x=>x.key===currentKey);
-  document.getElementById('tris').textContent=`${m.label} · ${u.tris.toLocaleString()} tris`;
-  document.getElementById('dims').innerHTML=`≈ <b>${u.W.toFixed(0)} × ${u.W.toFixed(0)} × ${u.Hh.toFixed(0)}</b> mm`
-    +`<div class="tgt">${m.family} · ${Math.round(P.N_PADS)} features · preview (STL from the family .py)</div>`;
+  mesh=new THREE.Mesh(g,mat); scene.add(mesh);
+  document.getElementById('tris').textContent=`${meta.body.label} · ${(idx.length/3).toLocaleString()} tris`;
+  const over=Math.max(dims.w,dims.d)>220;
+  document.getElementById('dims').innerHTML=
+    `≈ <b>${dims.w.toFixed(0)} × ${dims.d.toFixed(0)} × ${dims.h.toFixed(0)}</b> mm`
+    +(over?` <span class="bad">⚠ exceeds Ø220 print bed</span>`:'')
+    +`<div class="tgt">${meta.nPads} pads placed${meta.missed?` · <span class="bad">${meta.missed} missed surface</span>`:''}`
+    +` · ${P.HOLLOW==='on'?`shell ${P.WALL} mm, open bottom`:'solid'}</div>`;
   updateParams();
 }
-
 let pend=null;
-function schedule(){ document.getElementById('busy').style.display='block'; clearTimeout(pend); pend=setTimeout(()=>{ try{rebuild();}catch(e){console.error(e);} document.getElementById('busy').style.display='none'; },50); }
+function schedule(){ document.getElementById('busy').style.display='block'; clearTimeout(pend);
+  pend=setTimeout(()=>{ try{rebuild();}catch(e){console.error(e);} document.getElementById('busy').style.display='none'; },60); }
 
-function updateParams(){ const m=MODES.find(x=>x.key===currentKey); const lines=[`# shape: ${m.key}  (${m.family})`];
-  const emit=(k)=>{ const v=P[k]; lines.push(`${k.padEnd(13)}= ${typeof v==='string'?`"${v}"`:(Number.isInteger(v)?v:(+v).toFixed(STEPS[k]<0.01?3:2))}`); };
-  ['SIZE','HEIGHT','N_PADS','RES','SEED','SCREEN_MODE','SCREEN_DIA','SCREEN_MARGIN','SCREEN_DEPTH'].forEach(emit);
-  m.params.forEach(d=>emit(d[0]));
-  document.getElementById('params').textContent=lines.join('\n'); }
-
+function updateParams(){
+  const keep={BODY:P.BODY};
+  SECTIONS.forEach(s=>s.rows.forEach(d=>keep[d[0]]=P[d[0]]));
+  BODIES.find(b=>b.key===P.BODY).params.forEach(d=>keep[d[0]]=P[d[0]]);
+  document.getElementById('params').textContent=JSON.stringify(keep,null,1);
+}
 document.getElementById('copy').addEventListener('click',()=>navigator.clipboard.writeText(document.getElementById('params').textContent));
 
+// ---- STL export: fresh high-res rebuild, model space (z-up, mm) ----
 function exportSTL(){
-  if(!lastGeom) return; const {pos,idx}=lastGeom, nt=idx.length/3;
-  const buf=new ArrayBuffer(84+nt*50), dv=new DataView(buf); dv.setUint32(80,nt,true); let o=84;
-  for(let t=0;t<idx.length;t+=3){ const a=idx[t]*3,b=idx[t+1]*3,c=idx[t+2]*3;
-    const ax=pos[a],ay=pos[a+1],az=pos[a+2],bx=pos[b],by=pos[b+1],bz=pos[b+2],cx=pos[c],cy=pos[c+1],cz=pos[c+2];
-    const ux=bx-ax,uy=by-ay,uz=bz-az,vx=cx-ax,vy=cy-ay,vz=cz-az;
-    let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx; const L=Math.hypot(nx,ny,nz)||1; nx/=L;ny/=L;nz/=L;
-    dv.setFloat32(o,nx,true);dv.setFloat32(o+4,ny,true);dv.setFloat32(o+8,nz,true);o+=12;
-    dv.setFloat32(o,ax,true);dv.setFloat32(o+4,ay,true);dv.setFloat32(o+8,az,true);o+=12;
-    dv.setFloat32(o,bx,true);dv.setFloat32(o+4,by,true);dv.setFloat32(o+8,bz,true);o+=12;
-    dv.setFloat32(o,cx,true);dv.setFloat32(o+4,cy,true);dv.setFloat32(o+8,cz,true);o+=12;
-    dv.setUint16(o,0,true);o+=2; }
-  const url=URL.createObjectURL(new Blob([buf],{type:'model/stl'}));
-  const a=document.createElement('a'); a.href=url; a.download='sculptor_'+currentKey+'.stl'; a.click(); URL.revokeObjectURL(url);
+  document.getElementById('busy').style.display='block';
+  setTimeout(()=>{
+    try{
+      const m=buildMesh(P,P.EXPQ), {pos,idx}=m, nt=idx.length/3;
+      const buf=new ArrayBuffer(84+nt*50),dv=new DataView(buf); dv.setUint32(80,nt,true); let o=84;
+      for(let t=0;t<idx.length;t+=3){ const a=idx[t]*3,b=idx[t+1]*3,c=idx[t+2]*3;
+        const ax=pos[a],ay=pos[a+1],az=pos[a+2],bx=pos[b],by=pos[b+1],bz=pos[b+2],cx=pos[c],cy=pos[c+1],cz=pos[c+2];
+        const ux=bx-ax,uy=by-ay,uz=bz-az,vx=cx-ax,vy=cy-ay,vz=cz-az;
+        let nx=uy*vz-uz*vy,ny=uz*vx-ux*vz,nz=ux*vy-uy*vx; const L=Math.hypot(nx,ny,nz)||1; nx/=L;ny/=L;nz/=L;
+        dv.setFloat32(o,nx,true);dv.setFloat32(o+4,ny,true);dv.setFloat32(o+8,nz,true);o+=12;
+        dv.setFloat32(o,ax,true);dv.setFloat32(o+4,ay,true);dv.setFloat32(o+8,az,true);o+=12;
+        dv.setFloat32(o,bx,true);dv.setFloat32(o+4,by,true);dv.setFloat32(o+8,bz,true);o+=12;
+        dv.setFloat32(o,cx,true);dv.setFloat32(o+4,cy,true);dv.setFloat32(o+8,cz,true);o+=12;
+        dv.setUint16(o,0,true);o+=2; }
+      const url=URL.createObjectURL(new Blob([buf],{type:'model/stl'}));
+      const a=document.createElement('a'); a.href=url;
+      a.download=`omniphone_${P.BODY}_${Math.round(P.N_PADS)}pads_s${Math.round(P.SEED)}.stl`;
+      a.click(); URL.revokeObjectURL(url);
+    }catch(e){ console.error(e); }
+    document.getElementById('busy').style.display='none';
+  },30);
 }
 document.getElementById('stl').addEventListener('click',exportSTL);
 
-// ---- favourites (localStorage): save current shape+params, reload, delete ----
-const FAV_KEY='omniphone_sculptor_favs', favSel=document.getElementById('favSel');
-function loadFavs(){ try{ return JSON.parse(localStorage.getItem(FAV_KEY)) || []; }catch(e){ return []; } }
-function saveFavs(f){ localStorage.setItem(FAV_KEY, JSON.stringify(f)); }
-function favKeys(key){ const m=MODES.find(x=>x.key===key); return ['SIZE','HEIGHT','N_PADS','RES','SEED','SCREEN_MODE','SCREEN_DIA','SCREEN_MARGIN','SCREEN_DEPTH'].concat(m.params.map(d=>d[0])); }
-function populateFavs(pick){ const favs=loadFavs(); favSel.innerHTML='<option value="">— saved shapes —</option>';
-  favs.forEach((f,i)=>{ const o=document.createElement('option'); o.value=i; o.textContent=f.name; favSel.appendChild(o); }); favSel.value=(pick!==undefined?pick:''); }
-document.getElementById('favSave').addEventListener('click',()=>{ const m=MODES.find(x=>x.key===currentKey);
-  const name=prompt('Name this favourite:', m.label); if(!name) return;
-  const params={}; favKeys(currentKey).forEach(k=>params[k]=P[k]);
-  const favs=loadFavs(); favs.push({name,key:currentKey,params}); saveFavs(favs); populateFavs(favs.length-1); });
-document.getElementById('favDel').addEventListener('click',()=>{ const i=favSel.value; if(i==='') return;
-  const favs=loadFavs(); favs.splice(+i,1); saveFavs(favs); populateFavs(); });
-favSel.addEventListener('change',()=>{ const i=favSel.value; if(i==='') return; const f=loadFavs()[+i]; if(!f) return;
-  currentKey=f.key; shapeSel.value=f.key; Object.assign(P,f.params); renderSharedParams(); renderModeParams(); schedule(); });
-populateFavs();
+// ---- presets (ported from the v1 favourites) + user favourites ----
+const PRESETS=[
+ {name:'Brain — distinct areas', p:{BODY:'coral_rd',N_PADS:10,PAD_STYLE:'seat',RD_AMOUNT:7,RD_FEED:0.055,RD_KILL:0.062,RD_STEPS:2500}},
+ {name:'Bubble pile', p:{BODY:'blob',PAD_STYLE:'seat',N_PADS:14,OVERLAY:'bubbles',OV_COUNT:42,OV_MIN:12.5,OV_MAX:40,OV_BLEND:4}},
+ {name:'Loby (≈ the real device)', p:{BODY:'blob',PAD_STYLE:'lobe',N_PADS:14,PAD_DIA:44,PAD_H:20,PAD_BLEND:13}},
+ {name:'Cell ball (voronoi)', p:{BODY:'voronoi',N_PADS:24,PAD_STYLE:'seat',CELL_AMP:11.5,GROOVE:0.02}},
+ {name:'Spiky ball', p:{BODY:'blob',PAD_STYLE:'bump',N_PADS:24,PAD_DIA:44,PAD_H:21,PAD_BLEND:6}},
+ {name:'Soft bumps', p:{BODY:'blob',PAD_STYLE:'bump',N_PADS:24,PAD_DIA:70,PAD_H:21,PAD_BLEND:8}},
+ {name:'Unequal football', p:{BODY:'crystal',N_PADS:50,PAD_STYLE:'none',FACET_D:0.82,JITTER:0.09,SMOOTH:8}},
+ {name:'Alien blob (powder puff)', p:{BODY:'cactus',CSPEC:'powderpuff',N_PADS:6,PAD_STYLE:'none',RIB_DEPTH:0.02}},
+ {name:'Amanita bumps', p:{BODY:'mushroom',MSPEC:'amanita',CAP:0.74,HEIGHT:108,N_PADS:21,PAD_STYLE:'bump',PAD_DIA:22,PAD_H:7,BAND_LO:0.2}},
+ {name:'Morel', p:{BODY:'mushroom',MSPEC:'morel',CAP:1,MTEX:40,HEIGHT:108,PAD_STYLE:'none'}},
+ {name:'Thistle nubs', p:{BODY:'blob',HEIGHT:108,PAD_STYLE:'spike',N_PADS:50,PAD_DIA:45,PAD_H:22,SEAT_DIA:18,BAND_LO:-0.35}},
+ {name:'Lovely blob (cymatics)', p:{BODY:'cymatics',HEIGHT:108,PAD_STYLE:'none',CY_M:5,CY_N:3,CY_AMP:12}},
+ {name:'Mandel blob (smoothed)', p:{BODY:'mandelbulb',HEIGHT:108,PAD_STYLE:'none',MB_POWER:6,MB_ITER:6,MB_LEVEL:4,SMOOTH:10,RES:60}},
+ {name:'Julia blob (smoothed)', p:{BODY:'juliabulb',HEIGHT:108,PAD_STYLE:'none',JB_POWER:8,JB_ITER:6,JB_LEVEL:4,SMOOTH:10,RES:64}},
+];
+const FAV_KEY='omniphone_sculptor2_favs', favSel=document.getElementById('favSel');
+function loadFavs(){ try{ return JSON.parse(localStorage.getItem(FAV_KEY))||[]; }catch(e){ return []; } }
+function saveFavs(f){ localStorage.setItem(FAV_KEY,JSON.stringify(f)); }
+function populateFavs(pick){ const favs=loadFavs(); favSel.innerHTML='<option value="">— presets & favourites —</option>';
+  const ogP=document.createElement('optgroup'); ogP.label='Presets';
+  PRESETS.forEach((f,i)=>{ const o=document.createElement('option'); o.value='p'+i; o.textContent='★ '+f.name; ogP.appendChild(o); });
+  favSel.appendChild(ogP);
+  if(favs.length){ const ogF=document.createElement('optgroup'); ogF.label='My favourites';
+    favs.forEach((f,i)=>{ const o=document.createElement('option'); o.value='f'+i; o.textContent=f.name; ogF.appendChild(o); });
+    favSel.appendChild(ogF); }
+  favSel.value=pick!==undefined?pick:''; }
+function applyParams(src){ Object.assign(P,JSON.parse(JSON.stringify(DEFAULTS)),src);
+  shapeSel.value=P.BODY; renderSharedParams(); renderModeParams(); schedule(); }
+favSel.addEventListener('change',()=>{ const v=favSel.value; if(v==='') return;
+  if(v[0]==='p') applyParams(PRESETS[+v.slice(1)].p);
+  else { const f=loadFavs()[+v.slice(1)]; if(f) applyParams(f.params); } });
+document.getElementById('favSave').addEventListener('click',()=>{
+  const name=prompt('Name this favourite:',BODIES.find(b=>b.key===P.BODY).label); if(!name) return;
+  const favs=loadFavs(); favs.push({name,params:JSON.parse(JSON.stringify(P))}); saveFavs(favs); populateFavs('f'+(favs.length-1)); });
+document.getElementById('favDel').addEventListener('click',()=>{ const v=favSel.value; if(v===''||v[0]!=='f') return;
+  const favs=loadFavs(); favs.splice(+v.slice(1),1); saveFavs(favs); populateFavs(); });
 
-resize(); renderModeParams(); rebuild();
+populateFavs(); renderSharedParams(); renderModeParams(); resize(); schedule();
 (function loop(){ requestAnimationFrame(loop); controls.update(); renderer.render(scene,camera); })();
 </script>
 </body>

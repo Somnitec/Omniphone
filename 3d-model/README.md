@@ -4,6 +4,25 @@ Procedural generators for Omniphone enclosures, each paired with a live
 browser viewer (three.js, vendored offline) that emits a copy-pasteable
 parameter block:
 
+> **Blender port (in progress):** [`blender/omniphone_sculptor.py`](blender/omniphone_sculptor.py)
+> is the start of moving the *whole* modelling workflow into Blender (replacing
+> the sculptor.html → Fusion 360 hand-off). Slice 1 (done): ball → squish →
+> gradient-flatten underside → N pad seeds (phyllotaxis / random / Lloyd) →
+> Gray-Scott brain coral grown **on the mesh graph** (no pole distortion),
+> ridges out / grooves in, coverage fade. Watertight, mm units, ~2 s per
+> generate at 41 k verts.
+>
+> - **Install:** Blender ≥ 4.2 → Edit ▸ Preferences ▸ Add-ons ▸ Install… →
+>   pick the file → enable. Panel: 3D view sidebar (N) → **Omniphone** tab.
+>   Hit **Generate Omniphone**; the 🔄 button rolls a new random instrument.
+> - **Headless check:** `blender -b --factory-startup --python-exit-code 1
+>   --python blender/omniphone_sculptor.py -- --selftest`
+> - **Roadmap** (next slices): screen platform w/ vertex-attract merge → USB/jack
+>   panel mounts → flat bottom cut + 2 mm push-in / 4 mm shrink rabbet → 3 mm
+>   shell → apertures → parametric PCB-holder insert trimmed to shell → bottom
+>   plate + 3× M3 self-tap bosses. Pad flat seats/recesses after shape language
+>   settles. More pad algorithms after coral.
+
 > **Start here for exploring shapes:** [`sculptor.html`](sculptor.html) is a
 > unified playground — one page, ~24 shapes in a dropdown grouped by family:
 > **Classic** (thistle, Lloyd-relaxed thistle, cymatics, mandelbulb),
