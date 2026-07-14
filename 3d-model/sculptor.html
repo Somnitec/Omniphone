@@ -97,7 +97,7 @@ const H = (() => {
     for (let k = 0; k < rings.length - 1; k++) { const a = rings[k], b = rings[k + 1]; for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(a + j, a + j1, b + j1, a + j, b + j1, b + j); } }
     const bl = rings[rings.length - 1]; for (let j = 0; j < na; j++) idx.push(south, bl + (j + 1) % na, bl + j);
   }
-  function dome(pos, idx, R, Hh, na, nr, baseZ, disp) {   // flat-bottomed half-ellipsoid, closed
+  function dome(pos, idx, R, Hh, na, nr, baseZ, disp, footFrac) {   // flat-bottomed egg: rounded body + curved fillet down to a flat foot, closed
     const apex = pos.length / 3; pos.push(0, 0, baseZ + Hh + (disp ? disp(0, 0) : 0));
     const rings = [];
     for (let i = 1; i <= nr; i++) { const phi = 0.5 * Math.PI * i / nr, sp = Math.sin(phi), cp = Math.cos(phi); const b = pos.length / 3;
@@ -105,11 +105,19 @@ const H = (() => {
         pos.push(rr * Math.cos(th), rr * Math.sin(th), baseZ + Hh * cp + d * cp); } rings.push(b); }
     const b0 = rings[0]; for (let j = 0; j < na; j++) idx.push(apex, b0 + j, b0 + (j + 1) % na);
     for (let k = 0; k < rings.length - 1; k++) { const a = rings[k], b = rings[k + 1]; for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(a + j, a + j1, b + j1, a + j, b + j1, b + j); } }
-    const rim = rings[rings.length - 1], bot = pos.length / 3;
-    for (let j = 0; j < na; j++) { const kk = (rim + j) * 3; pos.push(pos[kk], pos[kk + 1], 0); }
+    // egg-taper fillet: quarter-ellipse from the equator (rim, vertical tangent) down to a smaller
+    // flat foot (horizontal tangent) — replaces the old vertical skirt + sharp 90° corner into the floor.
+    const rim = rings[rings.length - 1];
+    const fh = Math.max(baseZ, R * 0.28), rf = R * (footFrac === undefined ? 0.6 : footFrac);
+    const nf = Math.max(4, Math.round(nr * 0.35));
+    let prevRing = rim;
+    for (let f = 1; f <= nf; f++) { const beta = 0.5 * Math.PI * f / nf, sb = Math.sin(beta), cb = Math.cos(beta);
+      const rr = rf + (R - rf) * cb, zz = fh * (1 - sb), b = pos.length / 3;
+      for (let j = 0; j < na; j++) { const th = TAU * j / na; pos.push(rr * Math.cos(th), rr * Math.sin(th), zz); }
+      const a = prevRing; for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(a + j, a + j1, b + j1, a + j, b + j1, b + j); }
+      prevRing = b; }
     const bc = pos.length / 3; pos.push(0, 0, 0);
-    for (let j = 0; j < na; j++) { const j1 = (j + 1) % na; idx.push(rim + j, bot + j, bot + j1, rim + j, bot + j1, rim + j1); }
-    for (let j = 0; j < na; j++) idx.push(bc, bot + (j + 1) % na, bot + j);
+    for (let j = 0; j < na; j++) idx.push(bc, prevRing + (j + 1) % na, prevRing + j);
   }
   function disc(pos, idx, r, z0, z1, seg) {
     const tc = pos.length / 3; pos.push(0, 0, z1); const tb = pos.length / 3;
@@ -192,14 +200,21 @@ function dir(th, phi) { const sp = Math.sin(phi); return [sp * Math.cos(th), sp 
 // cached reaction-diffusion for the coral mode
 let _rd = { sig: '', f: null, N: 0 };
 function getRD(P) {
-  const sig = [P.RES, P.SEED, P.RD_FEED, P.RD_KILL, P.RD_STEPS].join(',');
+  const sig = [P.RES, P.SEED, P.N_PADS, P.RD_FEED, P.RD_KILL, P.RD_STEPS].join(',');
   if (sig === _rd.sig && _rd.f) return _rd;
   const N = Math.max(60, Math.min(150, Math.round(P.RES * 2)));
   const U = new Float32Array(N * N).fill(1), V = new Float32Array(N * N);
   let a = (Math.round(P.SEED) * 2654435761) >>> 0 || 1;
   const rnd = () => { a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
   for (let i = 0; i < N * N; i++) V[i] = 0.06 * rnd();
-  for (let s = 0; s < 6; s++) { const cx = (0.3 + 0.4 * rnd()) * N | 0, cy = (0.3 + 0.4 * rnd()) * N | 0; for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) { const r = (cy + yy) * N + (cx + xx); if (r >= 0 && r < N * N) { V[r] = 0.5; U[r] = 0.25; } } }
+  // nucleate one blob per pad (golden-angle phyllotaxis on the disc), matching coral.py's
+  // pad_disc_positions()/RD_SEED_AT_PADS so the preview's lump count tracks N_PADS.
+  const n = Math.max(1, Math.round(P.N_PADS)), ga = Math.PI * (3 - Math.sqrt(5)), lo = 0.10, hi = 0.92;
+  for (let i = 0; i < n; i++) {
+    const u = lo + (hi - lo) * Math.sqrt((i + 0.5) / n), th = i * ga;
+    const cx = ((0.5 * u * Math.cos(th) + 0.5) * N) | 0, cy = ((0.5 * u * Math.sin(th) + 0.5) * N) | 0;
+    for (let yy = -3; yy <= 3; yy++) for (let xx = -3; xx <= 3; xx++) { const r = (cy + yy) * N + (cx + xx); if (r >= 0 && r < N * N) { V[r] = 0.5; U[r] = 0.25; } }
+  }
   const F = P.RD_FEED, k = P.RD_KILL; let cU = U, cV = V, Un = new Float32Array(N * N), Vn = new Float32Array(N * N);
   for (let s = 0; s < Math.round(P.RD_STEPS); s++) {
     for (let r = 0; r < N; r++) { const rm = (r - 1 + N) % N, rp = (r + 1) % N, ro = r * N, rom = rm * N, rop = rp * N;
@@ -246,7 +261,7 @@ function mengerInside(u, v, w, level) { for (let l = 0; l < level; l++) { u *= 3
 function buildThistle(P, H, placement) {                 // ellipsoid bulb + flat-tipped needle pads
   const pos = [], idx = [], R = P.SIZE / 2, C = P.HEIGHT, cz = C * 0.5 + 4, rz = C * 0.5;
   H.ball(pos, idx, 0, 0, cz, R, R, rz, clampA(P.RES * 2.4), clampA(P.RES * 1.8), null);
-  const n = Math.max(3, Math.round(P.N_PADS)), bandLo = -0.35, bandHi = 0.95; let pts;
+  const n = Math.max(1, Math.round(P.N_PADS)), bandLo = -0.35, bandHi = 0.95; let pts;
   if (placement === 'lloyd') pts = lloydBand(n, bandLo, bandHi, 9, Math.round(P.SEED) + 1);
   else { pts = []; const ga = Math.PI * (3 - Math.sqrt(5)); for (let i = 0; i < n; i++) { const u = bandLo + (bandHi - bandLo) * ((i + 0.5) / n), r = Math.sqrt(Math.max(0, 1 - u * u)), th = i * ga; pts.push([r * Math.cos(th), r * Math.sin(th), u]); } }
   const baseR = R * P.SPIKE_BASE, tipR = baseR * 0.4, len = R * P.SPIKE_LEN;
@@ -271,7 +286,7 @@ const MODES = [
   params:[['BUB_MIN','Min bubble',8,30,0.5,13],['BUB_MAX','Max bubble',12,40,0.5,26]],
   build(P,H){ const pos=[],idx=[],R=P.SIZE/2*0.86,Hm=P.HEIGHT*0.55;
     H.dome(pos,idx,R,Hm,clampA(P.RES*2),clampA(P.RES*1.4),4,null);
-    const n=Math.max(12,Math.round(P.N_PADS*3)),ga=Math.PI*(3-Math.sqrt(5));
+    const n=Math.max(1,Math.round(P.N_PADS*3)),ga=Math.PI*(3-Math.sqrt(5));
     let a=(Math.round(P.SEED)*40503)>>>0||1; const rnd=()=>{a=(a*1103515245+12345)>>>0;return a/4294967296;};
     for(let i=0;i<n;i++){ const u=Math.sqrt((i+0.5)/n),th=i*ga,phi=0.5*Math.PI*u,sp=Math.sin(phi),cp=Math.cos(phi);
       const px=R*sp*Math.cos(th),py=R*sp*Math.sin(th),pz=4+Hm*cp,br=P.BUB_MIN+(P.BUB_MAX-P.BUB_MIN)*(1-u)*(0.7+0.4*rnd());
@@ -449,7 +464,7 @@ const MODES = [
 const P = {}, STEPS = {};
 const SHARED = [
   ['SIZE','Width (mm)',60,240,1,150],['HEIGHT','Height (mm)',20,220,1,95],
-  ['N_PADS','Feature count',1,24,1,10],['RES','Resolution',16,110,1,52],['SEED','Seed',0,60,1,3],
+  ['N_PADS','Feature count',1,96,1,10],['RES','Resolution',16,110,1,52],['SEED','Seed',0,60,1,3],
   ['__scr','__screen'],
   ['SCREEN_MODE','Screen','select',['top','base','none'],['Crown','Base','None'],'top'],
   ['SCREEN_DIA','Screen dia',10,90,1,32],['SCREEN_MARGIN','Bezel',0,16,0.5,4],['SCREEN_DEPTH','Depth',1,20,0.5,6],
@@ -498,7 +513,7 @@ const controls=new THREE.OrbitControls(camera,renderer.domElement); controls.ena
 scene.add(new THREE.HemisphereLight(0xffffff,0x20303a,0.95));
 const kL=new THREE.DirectionalLight(0xffffff,0.8); kL.position.set(0.7,1.3,0.6); scene.add(kL);
 const fL=new THREE.DirectionalLight(0xffd9c2,0.32); fL.position.set(-0.8,0.5,-0.6); scene.add(fL);
-const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.62,metalness:0.05,side:THREE.DoubleSide,flatShading:true});
+const mat=new THREE.MeshStandardMaterial({vertexColors:true,roughness:0.62,metalness:0.05,side:THREE.DoubleSide,flatShading:false});
 const C_LO=new THREE.Color(0x5c2b25),C_HI=new THREE.Color(0xffc0a6);
 let mesh=null, lastGeom=null;
 function resize(){ const w=view.clientWidth,h=view.clientHeight; renderer.setSize(w,h); camera.aspect=w/h; camera.updateProjectionMatrix(); }
