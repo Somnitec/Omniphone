@@ -5,23 +5,57 @@ browser viewer (three.js, vendored offline) that emits a copy-pasteable
 parameter block:
 
 > **Blender port (in progress):** [`blender/omniphone_sculptor.py`](blender/omniphone_sculptor.py)
-> is the start of moving the *whole* modelling workflow into Blender (replacing
-> the sculptor.html → Fusion 360 hand-off). Slice 1 (done): ball → squish →
-> gradient-flatten underside → N pad seeds (phyllotaxis / random / Lloyd) →
-> Gray-Scott brain coral grown **on the mesh graph** (no pole distortion),
-> ridges out / grooves in, coverage fade. Watertight, mm units, ~2 s per
-> generate at 41 k verts.
+> is moving the *whole* modelling workflow into Blender (replacing the
+> sculptor.html → Fusion 360 hand-off). Done so far: ball → squish →
+> gradient-flatten underside → **screen platform + USB/jack panel flats**
+> (disc attractors: settable tilt/azimuth/Ø/height, merge reach & strength;
+> circle-empty markers carry the axes for the aperture slice) → N pad seeds
+> (phyllotaxis / random / Lloyd, repelled from the screen cone) → Gray-Scott
+> brain coral grown **on the mesh graph** (no pole distortion), ridges out /
+> grooves in, coverage fade, auto-masked off the facets. Watertight, mm units.
 >
-> - **Install:** Blender ≥ 4.2 → Edit ▸ Preferences ▸ Add-ons ▸ Install… →
->   pick the file → enable. Panel: 3D view sidebar (N) → **Omniphone** tab.
->   Hit **Generate Omniphone**; the 🔄 button rolls a new random instrument.
+> - **Live editing:** shape/displacement sliders update **while dragging**
+>   (~5 ms; the coral field rides along stably). Pad/coral/RD changes make the
+>   pattern visibly **re-grow in the viewport** (~5 fps chunks, settling in a
+>   couple of seconds at the exact final state). Toggle with *Auto update*;
+>   *Generate* always forces a full clean rebuild.
+> - **Facet orientation:** screen/port discs lie **tangent to the smooth body
+>   surface** by default (tilt/azimuth choose *where*, like a spoke); a *Pitch*
+>   slider rotates the face off the tangent in the azimuth plane.
+> - **Build step (slice 3):** the **Build Shell + Plate** button (section 6)
+>   runs the engineering pass on the current body: flat bottom cut → plate
+>   recess (2 mm in / 4 mm inset rabbet, solid lip) → ~3 mm hollow shell →
+>   1.28″ screen counterbore + through-aperture, USB/jack holes → 3× M3
+>   self-tap bosses on solid pads → a countersunk bottom plate that drops in
+>   flush, with a **key ridge** tracing the lip/boss-pad profile so it can't
+>   slide or rotate. ~30 s; output is two closed manifolds, checked per boolean
+>   step in the console. *Bottom cut* is mm above the resting plane (z=0) and
+>   shows as a live wire circle in the viewport while you drag. Port *Pitch* is
+>   absolute (0° = face perpendicular to the ground); the screen's is relative
+>   to the surface tangent. Coral changes compute in the background and show
+>   the finished shape by default — flip *Grow in viewport* on to watch the
+>   pattern grow instead. Ridge height / groove depth accept negative values
+>   (dented ridges, bulging grooves). Implementation notes: the offset cavity is voxel-remeshed
+>   (its self-intersections in tight concave regions otherwise poison every
+>   later boolean), the lip is carved *out of the cavity tool* so the delicate
+>   underside resolves in a single subtraction, and everything runs on 4.5's
+>   manifold solver (the exact solver misclassified the large hollowed shell).
+> - **Install:** Blender ≥ 4.2 (4.5+ recommended for the manifold solver) →
+>   Edit ▸ Preferences ▸ Add-ons ▸ Install… → pick the file → enable. Panel:
+>   3D view sidebar (N) → **Omniphone** tab. Hit **Generate Omniphone**; the
+>   🔄 button rolls a new random instrument. The installed addon is a symlink
+>   to this repo file; after edits press the 🔌 **Reload** button in the panel
+>   header — it re-reads the file and re-registers in place (slider values
+>   survive). More reliable than F3 → "Reload Scripts" in 4.5.
 > - **Headless check:** `blender -b --factory-startup --python-exit-code 1
 >   --python blender/omniphone_sculptor.py -- --selftest`
-> - **Roadmap** (next slices): screen platform w/ vertex-attract merge → USB/jack
->   panel mounts → flat bottom cut + 2 mm push-in / 4 mm shrink rabbet → 3 mm
->   shell → apertures → parametric PCB-holder insert trimmed to shell → bottom
->   plate + 3× M3 self-tap bosses. Pad flat seats/recesses after shape language
->   settles. More pad algorithms after coral.
+> - **Roadmap** (next slices): parametric PCB-holder placeholder trimmed to the
+>   shell interior; pad flat seats/recesses; more pad algorithms after coral.
+> - **Known rough edges:** port flats low on the body sit on the rounded floor
+>   rim and look grafted-on — keep `height − Ø/2 ≳ 8 mm` (Generate warns) and
+>   tune Merge reach/strength by eye. Wall thickness is `wall` ± half the
+>   0.8 mm cavity voxel. The USB hole is a plain round hole — size it to the
+>   panel-mount part you pick.
 
 > **Start here for exploring shapes:** [`sculptor.html`](sculptor.html) is a
 > unified playground — one page, ~24 shapes in a dropdown grouped by family:
