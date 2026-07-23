@@ -14,12 +14,16 @@ secrets.h
 **/__pycache__/
 
 # Generated CAD artifacts — large and regenerable from the .py scripts.
-# Ignore every mesh/solid export under 3d-model/ (thistle, cymatics, mandelbulb,
-# the "saved models" archive, etc.).
+# Ignore every mesh/solid export + Blender working file (thistle, cymatics,
+# mandelbulb, the "saved models" archive, generated prints, etc.).
 3d-model/**/*.stl
 3d-model/**/*.step
+*.stl
+*.blend
+*.blend1
 
 # …except the printed-model reference archive: those files ARE the record of
 # what was physically printed, kept next to their photos + settings. Commit them.
 !3d-model/printed/**/*.stl
 !3d-model/printed/**/*.step
+!3d-model/printed/**/*.blend

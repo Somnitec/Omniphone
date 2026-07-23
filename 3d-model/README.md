@@ -29,7 +29,43 @@ parameter block:
 >   self-tap bosses on solid pads → a countersunk bottom plate that drops in
 >   flush, with a **key ridge** tracing the lip/boss-pad profile so it can't
 >   slide or rotate. ~30 s; output is two closed manifolds, checked per boolean
->   step in the console. *Bottom cut* is mm above the resting plane (z=0) and
+>   step in the console. The screen gets the real 1.28″ pocket: Ø36 aperture
+>   lip (0.5) → Ø39 drop-in pocket with a truncated tab-corner cutout (starts
+>   2.5 mm behind the lip, capped at the platform edge so it never holes the
+>   visible shoulder) + four heat-stake prongs at the square-tangent points.
+>   **Plate outfit** (panel 7, live ~0.3 s once a shell exists): dome legs
+>   (count/Ø/height/splay/radius, flat feet sized for stick-on pads), a
+>   speaker bay (recess + through-firing opening w/ rim), transducer glue zone
+>   w/ optional thinning, PAM8403 recess + melt posts, DPST switch hole + Ø1
+>   melt rivets @15 mm, battery corral (walls + strap gaps — no prongs against
+>   a LiPo). The speaker bay is **round by default** (recess + through-opening
+>   + meltable lock ridge around the rim) with the rectangular box bay as the
+>   alternate type. Pad layouts gained **Even (max spacing)** — relaxation run
+>   to convergence → most-equal pad sizes; pad count goes to 96.
+>   **Layer stack** (three stackable passes, any combination): panel 1 picks
+>   the **Form** — *Squished ball* · *Puffed Voronoi cells* (one cell per pad,
+>   Even layout ⇒ equal pads) · *Crystal/faceted* (every pad becomes a flat
+>   facet + a crown facet under the screen; filler facets close the underside)
+>   · *Cymatics dome* (Bessel standing wave) · *Mandelbulb* (radially-captured
+>   fractal, ~1 s per slider change, cached otherwise). Panel 2 = pad count &
+>   layout (greyed out when nothing uses pads). Panel 3 = the form's settings.
+>   Panel 4 = the **Texture pass**: a second algorithm displaced over the
+>   shaped surface with its own feature count/seed/amount, decoupled from the
+>   pads — Voronoi cells (grooves scale with cell size), Crystal facets (a
+>   *gem grinder*: the crest inside each texture cell is cut flat — sharp
+>   planar chips), Cymatics ripple, or Mandelbulb crust. Panel 5 = **Brain
+>   coral** (header toggle), the RD relief grown on top; pads are its seeds.
+>   So *cells + crystal texture*, *cymatics + coral*, *coral + small cells*,
+>   or the same algorithm twice at two scales all compose. Only the coral
+>   costs sim time — when it's off, no RD ever runs and everything is instant.
+>   If the screen cutter `blender/screencutout.stl` exists it is
+>   used verbatim (scaled to mm, centred on its top-lip circle, depth/bore/tab
+>   re-measured from the file on every build); prongs and boss stay parametric.
+>   [`screen_pocket_test.stl`](screen_pocket_test.stl) is a cut-out puck of
+>   just the screen pocket for fit-testing (print it screen-face down).
+>   ⚠ Don't reinstall the addon via the Add-ons menu — Install *copies* the
+>   file, replacing the repo symlink, and edits stop arriving. Use the 🔌
+>   Reload button (or restore the symlink). *Bottom cut* is mm above the resting plane (z=0) and
 >   shows as a live wire circle in the viewport while you drag. Port *Pitch* is
 >   absolute (0° = face perpendicular to the ground); the screen's is relative
 >   to the surface tangent. Coral changes compute in the background and show
